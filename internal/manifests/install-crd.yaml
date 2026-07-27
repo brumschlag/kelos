@@ -29722,6 +29722,22 @@ spec:
                     type: string
                   type: array
                 type: array
+              preCommands:
+                description: |-
+                  PreCommands are exec-form commands run by the worker-runner before the
+                  agent starts, in the workspace directory, with the same per-Task
+                  environment as the agent.
+
+                  A pooled worker's workspace persists across every Task it serves, so a
+                  scheduler that needs to attribute changes to one Task must record a marker
+                  before the agent runs. A non-zero exit fails the Task without starting the
+                  agent, because proceeding would produce a result attributed to the wrong
+                  Task.
+                items:
+                  items:
+                    type: string
+                  type: array
+                type: array
               prompt:
                 description: Prompt is the task prompt to send to the agent.
                 type: string

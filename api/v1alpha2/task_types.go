@@ -362,6 +362,18 @@ type TaskSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self.all(e, !has(e.valueFrom))",message="envOverrides values must be literals; valueFrom is not supported because the worker resolves this environment itself"
 	EnvOverrides []corev1.EnvVar `json:"envOverrides,omitempty"`
 
+	// PreCommands are exec-form commands run by the worker-runner before the
+	// agent starts, in the workspace directory, with the same per-Task
+	// environment as the agent.
+	//
+	// A pooled worker's workspace persists across every Task it serves, so a
+	// scheduler that needs to attribute changes to one Task must record a marker
+	// before the agent runs. A non-zero exit fails the Task without starting the
+	// agent, because proceeding would produce a result attributed to the wrong
+	// Task.
+	// +optional
+	PreCommands [][]string `json:"preCommands,omitempty"`
+
 	// PostCommands are exec-form commands run by the worker-runner after the
 	// agent exits, in the workspace directory, with the same per-Task
 	// environment as the agent.

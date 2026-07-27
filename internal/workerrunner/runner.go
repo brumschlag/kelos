@@ -280,6 +280,10 @@ func (r *Runner) runAgent(ctx context.Context, task *kelos.Task) error {
 
 	cmd.Env = taskAgentEnv(os.Environ(), task)
 
+	if err := runPreCommands(ctx, task, cmd.Dir); err != nil {
+		return err
+	}
+
 	if err := cmd.Run(); err != nil {
 		return err
 	}
@@ -287,23 +291,42 @@ func (r *Runner) runAgent(ctx context.Context, task *kelos.Task) error {
 	return runPostCommands(ctx, task, cmd.Dir)
 }
 
+// runPreCommands runs the Task's preCommands in the workspace before the agent
+// starts. A failure is returned so the agent never runs: a missing baseline would
+// otherwise yield a result attributed to the wrong Task.
+func runPreCommands(ctx context.Context, task *kelos.Task, workdir string) error {
+	return runHookCommands(ctx, task, workdir, "preCommand", task.Spec.PreCommands)
+}
+
 // runPostCommands runs the Task's postCommands in the workspace after the agent
 // has exited, with the same per-Task environment. A failure is returned so the
 // Task fails: a skipped transfer would otherwise be indistinguishable from an
 // agent that produced no changes.
 func runPostCommands(ctx context.Context, task *kelos.Task, workdir string) error {
-	for i, argv := range task.Spec.PostCommands {
+	return runHookCommands(ctx, task, workdir, "postCommand", task.Spec.PostCommands)
+}
+
+// runHookCommands runs a Task's hook commands in the workspace with the same
+// per-Task environment the agent receives.
+func runHookCommands(
+	ctx context.Context,
+	task *kelos.Task,
+	workdir string,
+	label string,
+	commands [][]string,
+) error {
+	for i, argv := range commands {
 		if len(argv) == 0 {
 			continue
 		}
-		log.Printf("Running postCommand %d/%d for task %s", i+1, len(task.Spec.PostCommands), task.Name)
+		log.Printf("Running %s %d/%d for task %s", label, i+1, len(commands), task.Name)
 		cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 		cmd.Dir = workdir
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		cmd.Env = taskAgentEnv(os.Environ(), task)
 		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("postCommand %d (%s): %w", i+1, argv[0], err)
+			return fmt.Errorf("%s %d (%s): %w", label, i+1, argv[0], err)
 		}
 	}
 	return nil

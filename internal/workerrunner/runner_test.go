@@ -321,6 +321,39 @@ func TestPostCommandsRunAfterAgentInWorkspace(t *testing.T) {
 	}
 }
 
+// A pooled worker's workspace carries state from every task it has served, so a
+// scheduler needs a marker taken BEFORE the agent runs to attribute changes to
+// this task alone. preCommands run in the workspace with the per-Task env.
+func TestPreCommandsRunBeforeAgent(t *testing.T) {
+	dir := t.TempDir()
+	task := &kelos.Task{
+		Spec: kelos.TaskSpec{
+			Prompt:      "do the thing",
+			PreCommands: [][]string{{"sh", "-c", "echo baseline > pre-ran.txt"}},
+		},
+	}
+
+	if err := runPreCommands(context.Background(), task, dir); err != nil {
+		t.Fatalf("runPreCommands: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, "pre-ran.txt")); err != nil {
+		t.Fatalf("pre command did not run in the workspace: %v", err)
+	}
+}
+
+// If the baseline cannot be captured the resulting diff would be wrong, so the
+// Task must fail rather than proceed and report someone else's changes.
+func TestPreCommandsReportFailure(t *testing.T) {
+	task := &kelos.Task{
+		Spec: kelos.TaskSpec{PreCommands: [][]string{{"sh", "-c", "exit 4"}}},
+	}
+
+	if err := runPreCommands(context.Background(), task, t.TempDir()); err == nil {
+		t.Fatal("expected an error from a failing pre command")
+	}
+}
+
 // A post command that fails must surface, not be swallowed: silently skipping the
 // upload looks identical to "the agent changed nothing", which is the worst
 // failure mode for a scheduler consuming the artifact.

@@ -1713,6 +1713,17 @@ func (in *TaskSpec) DeepCopyInto(out *TaskSpec) {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
 	}
+	if in.PreCommands != nil {
+		in, out := &in.PreCommands, &out.PreCommands
+		*out = make([][]string, len(*in))
+		for i := range *in {
+			if (*in)[i] != nil {
+				in, out := &(*in)[i], &(*out)[i]
+				*out = make([]string, len(*in))
+				copy(*out, *in)
+			}
+		}
+	}
 	if in.PostCommands != nil {
 		in, out := &in.PostCommands, &out.PostCommands
 		*out = make([][]string, len(*in))
