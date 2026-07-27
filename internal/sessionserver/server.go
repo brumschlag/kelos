@@ -40,6 +40,7 @@ import (
 
 	kelos "github.com/kelos-dev/kelos/api/v1alpha2"
 	"github.com/kelos-dev/kelos/internal/sessionreset"
+	"github.com/kelos-dev/kelos/internal/sessionsuspend"
 )
 
 const (
@@ -109,6 +110,7 @@ type sessionSummary struct {
 	PullRequest    *kelos.SessionPullRequest `json:"pullRequest,omitempty"`
 	Section        string                    `json:"section,omitempty"`
 	Resetting      bool                      `json:"resetting,omitempty"`
+	IdleSuspended  bool                      `json:"idleSuspended,omitempty"`
 }
 
 type sessionOptions struct {
@@ -322,6 +324,10 @@ func (s *Server) api(writer http.ResponseWriter, request *http.Request) {
 	}
 	if len(parts) == 4 && parts[3] == "reset" && request.Method == http.MethodPost {
 		s.resetSession(writer, request, namespace, name)
+		return
+	}
+	if len(parts) == 4 && parts[3] == "resume" && request.Method == http.MethodPost {
+		s.resumeSession(writer, request, namespace, name)
 		return
 	}
 	if len(parts) == 4 && parts[3] == "section" && request.Method == http.MethodPatch {
@@ -605,6 +611,33 @@ func (s *Server) resetSession(writer http.ResponseWriter, request *http.Request,
 	writeJSON(writer, http.StatusAccepted, summarize(session))
 }
 
+func (s *Server) resumeSession(writer http.ResponseWriter, request *http.Request, namespace, name string) {
+	session, _, err := sessionsuspend.RequestResume(
+		request.Context(),
+		s.client,
+		client.ObjectKey{Namespace: namespace, Name: name},
+		string(uuid.NewUUID()),
+	)
+	if err != nil {
+		status := http.StatusInternalServerError
+		switch {
+		case apierrors.IsNotFound(err):
+			status = http.StatusNotFound
+		case apierrors.IsForbidden(err):
+			status = http.StatusForbidden
+		case apierrors.IsConflict(err):
+			status = http.StatusConflict
+		}
+		writeError(writer, status, err.Error())
+		return
+	}
+	if session.Status.Phase == kelos.SessionPhaseSuspended && !sessionsuspend.IsIdlePolicySuspended(session) {
+		writeError(writer, http.StatusConflict, fmt.Sprintf("Session %q is suspended by user request", name))
+		return
+	}
+	writeJSON(writer, http.StatusAccepted, summarize(session))
+}
+
 func (s *Server) updateSessionSection(writer http.ResponseWriter, request *http.Request, namespace, name string) {
 	var payload updateSessionSectionRequest
 	if err := decodeJSON(request.Body, &payload); err != nil {
@@ -679,6 +712,7 @@ func summarize(session *kelos.Session) sessionSummary {
 		PullRequest:    session.Status.PullRequest,
 		Section:        session.Annotations[sessionSectionAnnotation],
 		Resetting:      session.Annotations[sessionreset.RequestAnnotation] != "",
+		IdleSuspended:  sessionsuspend.IsIdlePolicySuspended(session),
 	}
 	if !session.CreationTimestamp.IsZero() {
 		createdAt := session.CreationTimestamp
@@ -717,6 +751,19 @@ func (s *Server) connectSession(writer http.ResponseWriter, request *http.Reques
 		return
 	}
 	if session.Status.Phase == kelos.SessionPhaseSuspended {
+		if sessionsuspend.IsIdlePolicySuspended(&session) {
+			if _, _, err := sessionsuspend.RequestResume(
+				request.Context(),
+				s.client,
+				client.ObjectKeyFromObject(&session),
+				string(uuid.NewUUID()),
+			); err != nil {
+				writeKubernetesError(writer, fmt.Sprintf("requesting Session %q resume", name), err)
+				return
+			}
+			writeError(writer, http.StatusConflict, fmt.Sprintf("Session %q is resuming", name))
+			return
+		}
 		writeError(writer, http.StatusConflict, fmt.Sprintf("Session %q is suspended", name))
 		return
 	}

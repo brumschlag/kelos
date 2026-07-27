@@ -28,10 +28,12 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 
 	kelos "github.com/kelos-dev/kelos/api/v1alpha2"
 	"github.com/kelos-dev/kelos/internal/sessionreset"
 	"github.com/kelos-dev/kelos/internal/sessionruntime"
+	"github.com/kelos-dev/kelos/internal/sessionsuspend"
 	"github.com/kelos-dev/kelos/internal/sessionupdate"
 	"github.com/kelos-dev/kelos/test/e2e/framework"
 )
@@ -672,6 +674,71 @@ var _ = Describe("Session remote control", func() {
 		runTerminalTurn(f.Namespace, sessionName, "remove-git-workspace", ContainSubstring("agent › turn 2: git workspace removed"))
 		waitForSessionWorkspaceStatus(f, f.Namespace, sessionName, "", nil)
 	})
+
+	It("automatically suspends an idle Session", func() {
+		const sessionName = "idle-suspend"
+		configMapName := sessionName + "-provider"
+		mode := int32(0555)
+		_, err := f.Clientset.CoreV1().ConfigMaps(f.Namespace).Create(context.TODO(), &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: configMapName, Namespace: f.Namespace},
+			Data:       map[string]string{"claude": fakeClaude},
+		}, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() {
+			_ = f.Clientset.CoreV1().ConfigMaps(f.Namespace).Delete(context.TODO(), configMapName, metav1.DeleteOptions{})
+		})
+
+		createSession(f, &kelos.Session{
+			ObjectMeta: metav1.ObjectMeta{Name: sessionName},
+			Spec: kelos.SessionSpec{
+				Worker: kelos.WorkerSpec{
+					Type:        "claude-code",
+					Credentials: &kelos.Credentials{Type: kelos.CredentialTypeNone},
+					PodOverrides: &kelos.PodOverrides{
+						Env: []corev1.EnvVar{{
+							Name:  "PATH",
+							Value: "/workspace/fake-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+						}},
+						Volumes: []corev1.Volume{{
+							Name: "fake-provider",
+							VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+								LocalObjectReference: corev1.LocalObjectReference{Name: configMapName},
+								DefaultMode:          &mode,
+							}},
+						}},
+						VolumeMounts: []corev1.VolumeMount{{
+							Name:      "fake-provider",
+							MountPath: "/workspace/fake-bin",
+							ReadOnly:  true,
+						}},
+					},
+				},
+				IdlePolicy: &kelos.SessionIdlePolicy{SuspendAfterSeconds: ptr.To(int32(15))},
+			},
+		})
+		DeferCleanup(func() {
+			_ = f.KelosClientset.ApiV1alpha2().Sessions(f.Namespace).Delete(context.TODO(), sessionName, metav1.DeleteOptions{})
+		})
+		DeferCleanup(func() {
+			if CurrentSpecReport().Failed() {
+				collectSessionDebugInfo(f, f.Namespace, sessionName)
+			}
+		})
+
+		ready := waitForSessionPhase(f, f.Namespace, sessionName, kelos.SessionPhaseReady)
+		waitForSessionActivity(f, f.Namespace, sessionName, metav1.ConditionFalse)
+		suspended := waitForSessionPhase(f, f.Namespace, sessionName, kelos.SessionPhaseSuspended)
+		Expect(ptr.Deref(suspended.Spec.Suspend, false)).To(BeFalse())
+		readyCondition := apiMeta.FindStatusCondition(suspended.Status.Conditions, kelos.SessionConditionReady)
+		Expect(readyCondition).NotTo(BeNil())
+		Expect(readyCondition.Reason).To(Equal(sessionsuspend.IdlePolicyReason))
+		waitForPodDeletion(f, f.Namespace, ready.Status.PodName)
+
+		By("resuming the idle-suspended Session")
+		requestIdleSessionResume(f, f.Namespace, sessionName)
+		waitForSessionPhase(f, f.Namespace, sessionName, kelos.SessionPhaseReady)
+		runTerminalTurn(f.Namespace, sessionName, "after-idle-resume", ContainSubstring("agent › turn 1: after-idle-resume"))
+	})
 })
 
 func describeSessionProviderTests(cfg agentTestConfig) {
@@ -775,6 +842,21 @@ func updateSessionSuspend(f *framework.Framework, namespace, name string, suspen
 		_, err = f.KelosClientset.ApiV1alpha2().Sessions(namespace).Update(context.TODO(), session, metav1.UpdateOptions{})
 		return err
 	}, time.Minute, time.Second).Should(Succeed(), "Session %s/%s suspended state did not update to %t", namespace, name, suspend)
+}
+
+func requestIdleSessionResume(f *framework.Framework, namespace, name string) {
+	Eventually(func() error {
+		session, err := f.KelosClientset.ApiV1alpha2().Sessions(namespace).Get(context.TODO(), name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		if session.Annotations == nil {
+			session.Annotations = map[string]string{}
+		}
+		session.Annotations[sessionsuspend.ResumeRequestAnnotation] = "e2e-resume"
+		_, err = f.KelosClientset.ApiV1alpha2().Sessions(namespace).Update(context.TODO(), session, metav1.UpdateOptions{})
+		return err
+	}, time.Minute, time.Second).Should(Succeed(), "Session %s/%s idle resume request did not update", namespace, name)
 }
 
 func sessionTestVolumeClaimTemplate() *corev1.PersistentVolumeClaimSpec {

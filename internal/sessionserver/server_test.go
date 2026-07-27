@@ -20,11 +20,13 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	kelos "github.com/kelos-dev/kelos/api/v1alpha2"
 	"github.com/kelos-dev/kelos/internal/sessionreset"
+	"github.com/kelos-dev/kelos/internal/sessionsuspend"
 )
 
 func TestAuthenticationProtectsApplicationAndAPI(t *testing.T) {
@@ -113,17 +115,18 @@ func TestSessionSourceJavaScriptPreservesSelectedSource(t *testing.T) {
 	}
 	javascript := string(source)
 	for description, expected := range map[string]string{
-		"shared loading and submission guard": "function updateCreationBusyState() {\n  const busy = state.sourceLoading || state.creatingSession;\n  elements.sessionSource.disabled = busy;\n  elements.createButton.disabled = busy;\n}",
-		"submit loading guard":                "if (state.sourceLoading || state.creatingSession) return;",
-		"namespace invalidation reset":        "state.sourceGeneration += 1;\n  setSourceLoading(false);",
-		"explicit StorageClass tracking":      "state.sourceStorageClassNamePresent = Boolean(claim && 'storageClassName' in claim);",
-		"explicit empty StorageClass copy":    "if (storageClassName || state.sourceStorageClassNamePresent) {\n          payload.volumeClaimTemplate.storageClassName = storageClassName;\n        }",
-		"advanced reference warning":          "in YAML for additional namespace-scoped references.",
-		"suspended source YAML requirement":   "if (manifest.spec.suspend === true) return false;",
-		"source initial branch population":    "elements.form.elements.initialBranch.value = manifest.spec.initialBranch || '';",
-		"source initial prompt population":    "elements.form.elements.initialPrompt.value = manifest.spec.initialPrompt || '';",
-		"initial branch form submission":      "const initialBranch = values.get('initialBranch').trim();\n      if (initialBranch) payload.initialBranch = initialBranch;",
-		"initial prompt form submission":      "const initialPrompt = values.get('initialPrompt');\n      if (initialPrompt.trim()) payload.initialPrompt = initialPrompt;",
+		"shared loading and submission guard":     "function updateCreationBusyState() {\n  const busy = state.sourceLoading || state.creatingSession;\n  elements.sessionSource.disabled = busy;\n  elements.createButton.disabled = busy;\n}",
+		"submit loading guard":                    "if (state.sourceLoading || state.creatingSession) return;",
+		"namespace invalidation reset":            "state.sourceGeneration += 1;\n  setSourceLoading(false);",
+		"explicit StorageClass tracking":          "state.sourceStorageClassNamePresent = Boolean(claim && 'storageClassName' in claim);",
+		"explicit empty StorageClass copy":        "if (storageClassName || state.sourceStorageClassNamePresent) {\n          payload.volumeClaimTemplate.storageClassName = storageClassName;\n        }",
+		"advanced reference warning":              "in YAML for additional namespace-scoped references.",
+		"unsupported spec field YAML requirement": "const allowedSpecFields = new Set(['worker', 'suspend', 'initialBranch', 'initialPrompt', 'volumeClaimTemplate']);\n  if (Object.keys(manifest.spec).some(key => !allowedSpecFields.has(key))) return false;",
+		"suspended source YAML requirement":       "if (manifest.spec.suspend === true) return false;",
+		"source initial branch population":        "elements.form.elements.initialBranch.value = manifest.spec.initialBranch || '';",
+		"source initial prompt population":        "elements.form.elements.initialPrompt.value = manifest.spec.initialPrompt || '';",
+		"initial branch form submission":          "const initialBranch = values.get('initialBranch').trim();\n      if (initialBranch) payload.initialBranch = initialBranch;",
+		"initial prompt form submission":          "const initialPrompt = values.get('initialPrompt');\n      if (initialPrompt.trim()) payload.initialPrompt = initialPrompt;",
 	} {
 		if !strings.Contains(javascript, expected) {
 			t.Errorf("Session source JavaScript is missing %s: %s", description, expected)
@@ -166,6 +169,36 @@ func TestSessionSummaryIncludesUID(t *testing.T) {
 	}})
 	if summary.UID != "session-incarnation" {
 		t.Fatalf("Session summary UID = %q, want session-incarnation", summary.UID)
+	}
+}
+
+func TestSessionSummaryReportsIdleSuspension(t *testing.T) {
+	summary := summarize(&kelos.Session{Status: kelos.SessionStatus{
+		Phase: kelos.SessionPhaseSuspended,
+		Conditions: []metav1.Condition{{
+			Type:   kelos.SessionConditionReady,
+			Status: metav1.ConditionFalse,
+			Reason: sessionsuspend.IdlePolicyReason,
+		}},
+	}})
+	if !summary.IdleSuspended {
+		t.Fatal("Session summary idleSuspended = false, want true")
+	}
+}
+
+func TestSessionJavaScriptResumesIdleSuspension(t *testing.T) {
+	source, err := webFiles.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	javascript := string(source)
+	for _, expected := range []string{
+		"if (session.idleSuspended) resumeIdleSession(session);",
+		"/resume`, {method: 'POST'}",
+	} {
+		if !strings.Contains(javascript, expected) {
+			t.Errorf("Session JavaScript is missing idle resume behavior %q", expected)
+		}
 	}
 }
 
@@ -755,6 +788,44 @@ func TestSessionSectionAPI(t *testing.T) {
 	}
 }
 
+func TestSessionResumeAPIRequestsIdleResume(t *testing.T) {
+	server := testServer(t)
+	session := &kelos.Session{
+		ObjectMeta: metav1.ObjectMeta{Name: "chat", Namespace: "team-a"},
+		Spec: kelos.SessionSpec{Worker: kelos.WorkerSpec{
+			Type:        "codex",
+			Credentials: &kelos.Credentials{Type: kelos.CredentialTypeNone},
+		}},
+		Status: kelos.SessionStatus{
+			Phase: kelos.SessionPhaseSuspended,
+			Conditions: []metav1.Condition{{
+				Type:   kelos.SessionConditionReady,
+				Status: metav1.ConditionFalse,
+				Reason: sessionsuspend.IdlePolicyReason,
+			}},
+		},
+	}
+	if err := server.client.Create(t.Context(), session); err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/api/sessions/team-a/chat/resume", nil)
+	request.Header.Set("Authorization", "Bearer secret-token")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("resume status = %d body = %s", response.Code, response.Body.String())
+	}
+
+	var updated kelos.Session
+	if err := server.client.Get(t.Context(), client.ObjectKeyFromObject(session), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Annotations[sessionsuspend.ResumeRequestAnnotation] == "" {
+		t.Fatal("resume endpoint did not request an idle Session resume")
+	}
+}
+
 func TestNormalizeSessionSection(t *testing.T) {
 	for _, test := range []struct {
 		name      string
@@ -1212,6 +1283,9 @@ func TestSessionSourceAPIReturnsReusableSpec(t *testing.T) {
 		Spec: kelos.SessionSpec{
 			InitialBranch: "feature/codex-review",
 			InitialPrompt: "Investigate the issue interactively",
+			IdlePolicy: &kelos.SessionIdlePolicy{
+				SuspendAfterSeconds: ptr.To(int32(900)),
+			},
 			Worker: kelos.WorkerSpec{
 				Type: "codex",
 				Credentials: &kelos.Credentials{
@@ -1267,6 +1341,9 @@ func TestSessionSourceAPIReturnsReusableSpec(t *testing.T) {
 	if manifest.Spec.InitialBranch != "feature/codex-review" || manifest.Spec.InitialPrompt != "Investigate the issue interactively" {
 		t.Fatalf("Session manifest initialBranch/prompt = %q/%q", manifest.Spec.InitialBranch, manifest.Spec.InitialPrompt)
 	}
+	if manifest.Spec.IdlePolicy == nil || manifest.Spec.IdlePolicy.SuspendAfterSeconds == nil || *manifest.Spec.IdlePolicy.SuspendAfterSeconds != 900 {
+		t.Fatalf("Session manifest idlePolicy = %#v", manifest.Spec.IdlePolicy)
+	}
 	if worker.Type != "codex" || worker.Model != "gpt-5" || worker.Effort != "high" || worker.Image != "example.com/codex:latest" || worker.Credentials == nil || worker.Credentials.SecretRef.Name != "codex-credentials" {
 		t.Fatalf("Session manifest worker = %#v", worker)
 	}
@@ -1297,6 +1374,7 @@ func TestSessionSourceAPIReturnsReusableSpec(t *testing.T) {
 		"name: REVIEW_MODE",
 		"initialBranch: feature/codex-review",
 		"initialPrompt: Investigate the issue interactively",
+		"suspendAfterSeconds: 900",
 		`storageClassName: ""`,
 		"storage: 20Gi",
 	} {
@@ -1415,6 +1493,44 @@ func TestConnectSessionRejectsSuspendedSession(t *testing.T) {
 	}
 	if !strings.Contains(response.Body.String(), "is suspended") {
 		t.Fatalf("suspended Session body = %q", response.Body.String())
+	}
+}
+
+func TestConnectSessionRequestsIdleResume(t *testing.T) {
+	server := testServer(t)
+	session := &kelos.Session{
+		ObjectMeta: metav1.ObjectMeta{Name: "chat", Namespace: "team-a"},
+		Spec: kelos.SessionSpec{Worker: kelos.WorkerSpec{
+			Type:        "codex",
+			Credentials: &kelos.Credentials{Type: kelos.CredentialTypeNone},
+		}},
+		Status: kelos.SessionStatus{
+			Phase: kelos.SessionPhaseSuspended,
+			Conditions: []metav1.Condition{{
+				Type:   kelos.SessionConditionReady,
+				Status: metav1.ConditionFalse,
+				Reason: sessionsuspend.IdlePolicyReason,
+			}},
+		},
+	}
+	if err := server.client.Create(t.Context(), session); err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/api/sessions/team-a/chat/connect", nil)
+	request.Header.Set("Authorization", "Bearer secret-token")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "is resuming") {
+		t.Fatalf("idle-suspended Session response = %d body = %s", response.Code, response.Body.String())
+	}
+
+	var updated kelos.Session
+	if err := server.client.Get(t.Context(), client.ObjectKeyFromObject(session), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Annotations[sessionsuspend.ResumeRequestAnnotation] == "" {
+		t.Fatal("connect endpoint did not request an idle Session resume")
 	}
 }
 

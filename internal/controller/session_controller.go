@@ -28,6 +28,7 @@ import (
 	kelos "github.com/kelos-dev/kelos/api/v1alpha2"
 	"github.com/kelos-dev/kelos/internal/githubapp"
 	"github.com/kelos-dev/kelos/internal/sessionreset"
+	"github.com/kelos-dev/kelos/internal/sessionsuspend"
 	"github.com/kelos-dev/kelos/internal/sessionupdate"
 )
 
@@ -121,11 +122,29 @@ func (r *SessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := r.ensureSessionWorkspaceClaimOwnership(ctx, &session, &statefulSet); err != nil {
 		return ctrl.Result{}, err
 	}
-	if sessionSuspended(&session) {
+	if sessionManuallySuspended(&session) {
 		if err := r.setSessionReplicas(ctx, &statefulSet, 0); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{}, r.updateSessionStatus(ctx, &session, nil, kelos.SessionPhaseSuspended, "Session runtime is suspended", "RuntimeSuspended")
+		if err := r.updateSessionStatus(ctx, &session, nil, kelos.SessionPhaseSuspended, "Session runtime is suspended by user request", "UserRequested"); err != nil {
+			return ctrl.Result{}, err
+		}
+		if session.Annotations[sessionsuspend.ResumeRequestAnnotation] != "" {
+			if err := r.clearSessionIdleResumeRequest(ctx, &session); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{Requeue: true}, nil
+		}
+		return ctrl.Result{}, nil
+	}
+	if sessionsuspend.IsIdlePolicySuspended(&session) {
+		return r.reconcileIdleSuspendedSession(ctx, &session, &statefulSet)
+	}
+	if session.Annotations[sessionsuspend.ResumeRequestAnnotation] != "" {
+		if err := r.clearSessionIdleResumeRequest(ctx, &session); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
 	}
 	runtimeStopped := statefulSet.Spec.Replicas != nil && *statefulSet.Spec.Replicas == 0
 	if err := r.ensureSessionService(ctx, &session); err != nil {
@@ -178,6 +197,14 @@ func (r *SessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := r.updateSessionStatus(ctx, &session, &pod, phase, message, reason); err != nil {
 		return ctrl.Result{}, err
 	}
+	idleResult, handlingIdleSuspend, err := r.reconcileSessionIdlePolicy(ctx, &session, &statefulSet, &pod, time.Now())
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if handlingIdleSuspend {
+		return idleResult, nil
+	}
+	result = mergeReconcileResults(result, idleResult)
 	updateResult, waitingForUpdate, err := r.reconcileSessionRuntimeUpdate(ctx, &session, &statefulSet, &pod, phase)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -253,10 +280,14 @@ func (r *SessionReconciler) createSessionStatefulSet(ctx context.Context, sessio
 	phase := kelos.SessionPhasePending
 	message := "Session Pod is starting"
 	reason := "PodStarting"
-	if sessionSuspended(session) {
+	if sessionManuallySuspended(session) {
 		phase = kelos.SessionPhaseSuspended
-		message = "Session runtime is suspended"
-		reason = "RuntimeSuspended"
+		message = "Session runtime is suspended by user request"
+		reason = "UserRequested"
+	} else if sessionIdleSuspendedWithoutWake(session) {
+		phase = kelos.SessionPhaseSuspended
+		message = "Session runtime is suspended after exceeding its idle policy"
+		reason = sessionsuspend.IdlePolicyReason
 	}
 	if err := r.updateSessionStatus(ctx, session, nil, phase, message, reason); err != nil {
 		return ctrl.Result{}, err
@@ -475,11 +506,11 @@ func (r *SessionReconciler) startSessionAfterReset(ctx context.Context, session 
 	if statefulSet.DeletionTimestamp != nil {
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
-	if sessionSuspended(session) {
+	if sessionManuallySuspended(session) {
 		if err := r.setSessionReplicas(ctx, statefulSet, 0); err != nil {
 			return ctrl.Result{}, err
 		}
-		if err := r.updateSessionStatus(ctx, session, nil, kelos.SessionPhaseSuspended, "Session runtime is suspended", "RuntimeSuspended"); err != nil {
+		if err := r.updateSessionStatus(ctx, session, nil, kelos.SessionPhaseSuspended, "Session runtime is suspended by user request", "UserRequested"); err != nil {
 			return ctrl.Result{}, err
 		}
 		if err := r.clearSessionReset(ctx, session); err != nil {
@@ -558,15 +589,186 @@ func (r *SessionReconciler) setSessionReplicas(ctx context.Context, statefulSet 
 	return nil
 }
 
-func sessionSuspended(session *kelos.Session) bool {
+func sessionManuallySuspended(session *kelos.Session) bool {
 	return ptr.Deref(session.Spec.Suspend, false)
 }
 
+func sessionIdleSuspendedWithoutWake(session *kelos.Session) bool {
+	return sessionsuspend.IsIdlePolicySuspended(session) &&
+		session.Annotations[sessionsuspend.ResumeRequestAnnotation] == "" &&
+		session.Annotations[sessionreset.RequestAnnotation] == ""
+}
+
+func (r *SessionReconciler) reconcileIdleSuspendedSession(
+	ctx context.Context,
+	session *kelos.Session,
+	statefulSet *appsv1.StatefulSet,
+) (ctrl.Result, error) {
+	if session.Annotations[sessionsuspend.ResumeRequestAnnotation] == "" {
+		if err := r.setSessionReplicas(ctx, statefulSet, 0); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, r.updateSessionStatus(
+			ctx,
+			session,
+			nil,
+			kelos.SessionPhaseSuspended,
+			"Session runtime is suspended after exceeding its idle policy",
+			sessionsuspend.IdlePolicyReason,
+		)
+	}
+	if hasSessionRuntimeUpdateAnnotations(session) {
+		if err := r.clearSessionRuntimeUpdateRequest(ctx, session); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+	if err := r.setSessionReplicas(ctx, statefulSet, 1); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.updateSessionStatus(ctx, session, nil, kelos.SessionPhasePending, "Session Pod is resuming after idle suspension", "IdleResumeRequested"); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.clearSessionIdleResumeRequest(ctx, session); err != nil {
+		return ctrl.Result{}, err
+	}
+	log.FromContext(ctx).Info("Resumed idle-suspended Session", "session", session.Name)
+	if r.Recorder != nil {
+		r.Recorder.Event(session, corev1.EventTypeNormal, "SessionIdleResumed", "Resumed Session after a client requested a connection")
+	}
+	return ctrl.Result{Requeue: true}, nil
+}
+
+func (r *SessionReconciler) reconcileSessionIdlePolicy(
+	ctx context.Context,
+	session *kelos.Session,
+	statefulSet *appsv1.StatefulSet,
+	pod *corev1.Pod,
+	now time.Time,
+) (ctrl.Result, bool, error) {
+	expired, remaining := sessionIdleSuspendRemaining(session, now)
+	request, idleSuspendRequested, err := sessionIdleSuspendRequest(session)
+	if err != nil {
+		return ctrl.Result{}, true, err
+	}
+	if !expired {
+		if idleSuspendRequested {
+			if err := r.clearSessionRuntimeUpdateRequest(ctx, session); err != nil {
+				return ctrl.Result{}, true, err
+			}
+			return ctrl.Result{Requeue: true}, true, nil
+		}
+		return ctrl.Result{RequeueAfter: remaining}, false, nil
+	}
+
+	deadline, ok := sessionIdleSuspendDeadline(session)
+	if !ok {
+		return ctrl.Result{}, false, nil
+	}
+	desired := sessionupdate.NewIdleSuspendRequest(pod.UID, deadline)
+	if !idleSuspendRequested || request != desired {
+		encoded, err := sessionupdate.Encode(desired)
+		if err != nil {
+			return ctrl.Result{}, true, err
+		}
+		if err := r.setSessionRuntimeUpdateRequest(ctx, session, encoded); err != nil {
+			return ctrl.Result{}, true, err
+		}
+		if r.Recorder != nil {
+			r.Recorder.Eventf(session, corev1.EventTypeNormal, "SessionIdleDraining", "Waiting for Session Pod %s to drain before suspending it", pod.Name)
+		}
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, true, nil
+	}
+
+	var report sessionupdate.Report
+	if value := session.Annotations[sessionupdate.ReportAnnotation]; value != "" {
+		report, err = sessionupdate.DecodeReport(value)
+		if err != nil {
+			return ctrl.Result{}, true, fmt.Errorf("reading idle suspension drain report for Session %q: %w", session.Name, err)
+		}
+	}
+	drained := report.RequestID == desired.ID && report.PodUID == pod.UID && report.Phase == sessionupdate.PhaseDrained
+	if !drained {
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, true, nil
+	}
+
+	if err := r.updateSessionStatus(
+		ctx,
+		session,
+		nil,
+		kelos.SessionPhaseSuspended,
+		"Session runtime is suspended after exceeding its idle policy",
+		sessionsuspend.IdlePolicyReason,
+	); err != nil {
+		return ctrl.Result{}, true, err
+	}
+	if err := r.setSessionReplicas(ctx, statefulSet, 0); err != nil {
+		return ctrl.Result{}, true, fmt.Errorf("suspending idle Session %q: %w", session.Name, err)
+	}
+	log.FromContext(ctx).Info("Suspended idle Session", "session", session.Name)
+	if r.Recorder != nil {
+		r.Recorder.Event(session, corev1.EventTypeNormal, "SessionIdleSuspended", "Suspended Session after it exceeded its idle policy")
+	}
+	return ctrl.Result{Requeue: true}, true, nil
+}
+
+func sessionIdleSuspendRemaining(session *kelos.Session, now time.Time) (bool, time.Duration) {
+	deadline, ok := sessionIdleSuspendDeadline(session)
+	if !ok {
+		return false, 0
+	}
+	remaining := deadline.Sub(now)
+	if remaining <= 0 {
+		return true, 0
+	}
+	return false, remaining
+}
+
+func sessionIdleSuspendDeadline(session *kelos.Session) (time.Time, bool) {
+	if session.Spec.IdlePolicy == nil || session.Spec.IdlePolicy.SuspendAfterSeconds == nil || sessionManuallySuspended(session) {
+		return time.Time{}, false
+	}
+	active := apiMeta.FindStatusCondition(session.Status.Conditions, kelos.SessionConditionActive)
+	if active == nil || active.Status != metav1.ConditionFalse {
+		return time.Time{}, false
+	}
+
+	idleSince := session.CreationTimestamp.Time
+	if session.Status.LastActivityTime != nil && session.Status.LastActivityTime.After(idleSince) {
+		idleSince = session.Status.LastActivityTime.Time
+	}
+	if active.LastTransitionTime.After(idleSince) {
+		idleSince = active.LastTransitionTime.Time
+	}
+	return idleSince.Add(time.Duration(*session.Spec.IdlePolicy.SuspendAfterSeconds) * time.Second), true
+}
+
+func sessionIdleSuspendRequest(session *kelos.Session) (sessionupdate.Request, bool, error) {
+	value := session.Annotations[sessionupdate.RequestAnnotation]
+	if value == "" {
+		return sessionupdate.Request{}, false, nil
+	}
+	request, err := sessionupdate.Decode(value)
+	if err != nil {
+		return sessionupdate.Request{}, false, fmt.Errorf("reading runtime drain request for Session %q: %w", session.Name, err)
+	}
+	return request, request.Operation == sessionupdate.OperationIdleSuspend, nil
+}
+
 func sessionRuntimeReplicas(session *kelos.Session) int32 {
-	if sessionSuspended(session) {
+	if sessionManuallySuspended(session) || sessionIdleSuspendedWithoutWake(session) {
 		return 0
 	}
 	return 1
+}
+
+func (r *SessionReconciler) clearSessionIdleResumeRequest(ctx context.Context, session *kelos.Session) error {
+	original := session.DeepCopy()
+	delete(session.Annotations, sessionsuspend.ResumeRequestAnnotation)
+	if err := r.Patch(ctx, session, client.MergeFrom(original)); err != nil {
+		return fmt.Errorf("clearing idle resume request for Session %q: %w", session.Name, err)
+	}
+	return nil
 }
 
 func (r *SessionReconciler) setSessionResetState(ctx context.Context, session *kelos.Session, value string) error {

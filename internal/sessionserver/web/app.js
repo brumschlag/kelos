@@ -939,6 +939,8 @@ function setSourceWorkspace(workspaceRef) {
 }
 
 function sourceFitsForm(manifest) {
+  const allowedSpecFields = new Set(['worker', 'suspend', 'initialBranch', 'initialPrompt', 'volumeClaimTemplate']);
+  if (Object.keys(manifest.spec).some(key => !allowedSpecFields.has(key))) return false;
   if (manifest.spec.suspend === true) return false;
   const worker = manifest.spec.worker;
   const allowedWorkerFields = new Set(['type', 'credentials', 'model', 'workspaceRef', 'agentConfigRefs']);
@@ -1089,6 +1091,7 @@ function selectSession(session) {
     elements.messages.append(elements.welcome || createWelcome());
     return;
   }
+  if (session.idleSuspended) resumeIdleSession(session);
   const view = cachedSessionView(session);
   const hasCachedMessages = view.messages.hasChildNodes();
   const hasCachedHistory = hasCachedMessages && !view.statusPlaceholder;
@@ -1116,6 +1119,15 @@ function selectSession(session) {
   view.statusPlaceholder = true;
   if (session.phase === 'Ready' && !session.resetting) connectSocket();
   scheduleBottomAnchor();
+}
+
+async function resumeIdleSession(session) {
+  try {
+    await api(`/api/sessions/${encodeURIComponent(session.namespace)}/${encodeURIComponent(session.name)}/resume`, {method: 'POST'});
+    await loadSessions({quiet: true});
+  } catch (error) {
+    showToast(error.message);
+  }
 }
 
 function createWelcome() {

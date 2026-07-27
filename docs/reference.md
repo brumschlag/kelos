@@ -215,6 +215,7 @@ the Session resource and is visible through the Kubernetes API.
 | `spec.initialBranch` | Git branch used to initialize the Session workspace. Checks out the branch from `origin` when it exists, or creates it from the Workspace ref. Requires `spec.worker.workspaceRef` | No |
 | `spec.initialPrompt` | Prompt submitted when the Session starts without retained conversation history. An `emptyDir` workspace may submit it again after Pod replacement | No |
 | `spec.volumeClaimTemplate` | PersistentVolumeClaimSpec for the Session workspace. Recommended for durable Sessions; omit to use an ephemeral `emptyDir` workspace | No |
+| `spec.idlePolicy.suspendAfterSeconds` | Suspend the runtime after it has reported no active turn for this many seconds. Omit to disable automatic suspension; zero suspends as soon as the runtime reports that it is idle | No |
 | `status.phase` | Infrastructure phase: `Pending`, `Ready`, `Suspended`, or `Failed` | Output |
 | `status.podName` | Session Pod name | Output |
 | `status.podUID` | Identity of the Pod running the live conversation | Output |
@@ -308,6 +309,16 @@ Session Pod does not change the order. The web client shows activity,
 `status.branch`, and the pull request with a colored, text-labeled state in both
 the Session sidebar and conversation header.
 
+When `spec.idlePolicy.suspendAfterSeconds` is set, Kelos measures idleness from
+the latest of Session creation, `status.lastActivityTime`, and the current
+`Active=False` transition. When the deadline passes, Kelos drains accepted
+turns, stops the runtime, reports `status.phase: Suspended` with the
+`IdlePolicyTriggered` Ready-condition reason, and retains persistent workspace
+storage. `spec.suspend` remains unchanged. Selecting the Session in the web
+interface or connecting through the terminal resumes an idle-suspended Session.
+Sessions suspended with `spec.suspend: true` remain suspended until that field
+is set back to `false`.
+
 When `spec.initialBranch` is set, workspace initialization fetches and checks
 out that branch from `origin`, or creates it from `Workspace.spec.ref` when the
 remote branch does not exist. This establishes the initial branch without
@@ -380,6 +391,7 @@ webhook-driven TaskSpawner.
 | `spec.sessionTemplate.initialPrompt` | Go text/template submitted when the created Session starts | Yes |
 | `spec.sessionTemplate.suspend` | Whether each created Session starts suspended (defaults to `false`) | No |
 | `spec.sessionTemplate.volumeClaimTemplate` | Persistent workspace for each Session; recommended so conversation history survives Pod replacement | No |
+| `spec.sessionTemplate.idlePolicy.suspendAfterSeconds` | Idle duration copied to each Session before its runtime is suspended automatically | No |
 | `status.observedGeneration` | Most recent generation observed by the controller | Output |
 | `status.totalSessions` | Current number of Sessions associated with this spawner | Output |
 | `status.lastSessionName` | Session most recently created or confirmed to exist | Output |

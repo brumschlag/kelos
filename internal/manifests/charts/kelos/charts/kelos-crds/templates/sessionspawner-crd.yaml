@@ -61,6 +61,22 @@ spec:
                   The initialPrompt and initialBranch fields are Go text/templates rendered
                   with the matching GitHub webhook context.
                 properties:
+                  idlePolicy:
+                    description: |-
+                      IdlePolicy configures automatic lifecycle actions after the Session has
+                      been continuously idle.
+                    properties:
+                      suspendAfterSeconds:
+                        description: |-
+                          SuspendAfterSeconds suspends the Session after it has been continuously
+                          idle for this many seconds. Omit this field to disable automatic
+                          suspension. Zero suspends the Session as soon as the runtime reports that
+                          it is idle. Automatic suspension does not change spec.suspend, and a
+                          client connection resumes the Session.
+                        format: int32
+                        minimum: 0
+                        type: integer
+                    type: object
                   initialBranch:
                     description: |-
                       InitialBranch is the git branch to check out when initializing the Session

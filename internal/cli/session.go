@@ -23,6 +23,7 @@ import (
 
 	kelos "github.com/kelos-dev/kelos/api/v1alpha2"
 	"github.com/kelos-dev/kelos/internal/sessionruntime"
+	"github.com/kelos-dev/kelos/internal/sessionsuspend"
 )
 
 const sessionRuntimeClient = "/kelos/bin/kelos-session-runtime"
@@ -128,9 +129,10 @@ func (s *sessionPodStream) Close() {
 }
 
 type sessionReconnectDependencies struct {
-	getSession  func(context.Context, string, string) (*kelos.Session, error)
-	openStream  func(context.Context, string, string, io.Writer) (*sessionPodStream, error)
-	runTerminal func(context.Context, io.Reader, io.Writer, io.Reader, io.Writer, bool) error
+	getSession    func(context.Context, string, string) (*kelos.Session, error)
+	requestResume func(context.Context, string, string) error
+	openStream    func(context.Context, string, string, io.Writer) (*sessionPodStream, error)
+	runTerminal   func(context.Context, io.Reader, io.Writer, io.Reader, io.Writer, bool) error
 }
 
 type sessionEventResult struct {
@@ -299,6 +301,15 @@ func connectSession(ctx context.Context, restConfig *rest.Config, namespace, nam
 			}
 			return session, nil
 		},
+		requestResume: func(ctx context.Context, namespace, name string) error {
+			_, _, err := sessionsuspend.RequestResume(
+				ctx,
+				controllerClient,
+				client.ObjectKey{Namespace: namespace, Name: name},
+				string(uuid.NewUUID()),
+			)
+			return err
+		},
 		openStream: func(ctx context.Context, namespace, podName string, diagnostics io.Writer) (*sessionPodStream, error) {
 			return openSessionPodStream(ctx, restConfig, namespace, podName, diagnostics)
 		},
@@ -414,7 +425,16 @@ func connectSessionWithDependencies(
 	connectedBefore := false
 	pendingRequests := make([]pendingSessionRequest, 0)
 	for {
-		session, err := waitForReadySession(terminalCtx, namespace, name, diagnostics, dependencies.getSession, terminalDone, connectedBefore)
+		session, err := waitForReadySession(
+			terminalCtx,
+			namespace,
+			name,
+			diagnostics,
+			dependencies.getSession,
+			dependencies.requestResume,
+			terminalDone,
+			connectedBefore,
+		)
 		if err != nil {
 			if errors.Is(err, errSessionTerminalClosed) {
 				return nil
@@ -605,10 +625,12 @@ func waitForReadySession(
 	namespace, name string,
 	stderr io.Writer,
 	getSession func(context.Context, string, string) (*kelos.Session, error),
+	requestResume func(context.Context, string, string) error,
 	terminalDone <-chan error,
 	retryFailed bool,
 ) (*kelos.Session, error) {
 	reportedWaiting := false
+	resumeRequested := false
 	for {
 		session, err := getSession(ctx, namespace, name)
 		if apierrors.IsNotFound(err) {
@@ -626,6 +648,18 @@ func waitForReadySession(
 			}
 			if !reportedWaiting {
 				reportSessionTerminalDiagnostic(stderr, sessionTerminalStatusReconnecting, "Waiting for Session %q to recover", name)
+				reportedWaiting = true
+			}
+		} else if sessionsuspend.IsIdlePolicySuspended(session) {
+			if !resumeRequested {
+				if requestResume == nil {
+					return nil, fmt.Errorf("resuming idle Session %q: resume requester is not configured", name)
+				}
+				if err := requestResume(ctx, namespace, name); err != nil {
+					return nil, fmt.Errorf("resuming idle Session %q: %w", name, err)
+				}
+				reportSessionTerminalDiagnostic(stderr, sessionTerminalStatusConnecting, "Resuming idle Session %q", name)
+				resumeRequested = true
 				reportedWaiting = true
 			}
 		} else if session.Status.Phase == kelos.SessionPhaseSuspended {

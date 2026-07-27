@@ -296,6 +296,54 @@ spec:
 		Expect(k8sClient.Update(ctx, session)).To(Succeed())
 	})
 
+	It("allows a typed client to suspend a Session with stored empty optional strings", func() {
+		session := &unstructured.Unstructured{Object: map[string]interface{}{
+			"apiVersion": "kelos.dev/v1alpha2",
+			"kind":       "Session",
+			"metadata": map[string]interface{}{
+				"name":      "mutable-suspend-stored-empty",
+				"namespace": namespace,
+			},
+			"spec": map[string]interface{}{
+				"worker": map[string]interface{}{
+					"type":   "codex",
+					"model":  "",
+					"effort": "",
+					"image":  "",
+					"credentials": map[string]interface{}{
+						"type": "none",
+					},
+				},
+				"initialBranch": "",
+				"initialPrompt": "",
+			},
+		}}
+		Expect(k8sClient.Create(ctx, session)).To(Succeed())
+		for _, path := range [][]string{
+			{"spec", "worker", "model"},
+			{"spec", "worker", "effort"},
+			{"spec", "worker", "image"},
+			{"spec", "initialBranch"},
+			{"spec", "initialPrompt"},
+		} {
+			value, found, err := unstructured.NestedString(session.Object, path...)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(found).To(BeTrue(), "stored field %s is absent", strings.Join(path, "."))
+			Expect(value).To(BeEmpty())
+		}
+
+		var current kelos.Session
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(session), &current)).To(Succeed())
+		current.Spec.Suspend = ptr.To(true)
+		Expect(k8sClient.Update(ctx, &current)).To(Succeed())
+	})
+
+	It("rejects a negative idle suspension duration", func() {
+		session := validSession(namespace, "negative-idle-suspend", "codex")
+		session.Spec.IdlePolicy = &kelos.SessionIdlePolicy{SuspendAfterSeconds: ptr.To(int32(-1))}
+		Expect(k8sClient.Create(ctx, session)).NotTo(Succeed())
+	})
+
 	It("keeps Session configuration immutable", func() {
 		mutations := []struct {
 			name   string
@@ -312,6 +360,9 @@ spec:
 			}},
 			{name: "volume-claim-template", mutate: func(session *kelos.Session) {
 				session.Spec.VolumeClaimTemplate = nil
+			}},
+			{name: "idle-policy", mutate: func(session *kelos.Session) {
+				session.Spec.IdlePolicy = &kelos.SessionIdlePolicy{SuspendAfterSeconds: ptr.To(int32(60))}
 			}},
 		}
 		for _, mutation := range mutations {

@@ -149,8 +149,15 @@ func (s *Server) runSessionUpdateReporter(ctx context.Context) {
 }
 
 func (s *Server) reportSessionUpdate(ctx context.Context) error {
+	report := s.sessionRuntimeUpdateReport()
+	if report != nil && report.Phase == sessionupdate.PhaseDrained && s.idleSuspendDrained() {
+		if err := s.waitForSessionStatusPublish(ctx); err != nil {
+			return err
+		}
+		report = s.sessionRuntimeUpdateReport()
+	}
 	var value any
-	if report := s.sessionRuntimeUpdateReport(); report != nil {
+	if report != nil {
 		encoded, err := sessionupdate.EncodeReport(*report)
 		if err != nil {
 			return err
@@ -185,6 +192,14 @@ func (s *Server) sessionRuntimeUpdateReport() *sessionupdate.Report {
 		}
 	}
 	return report
+}
+
+func (s *Server) idleSuspendDrained() bool {
+	s.submitMu.Lock()
+	defer s.submitMu.Unlock()
+	return s.updateRequest != nil &&
+		s.updateRequest.Operation == sessionupdate.OperationIdleSuspend &&
+		s.outstanding == 0
 }
 
 func waitForSessionUpdateRetry(ctx context.Context) bool {

@@ -86,6 +86,23 @@ type SessionSpec struct {
 	// this field to use an ephemeral emptyDir workspace, primarily for development.
 	// +optional
 	VolumeClaimTemplate *corev1.PersistentVolumeClaimSpec `json:"volumeClaimTemplate,omitempty"`
+
+	// IdlePolicy configures automatic lifecycle actions after the Session has
+	// been continuously idle.
+	// +optional
+	IdlePolicy *SessionIdlePolicy `json:"idlePolicy,omitempty"`
+}
+
+// SessionIdlePolicy configures automatic lifecycle actions for an idle Session.
+type SessionIdlePolicy struct {
+	// SuspendAfterSeconds suspends the Session after it has been continuously
+	// idle for this many seconds. Omit this field to disable automatic
+	// suspension. Zero suspends the Session as soon as the runtime reports that
+	// it is idle. Automatic suspension does not change spec.suspend, and a
+	// client connection resumes the Session.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	SuspendAfterSeconds *int32 `json:"suspendAfterSeconds,omitempty"`
 }
 
 // SessionStatus defines the observed state of a Session.
@@ -148,10 +165,18 @@ type Session struct {
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
 	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:XValidation:rule="self.worker == oldSelf.worker",message="worker is immutable"
-	// +kubebuilder:validation:XValidation:rule="has(self.initialBranch) == has(oldSelf.initialBranch) && (!has(self.initialBranch) || self.initialBranch == oldSelf.initialBranch)",message="initialBranch is immutable"
-	// +kubebuilder:validation:XValidation:rule="has(self.initialPrompt) == has(oldSelf.initialPrompt) && (!has(self.initialPrompt) || self.initialPrompt == oldSelf.initialPrompt)",message="initialPrompt is immutable"
+	// +kubebuilder:validation:XValidation:rule="self.worker.type == oldSelf.worker.type",message="worker.type is immutable"
+	// +kubebuilder:validation:XValidation:rule="self.worker.credentials == oldSelf.worker.credentials",message="worker.credentials is immutable"
+	// +kubebuilder:validation:XValidation:rule="(!has(self.worker.model) ? '' : self.worker.model) == (!has(oldSelf.worker.model) ? '' : oldSelf.worker.model)",message="worker.model is immutable"
+	// +kubebuilder:validation:XValidation:rule="(!has(self.worker.effort) ? '' : self.worker.effort) == (!has(oldSelf.worker.effort) ? '' : oldSelf.worker.effort)",message="worker.effort is immutable"
+	// +kubebuilder:validation:XValidation:rule="(!has(self.worker.image) ? '' : self.worker.image) == (!has(oldSelf.worker.image) ? '' : oldSelf.worker.image)",message="worker.image is immutable"
+	// +kubebuilder:validation:XValidation:rule="has(self.worker.workspaceRef) == has(oldSelf.worker.workspaceRef) && (!has(self.worker.workspaceRef) || self.worker.workspaceRef == oldSelf.worker.workspaceRef)",message="worker.workspaceRef is immutable"
+	// +kubebuilder:validation:XValidation:rule="has(self.worker.agentConfigRefs) == has(oldSelf.worker.agentConfigRefs) && (!has(self.worker.agentConfigRefs) || self.worker.agentConfigRefs == oldSelf.worker.agentConfigRefs)",message="worker.agentConfigRefs is immutable"
+	// +kubebuilder:validation:XValidation:rule="has(self.worker.podOverrides) == has(oldSelf.worker.podOverrides) && (!has(self.worker.podOverrides) || self.worker.podOverrides == oldSelf.worker.podOverrides)",message="worker.podOverrides is immutable"
+	// +kubebuilder:validation:XValidation:rule="(!has(self.initialBranch) ? '' : self.initialBranch) == (!has(oldSelf.initialBranch) ? '' : oldSelf.initialBranch)",message="initialBranch is immutable"
+	// +kubebuilder:validation:XValidation:rule="(!has(self.initialPrompt) ? '' : self.initialPrompt) == (!has(oldSelf.initialPrompt) ? '' : oldSelf.initialPrompt)",message="initialPrompt is immutable"
 	// +kubebuilder:validation:XValidation:rule="has(self.volumeClaimTemplate) == has(oldSelf.volumeClaimTemplate) && (!has(self.volumeClaimTemplate) || self.volumeClaimTemplate == oldSelf.volumeClaimTemplate)",message="volumeClaimTemplate is immutable"
+	// +kubebuilder:validation:XValidation:rule="has(self.idlePolicy) == has(oldSelf.idlePolicy) && (!has(self.idlePolicy) || self.idlePolicy == oldSelf.idlePolicy)",message="idlePolicy is immutable"
 	Spec   SessionSpec   `json:"spec"`
 	Status SessionStatus `json:"status,omitempty"`
 }

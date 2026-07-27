@@ -60,6 +60,7 @@ type turnRequest struct {
 type sessionStatusPublishRequest struct {
 	active                       bool
 	refreshWorkspaceAfterPublish bool
+	completed                    chan struct{}
 }
 
 type pendingInput struct {
@@ -251,6 +252,9 @@ func (s *Server) Serve(ctx context.Context) error {
 		s.journal.Close()
 		_ = os.Remove(s.config.SocketPath)
 	}()
+	if s.publishSessionStatus != nil {
+		go s.runSessionStatusPublishes(serveCtx)
+	}
 	if err := s.initializeSessionUpdate(serveCtx); err != nil {
 		return err
 	}
@@ -280,9 +284,6 @@ func (s *Server) Serve(ctx context.Context) error {
 
 	providerDone := s.provider.Done()
 	go s.runWorkspaceStatusRefreshes(serveCtx)
-	if s.publishSessionStatus != nil {
-		go s.runSessionStatusPublishes(serveCtx)
-	}
 	s.requestWorkspaceStatusRefresh()
 	s.requestSessionStatusPublish()
 	go func() {
@@ -367,18 +368,32 @@ func (s *Server) runWorkspaceStatusRefreshes(ctx context.Context) {
 }
 
 func (s *Server) requestSessionStatusPublish() {
-	s.queueSessionStatusPublish(false, false)
+	s.queueSessionStatusPublish(false, false, nil)
 }
 
 func (s *Server) requestSessionStatusPublishAfterWorkspaceRefresh() {
-	s.queueSessionStatusPublish(true, false)
+	s.queueSessionStatusPublish(true, false, nil)
 }
 
 func (s *Server) requestPeriodicSessionStatusPublish() {
-	s.queueSessionStatusPublish(true, true)
+	s.queueSessionStatusPublish(true, true, nil)
 }
 
-func (s *Server) queueSessionStatusPublish(force, refreshWorkspaceAfterPublish bool) {
+func (s *Server) waitForSessionStatusPublish(ctx context.Context) error {
+	if s.publishSessionStatus == nil {
+		return nil
+	}
+	completed := make(chan struct{})
+	s.queueSessionStatusPublish(true, false, completed)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-completed:
+		return nil
+	}
+}
+
+func (s *Server) queueSessionStatusPublish(force, refreshWorkspaceAfterPublish bool, completed chan struct{}) {
 	if s.publishSessionStatus == nil {
 		return
 	}
@@ -390,6 +405,7 @@ func (s *Server) queueSessionStatusPublish(force, refreshWorkspaceAfterPublish b
 		s.sessionStatusPublishQueue = append(s.sessionStatusPublishQueue, sessionStatusPublishRequest{
 			active:                       active,
 			refreshWorkspaceAfterPublish: refreshWorkspaceAfterPublish,
+			completed:                    completed,
 		})
 	}
 	s.sessionStatusMu.Unlock()
@@ -449,6 +465,9 @@ func (s *Server) runSessionStatusPublishes(ctx context.Context) {
 			next = s.sessionStatusRetryInterval
 		} else {
 			s.completeSessionStatusPublish()
+			if request.completed != nil {
+				close(request.completed)
+			}
 			if request.refreshWorkspaceAfterPublish {
 				s.requestWorkspaceStatusRefresh()
 			}
@@ -533,6 +552,9 @@ func (s *Server) submitMessage(text, requestID string) error {
 	s.submitMu.Lock()
 	defer s.submitMu.Unlock()
 	if s.updateRequest != nil {
+		if s.updateRequest.Operation == sessionupdate.OperationIdleSuspend {
+			return errors.New("Session runtime is preparing to suspend; retry shortly")
+		}
 		return errors.New("Session runtime is draining for an update; retry after it reconnects")
 	}
 	if err := s.journal.Err(); err != nil {

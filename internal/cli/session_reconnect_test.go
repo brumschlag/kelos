@@ -12,8 +12,11 @@ import (
 	"testing"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	kelos "github.com/kelos-dev/kelos/api/v1alpha2"
 	"github.com/kelos-dev/kelos/internal/sessionruntime"
+	"github.com/kelos-dev/kelos/internal/sessionsuspend"
 )
 
 func TestSessionTerminalReconnectsToReplacementPod(t *testing.T) {
@@ -220,6 +223,7 @@ func TestWaitForReadySessionReportsSuspension(t *testing.T) {
 			}
 			return &kelos.Session{Status: kelos.SessionStatus{Phase: kelos.SessionPhaseReady, PodName: "session-pod"}}, nil
 		},
+		nil,
 		make(chan error),
 		false,
 	)
@@ -230,6 +234,52 @@ func TestWaitForReadySessionReportsSuspension(t *testing.T) {
 		t.Fatalf("ready Session Pod = %q, want session-pod", session.Status.PodName)
 	}
 	if !strings.Contains(stderr.String(), `Waiting for Session "chat" to resume`) {
+		t.Fatalf("Session diagnostics = %q", stderr.String())
+	}
+}
+
+func TestWaitForReadySessionRequestsIdleResume(t *testing.T) {
+	var stderr bytes.Buffer
+	var reads atomic.Int32
+	var resumeRequests atomic.Int32
+	session, err := waitForReadySession(
+		t.Context(),
+		"default",
+		"chat",
+		&stderr,
+		func(context.Context, string, string) (*kelos.Session, error) {
+			if reads.Add(1) == 1 {
+				return &kelos.Session{Status: kelos.SessionStatus{
+					Phase: kelos.SessionPhaseSuspended,
+					Conditions: []metav1.Condition{{
+						Type:   kelos.SessionConditionReady,
+						Status: metav1.ConditionFalse,
+						Reason: sessionsuspend.IdlePolicyReason,
+					}},
+				}}, nil
+			}
+			return &kelos.Session{Status: kelos.SessionStatus{Phase: kelos.SessionPhaseReady, PodName: "session-pod"}}, nil
+		},
+		func(_ context.Context, namespace, name string) error {
+			if namespace != "default" || name != "chat" {
+				t.Fatalf("resume Session = %s/%s, want default/chat", namespace, name)
+			}
+			resumeRequests.Add(1)
+			return nil
+		},
+		make(chan error),
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.Status.PodName != "session-pod" {
+		t.Fatalf("ready Session Pod = %q, want session-pod", session.Status.PodName)
+	}
+	if resumeRequests.Load() != 1 {
+		t.Fatalf("resume requests = %d, want 1", resumeRequests.Load())
+	}
+	if !strings.Contains(stderr.String(), `Resuming idle Session "chat"`) {
 		t.Fatalf("Session diagnostics = %q", stderr.String())
 	}
 }

@@ -32,6 +32,7 @@ import (
 	kelos "github.com/kelos-dev/kelos/api/v1alpha2"
 	"github.com/kelos-dev/kelos/internal/githubapp"
 	"github.com/kelos-dev/kelos/internal/sessionreset"
+	"github.com/kelos-dev/kelos/internal/sessionsuspend"
 	"github.com/kelos-dev/kelos/internal/sessionupdate"
 )
 
@@ -1625,6 +1626,387 @@ func testSessionReconciler(cl client.Client, scheme *runtime.Scheme) *SessionRec
 		SessionRuntimeImage: "runtime:test",
 		Recorder:            record.NewFakeRecorder(10),
 	}
+}
+
+func TestSessionIdleSuspendRemaining(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.July, 27, 12, 0, 0, 0, time.UTC)
+	activeCondition := func(status metav1.ConditionStatus, transition time.Time) metav1.Condition {
+		return metav1.Condition{
+			Type:               kelos.SessionConditionActive,
+			Status:             status,
+			Reason:             "Test",
+			LastTransitionTime: metav1.NewTime(transition),
+		}
+	}
+	newSession := func(after *int32, status metav1.ConditionStatus) *kelos.Session {
+		session := testSession("idle", "codex")
+		session.CreationTimestamp = metav1.NewTime(now.Add(-time.Hour))
+		if after != nil {
+			session.Spec.IdlePolicy = &kelos.SessionIdlePolicy{SuspendAfterSeconds: after}
+		}
+		if status != "" {
+			session.Status.Conditions = []metav1.Condition{activeCondition(status, now.Add(-time.Minute))}
+		}
+		return session
+	}
+
+	tests := []struct {
+		name          string
+		session       *kelos.Session
+		wantExpired   bool
+		wantRemaining time.Duration
+	}{
+		{
+			name:    "no policy",
+			session: newSession(nil, metav1.ConditionFalse),
+		},
+		{
+			name:    "missing activity",
+			session: newSession(ptr.To(int32(60)), ""),
+		},
+		{
+			name:    "active",
+			session: newSession(ptr.To(int32(60)), metav1.ConditionTrue),
+		},
+		{
+			name:    "unknown activity",
+			session: newSession(ptr.To(int32(60)), metav1.ConditionUnknown),
+		},
+		{
+			name: "already suspended",
+			session: func() *kelos.Session {
+				session := newSession(ptr.To(int32(60)), metav1.ConditionFalse)
+				session.Spec.Suspend = ptr.To(true)
+				return session
+			}(),
+		},
+		{
+			name:          "before deadline",
+			session:       newSession(ptr.To(int32(600)), metav1.ConditionFalse),
+			wantRemaining: 9 * time.Minute,
+		},
+		{
+			name:        "after deadline",
+			session:     newSession(ptr.To(int32(30)), metav1.ConditionFalse),
+			wantExpired: true,
+		},
+		{
+			name:        "zero duration",
+			session:     newSession(ptr.To(int32(0)), metav1.ConditionFalse),
+			wantExpired: true,
+		},
+		{
+			name: "latest activity timestamp wins",
+			session: func() *kelos.Session {
+				session := newSession(ptr.To(int32(600)), metav1.ConditionFalse)
+				lastActivity := metav1.NewTime(now.Add(-30 * time.Second))
+				session.Status.LastActivityTime = &lastActivity
+				return session
+			}(),
+			wantRemaining: 9*time.Minute + 30*time.Second,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			expired, remaining := sessionIdleSuspendRemaining(tt.session, now)
+			if expired != tt.wantExpired || remaining != tt.wantRemaining {
+				t.Fatalf("sessionIdleSuspendRemaining() = (%t, %s), want (%t, %s)", expired, remaining, tt.wantExpired, tt.wantRemaining)
+			}
+		})
+	}
+}
+
+func TestSessionReconcilerSchedulesIdleSuspension(t *testing.T) {
+	t.Parallel()
+	session, statefulSet, pod, scheme := idleSessionReconcileObjects(t, "idle-schedule")
+	session.Spec.IdlePolicy = &kelos.SessionIdlePolicy{SuspendAfterSeconds: ptr.To(int32(600))}
+	idleSince := metav1.NewTime(time.Now().Add(-time.Minute))
+	session.Status.LastActivityTime = &idleSince
+	session.Status.Conditions = []metav1.Condition{{
+		Type:               kelos.SessionConditionActive,
+		Status:             metav1.ConditionFalse,
+		Reason:             "Idle",
+		LastTransitionTime: idleSince,
+	}}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&kelos.Session{}, &corev1.Pod{}, &appsv1.StatefulSet{}).
+		WithObjects(session, statefulSet, pod).
+		Build()
+
+	result, err := testSessionReconciler(cl, scheme).Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(session)})
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if result.RequeueAfter < 8*time.Minute || result.RequeueAfter > 10*time.Minute {
+		t.Fatalf("Reconcile() requeueAfter = %s, want near 9m", result.RequeueAfter)
+	}
+	var current kelos.Session
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(session), &current); err != nil {
+		t.Fatal(err)
+	}
+	if sessionManuallySuspended(&current) {
+		t.Fatal("Session was suspended before its idle deadline")
+	}
+}
+
+func TestSessionReconcilerSuspendsAndResumesIdleSession(t *testing.T) {
+	t.Parallel()
+	session, statefulSet, pod, scheme := idleSessionReconcileObjects(t, "idle-suspend")
+	pod.Labels[appsv1.StatefulSetRevisionLabel] = "stale"
+	session.Spec.IdlePolicy = &kelos.SessionIdlePolicy{SuspendAfterSeconds: ptr.To(int32(60))}
+	idleSince := metav1.NewTime(time.Now().Add(-10 * time.Minute))
+	session.Status.LastActivityTime = &idleSince
+	session.Status.Conditions = []metav1.Condition{{
+		Type:               kelos.SessionConditionActive,
+		Status:             metav1.ConditionFalse,
+		Reason:             "Idle",
+		LastTransitionTime: idleSince,
+	}}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&kelos.Session{}, &corev1.Pod{}, &appsv1.StatefulSet{}).
+		WithObjects(session, statefulSet, pod).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	reconciler := testSessionReconciler(cl, scheme)
+	reconciler.Recorder = recorder
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(session)})
+	if err != nil {
+		t.Fatalf("Reconcile() requesting idle drain error = %v", err)
+	}
+	if result.Requeue || result.RequeueAfter == 0 {
+		t.Fatalf("Reconcile() result = %#v, want drain polling", result)
+	}
+	var current kelos.Session
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(session), &current); err != nil {
+		t.Fatal(err)
+	}
+	if sessionManuallySuspended(&current) {
+		t.Fatal("Session was suspended before its runtime drained")
+	}
+	drainRequest, err := sessionupdate.Decode(current.Annotations[sessionupdate.RequestAnnotation])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if drainRequest.Operation != sessionupdate.OperationIdleSuspend || drainRequest.PodUID != pod.UID {
+		t.Fatalf("idle suspension drain request = %#v", drainRequest)
+	}
+	var currentPod corev1.Pod
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(pod), &currentPod); err != nil {
+		t.Fatalf("Session Pod was replaced before idle suspension: %v", err)
+	}
+
+	report, err := sessionupdate.EncodeReport(sessionupdate.Report{
+		RequestID: drainRequest.ID,
+		PodUID:    pod.UID,
+		Phase:     sessionupdate.PhaseDrained,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.Annotations[sessionupdate.ReportAnnotation] = report
+	if err := cl.Update(context.Background(), &current); err != nil {
+		t.Fatal(err)
+	}
+	result, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(session)})
+	if err != nil {
+		t.Fatalf("Reconcile() after idle drain error = %v", err)
+	}
+	if !result.Requeue {
+		t.Fatal("Reconcile() did not requeue after idle suspension")
+	}
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(session), &current); err != nil {
+		t.Fatal(err)
+	}
+	if sessionManuallySuspended(&current) {
+		t.Fatal("Session spec.suspend was changed by idle suspension")
+	}
+	if current.Status.Phase != kelos.SessionPhaseSuspended {
+		t.Fatalf("Session phase = %q, want %q", current.Status.Phase, kelos.SessionPhaseSuspended)
+	}
+	ready := apiMeta.FindStatusCondition(current.Status.Conditions, kelos.SessionConditionReady)
+	if ready == nil || ready.Reason != sessionsuspend.IdlePolicyReason {
+		t.Fatalf("Session Ready condition = %#v, want reason %q", ready, sessionsuspend.IdlePolicyReason)
+	}
+	var currentStatefulSet appsv1.StatefulSet
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(statefulSet), &currentStatefulSet); err != nil {
+		t.Fatal(err)
+	}
+	if currentStatefulSet.Spec.Replicas == nil || *currentStatefulSet.Spec.Replicas != 0 {
+		t.Fatalf("Session replicas = %v, want 0", currentStatefulSet.Spec.Replicas)
+	}
+	foundSuspendEvent := false
+	for len(recorder.Events) > 0 {
+		event := <-recorder.Events
+		if !strings.Contains(event, "SessionIdleSuspended") {
+			continue
+		}
+		foundSuspendEvent = true
+	}
+	if !foundSuspendEvent {
+		t.Fatal("expected a SessionIdleSuspended event")
+	}
+
+	if current.Annotations == nil {
+		current.Annotations = map[string]string{}
+	}
+	current.Annotations[sessionsuspend.ResumeRequestAnnotation] = "request-1"
+	if err := cl.Update(context.Background(), &current); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(session)}); err != nil {
+		t.Fatalf("Reconcile() clearing idle drain error = %v", err)
+	}
+	result, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(session)})
+	if err != nil {
+		t.Fatalf("Reconcile() resuming idle Session error = %v", err)
+	}
+	if !result.Requeue {
+		t.Fatal("Reconcile() did not requeue after resuming idle Session")
+	}
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(session), &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status.Phase != kelos.SessionPhasePending {
+		t.Fatalf("resumed Session phase = %q, want %q", current.Status.Phase, kelos.SessionPhasePending)
+	}
+	if current.Annotations[sessionsuspend.ResumeRequestAnnotation] != "" || hasSessionRuntimeUpdateAnnotations(&current) {
+		t.Fatalf("resume annotations were not cleared: %#v", current.Annotations)
+	}
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(statefulSet), &currentStatefulSet); err != nil {
+		t.Fatal(err)
+	}
+	if currentStatefulSet.Spec.Replicas == nil || *currentStatefulSet.Spec.Replicas != 1 {
+		t.Fatalf("resumed Session replicas = %v, want 1", currentStatefulSet.Spec.Replicas)
+	}
+}
+
+func TestSessionReconcilerCancelsIdleSuspensionWhenActivityRacesWithDrain(t *testing.T) {
+	t.Parallel()
+	session, statefulSet, pod, scheme := idleSessionReconcileObjects(t, "idle-race")
+	session.Spec.IdlePolicy = &kelos.SessionIdlePolicy{SuspendAfterSeconds: ptr.To(int32(60))}
+	idleSince := metav1.NewTime(time.Now().Add(-10 * time.Minute))
+	session.Status.LastActivityTime = &idleSince
+	session.Status.Conditions = []metav1.Condition{{
+		Type:               kelos.SessionConditionActive,
+		Status:             metav1.ConditionFalse,
+		Reason:             "Idle",
+		LastTransitionTime: idleSince,
+	}}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&kelos.Session{}, &corev1.Pod{}, &appsv1.StatefulSet{}).
+		WithObjects(session, statefulSet, pod).
+		Build()
+	reconciler := testSessionReconciler(cl, scheme)
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(session)}
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatalf("Reconcile() requesting idle drain error = %v", err)
+	}
+
+	var current kelos.Session
+	if err := cl.Get(context.Background(), request.NamespacedName, &current); err != nil {
+		t.Fatal(err)
+	}
+	drainRequest, err := sessionupdate.Decode(current.Annotations[sessionupdate.RequestAnnotation])
+	if err != nil {
+		t.Fatal(err)
+	}
+	recentActivity := metav1.Now()
+	current.Status.LastActivityTime = &recentActivity
+	apiMeta.SetStatusCondition(&current.Status.Conditions, metav1.Condition{
+		Type:               kelos.SessionConditionActive,
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: current.Generation,
+		Reason:             "Idle",
+		Message:            "Session runtime is idle",
+		LastTransitionTime: recentActivity,
+	})
+	if err := cl.Status().Update(context.Background(), &current); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Get(context.Background(), request.NamespacedName, &current); err != nil {
+		t.Fatal(err)
+	}
+	report, err := sessionupdate.EncodeReport(sessionupdate.Report{
+		RequestID: drainRequest.ID,
+		PodUID:    pod.UID,
+		Phase:     sessionupdate.PhaseDrained,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.Annotations[sessionupdate.ReportAnnotation] = report
+	if err := cl.Update(context.Background(), &current); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := reconciler.Reconcile(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Reconcile() after raced activity error = %v", err)
+	}
+	if !result.Requeue {
+		t.Fatalf("Reconcile() result = %#v, want requeue after cancelling drain", result)
+	}
+	if err := cl.Get(context.Background(), request.NamespacedName, &current); err != nil {
+		t.Fatal(err)
+	}
+	if sessionManuallySuspended(&current) {
+		t.Fatal("Session was suspended after activity raced with its idle drain")
+	}
+	if hasSessionRuntimeUpdateAnnotations(&current) {
+		t.Fatalf("idle drain annotations were not cleared: %#v", current.Annotations)
+	}
+
+	result, err = reconciler.Reconcile(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Reconcile() rescheduling idle suspension error = %v", err)
+	}
+	if result.RequeueAfter <= 0 || result.RequeueAfter > time.Minute {
+		t.Fatalf("Reconcile() requeueAfter = %s, want a fresh idle deadline", result.RequeueAfter)
+	}
+}
+
+func idleSessionReconcileObjects(t *testing.T, name string) (*kelos.Session, *appsv1.StatefulSet, *corev1.Pod, *runtime.Scheme) {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{appsv1.AddToScheme, corev1.AddToScheme, rbacv1.AddToScheme, kelos.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	session := testSession(name, "codex")
+	session.Generation = 1
+	session.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Hour))
+	statefulSet := testSessionStatefulSet(session)
+	statefulSet.Generation = 1
+	statefulSet.Status.ObservedGeneration = 1
+	statefulSet.Status.UpdateRevision = "current"
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            statefulSet.Name + "-0",
+			Namespace:       session.Namespace,
+			UID:             types.UID(name + "-pod"),
+			Labels:          map[string]string{appsv1.StatefulSetRevisionLabel: "current"},
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(statefulSet, appsv1.SchemeGroupVersion.WithKind("StatefulSet"))},
+		},
+		Spec: *statefulSet.Spec.Template.Spec.DeepCopy(),
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+	session.Status = kelos.SessionStatus{
+		ObservedGeneration: session.Generation,
+		Phase:              kelos.SessionPhaseReady,
+		PodName:            pod.Name,
+		PodUID:             pod.UID,
+	}
+	return session, statefulSet, pod, scheme
 }
 
 func findVolume(volumes []corev1.Volume, name string) *corev1.Volume {

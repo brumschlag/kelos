@@ -697,6 +697,22 @@ spec:
           spec:
             description: SessionSpec defines the desired state of a Session.
             properties:
+              idlePolicy:
+                description: |-
+                  IdlePolicy configures automatic lifecycle actions after the Session has
+                  been continuously idle.
+                properties:
+                  suspendAfterSeconds:
+                    description: |-
+                      SuspendAfterSeconds suspends the Session after it has been continuously
+                      idle for this many seconds. Omit this field to disable automatic
+                      suspension. Zero suspends the Session as soon as the runtime reports that
+                      it is idle. Automatic suspension does not change spec.suspend, and a
+                      client connection resumes the Session.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                type: object
               initialBranch:
                 description: |-
                   InitialBranch is the git branch to check out when initializing the Session
@@ -7803,18 +7819,44 @@ spec:
             - worker
             type: object
             x-kubernetes-validations:
-            - message: worker is immutable
-              rule: self.worker == oldSelf.worker
+            - message: worker.type is immutable
+              rule: self.worker.type == oldSelf.worker.type
+            - message: worker.credentials is immutable
+              rule: self.worker.credentials == oldSelf.worker.credentials
+            - message: worker.model is immutable
+              rule: '(!has(self.worker.model) ? '''' : self.worker.model) == (!has(oldSelf.worker.model)
+                ? '''' : oldSelf.worker.model)'
+            - message: worker.effort is immutable
+              rule: '(!has(self.worker.effort) ? '''' : self.worker.effort) == (!has(oldSelf.worker.effort)
+                ? '''' : oldSelf.worker.effort)'
+            - message: worker.image is immutable
+              rule: '(!has(self.worker.image) ? '''' : self.worker.image) == (!has(oldSelf.worker.image)
+                ? '''' : oldSelf.worker.image)'
+            - message: worker.workspaceRef is immutable
+              rule: has(self.worker.workspaceRef) == has(oldSelf.worker.workspaceRef)
+                && (!has(self.worker.workspaceRef) || self.worker.workspaceRef ==
+                oldSelf.worker.workspaceRef)
+            - message: worker.agentConfigRefs is immutable
+              rule: has(self.worker.agentConfigRefs) == has(oldSelf.worker.agentConfigRefs)
+                && (!has(self.worker.agentConfigRefs) || self.worker.agentConfigRefs
+                == oldSelf.worker.agentConfigRefs)
+            - message: worker.podOverrides is immutable
+              rule: has(self.worker.podOverrides) == has(oldSelf.worker.podOverrides)
+                && (!has(self.worker.podOverrides) || self.worker.podOverrides ==
+                oldSelf.worker.podOverrides)
             - message: initialBranch is immutable
-              rule: has(self.initialBranch) == has(oldSelf.initialBranch) && (!has(self.initialBranch)
-                || self.initialBranch == oldSelf.initialBranch)
+              rule: '(!has(self.initialBranch) ? '''' : self.initialBranch) == (!has(oldSelf.initialBranch)
+                ? '''' : oldSelf.initialBranch)'
             - message: initialPrompt is immutable
-              rule: has(self.initialPrompt) == has(oldSelf.initialPrompt) && (!has(self.initialPrompt)
-                || self.initialPrompt == oldSelf.initialPrompt)
+              rule: '(!has(self.initialPrompt) ? '''' : self.initialPrompt) == (!has(oldSelf.initialPrompt)
+                ? '''' : oldSelf.initialPrompt)'
             - message: volumeClaimTemplate is immutable
               rule: has(self.volumeClaimTemplate) == has(oldSelf.volumeClaimTemplate)
                 && (!has(self.volumeClaimTemplate) || self.volumeClaimTemplate ==
                 oldSelf.volumeClaimTemplate)
+            - message: idlePolicy is immutable
+              rule: has(self.idlePolicy) == has(oldSelf.idlePolicy) && (!has(self.idlePolicy)
+                || self.idlePolicy == oldSelf.idlePolicy)
             - message: worker.type must be claude-code, codex, or opencode
               rule: has(self.worker.type) && self.worker.type in ['claude-code', 'codex',
                 'opencode']
@@ -8005,6 +8047,22 @@ spec:
                   The initialPrompt and initialBranch fields are Go text/templates rendered
                   with the matching GitHub webhook context.
                 properties:
+                  idlePolicy:
+                    description: |-
+                      IdlePolicy configures automatic lifecycle actions after the Session has
+                      been continuously idle.
+                    properties:
+                      suspendAfterSeconds:
+                        description: |-
+                          SuspendAfterSeconds suspends the Session after it has been continuously
+                          idle for this many seconds. Omit this field to disable automatic
+                          suspension. Zero suspends the Session as soon as the runtime reports that
+                          it is idle. Automatic suspension does not change spec.suspend, and a
+                          client connection resumes the Session.
+                        format: int32
+                        minimum: 0
+                        type: integer
+                    type: object
                   initialBranch:
                     description: |-
                       InitialBranch is the git branch to check out when initializing the Session

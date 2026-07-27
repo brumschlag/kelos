@@ -966,6 +966,106 @@ func TestServerDrainsAcceptedTurnsBeforeRuntimeUpdate(t *testing.T) {
 	}
 }
 
+func TestServerPublishesActivityBeforeAcknowledgingIdleDrain(t *testing.T) {
+	podUID := types.UID("pod-uid")
+	request := sessionupdate.NewIdleSuspendRequest(podUID, time.Date(2026, time.July, 27, 12, 0, 0, 0, time.UTC))
+	encoded, err := sessionupdate.Encode(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &kelos.Session{ObjectMeta: metav1.ObjectMeta{
+		Name:        "chat",
+		Namespace:   "default",
+		Annotations: map[string]string{sessionupdate.RequestAnnotation: encoded},
+	}}
+	clientset := kelosfake.NewSimpleClientset(session)
+	journal := NewJournal()
+	defer journal.Close()
+	server := NewServer(Config{
+		SessionName:   session.Name,
+		PodUID:        podUID,
+		SessionClient: clientset.ApiV1alpha2().Sessions(session.Namespace),
+	}, journal, &fakeProvider{})
+	if err := server.observeSessionUpdate(session); err != nil {
+		t.Fatal(err)
+	}
+
+	firstPublishStarted := make(chan struct{})
+	releaseFirstPublish := make(chan struct{})
+	var (
+		publishedMu sync.Mutex
+		published   []bool
+	)
+	server.publishSessionStatus = func(ctx context.Context, active bool) error {
+		publishedMu.Lock()
+		published = append(published, active)
+		first := len(published) == 1
+		publishedMu.Unlock()
+		if first {
+			close(firstPublishStarted)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-releaseFirstPublish:
+			}
+		}
+		return nil
+	}
+	server.activeMu.Lock()
+	server.activeTurn = "turn-1"
+	server.activeMu.Unlock()
+	server.requestSessionStatusPublish()
+	server.activeMu.Lock()
+	server.activeTurn = ""
+	server.activeMu.Unlock()
+	server.requestSessionStatusPublish()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go server.runSessionStatusPublishes(ctx)
+	reportDone := make(chan error, 1)
+	go func() {
+		reportDone <- server.reportSessionUpdate(ctx)
+	}()
+	select {
+	case <-firstPublishStarted:
+	case <-time.After(time.Second):
+		t.Fatal("activity status publication did not start")
+	}
+	current, err := clientset.ApiV1alpha2().Sessions(session.Namespace).Get(ctx, session.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Annotations[sessionupdate.ReportAnnotation] != "" {
+		t.Fatal("runtime acknowledged the idle drain before publishing queued activity")
+	}
+	close(releaseFirstPublish)
+	select {
+	case err := <-reportDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runtime did not acknowledge the idle drain")
+	}
+	current, err = clientset.ApiV1alpha2().Sessions(session.Namespace).Get(ctx, session.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := sessionupdate.DecodeReport(current.Annotations[sessionupdate.ReportAnnotation])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.RequestID != request.ID || report.PodUID != podUID || report.Phase != sessionupdate.PhaseDrained {
+		t.Fatalf("runtime update report = %#v", report)
+	}
+	publishedMu.Lock()
+	defer publishedMu.Unlock()
+	if want := []bool{true, false, false}; !reflect.DeepEqual(published, want) {
+		t.Fatalf("published activity states = %v, want %v", published, want)
+	}
+}
+
 func TestServerAcknowledgesSessionRuntimeUpdate(t *testing.T) {
 	podUID := types.UID("pod-uid")
 	request := sessionupdate.NewRequest(podUID, "desired-revision")
