@@ -319,7 +319,35 @@ func taskAgentEnv(base []string, task *kelos.Task) []string {
 	if task.Spec.UpstreamRepo != "" {
 		env = append(env, "KELOS_UPSTREAM_REPO="+task.Spec.UpstreamRepo)
 	}
+
+	// Per-Task agent environment. Appended last so a Task's value wins over the
+	// pool's pod-level default, letting Tasks on one pool target different
+	// providers. Reserved names are skipped: they are controller-owned, and
+	// letting a Task overwrite its own identity or the refreshed GitHub token
+	// would break task correlation and credential rotation.
+	for _, e := range task.Spec.EnvOverrides {
+		if isReservedEnvName(e.Name) {
+			continue
+		}
+		env = append(env, e.Name+"="+e.Value)
+	}
 	return env
+}
+
+// reservedEnvNames are set by the controller or refreshed by the runner, so a
+// Task must not override them.
+var reservedEnvNames = map[string]struct{}{
+	"GITHUB_TOKEN":        {},
+	"GH_TOKEN":            {},
+	"GH_ENTERPRISE_TOKEN": {},
+}
+
+func isReservedEnvName(name string) bool {
+	if strings.HasPrefix(name, "KELOS_") {
+		return true
+	}
+	_, ok := reservedEnvNames[name]
+	return ok
 }
 
 // currentGitHubToken reads the current GitHub token from the file named by

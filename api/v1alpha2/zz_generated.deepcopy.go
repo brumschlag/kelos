@@ -1706,6 +1706,13 @@ func (in *TaskSpec) DeepCopyInto(out *TaskSpec) {
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
+	if in.EnvOverrides != nil {
+		in, out := &in.EnvOverrides, &out.EnvOverrides
+		*out = make([]v1.EnvVar, len(*in))
+		for i := range *in {
+			(*in)[i].DeepCopyInto(&(*out)[i])
+		}
+	}
 	if in.TTLSecondsAfterFinished != nil {
 		in, out := &in.TTLSecondsAfterFinished, &out.TTLSecondsAfterFinished
 		*out = new(int32)

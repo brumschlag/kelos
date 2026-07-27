@@ -341,6 +341,27 @@ type TaskSpec struct {
 	// +optional
 	DependsOn []string `json:"dependsOn,omitempty"`
 
+	// EnvOverrides sets additional environment variables for this Task's agent
+	// process only.
+	//
+	// This is the per-Task environment channel for pooled Tasks. A worker pod is
+	// long-lived and serves many Tasks, so pod-level env cannot hold a per-Task
+	// value, and podOverrides is unavailable alongside workerPoolRef because it
+	// mutates the pool's shared pod template. These values are applied by the
+	// worker-runner as it assembles the environment for a single agent
+	// invocation, so they take effect without restarting the worker.
+	//
+	// Values are literals only; referencing a Secret or ConfigMap key is
+	// rejected, because the worker resolves this environment itself and a
+	// reference would otherwise be silently dropped. Names reserved by Kelos (the
+	// KELOS_ prefix and the GitHub token variables) are ignored, so a Task cannot
+	// spoof its own identity or the refreshed credentials.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:XValidation:rule="self.all(e, !has(e.valueFrom))",message="envOverrides values must be literals; valueFrom is not supported because the worker resolves this environment itself"
+	EnvOverrides []corev1.EnvVar `json:"envOverrides,omitempty"`
+
 	// Branch is the git branch this Task works on. When set, an init
 	// container checks out this branch before the agent starts. The
 	// controller ensures only one Task with the same Branch value

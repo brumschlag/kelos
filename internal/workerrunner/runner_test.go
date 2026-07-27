@@ -220,6 +220,77 @@ func TestTaskAgentEnvTaskNameOverridesInheritedValue(t *testing.T) {
 	}
 }
 
+// A pooled Task cannot use podOverrides.env (the CRD forbids podOverrides with
+// workerPoolRef, and a long-lived worker pod's env cannot hold a per-Task
+// value), so spec.envOverrides is the per-Task channel for agent environment.
+// Without it, a scheduler cannot vary provider routing per Task on a pool.
+func TestTaskAgentEnvIncludesEnvOverrides(t *testing.T) {
+	task := &kelos.Task{
+		Spec: kelos.TaskSpec{
+			Prompt: "Fix the bug",
+			EnvOverrides: []corev1.EnvVar{
+				{Name: "CLAUDE_CODE_USE_BEDROCK", Value: "1"},
+				{Name: "AWS_REGION", Value: "us-east-1"},
+			},
+		},
+	}
+
+	env := taskAgentEnv([]string{"OTHER=value"}, task)
+
+	if got := lastEnvValue(env, "CLAUDE_CODE_USE_BEDROCK"); got != "1" {
+		t.Errorf("CLAUDE_CODE_USE_BEDROCK = %q, want \"1\"", got)
+	}
+	if got := lastEnvValue(env, "AWS_REGION"); got != "us-east-1" {
+		t.Errorf("AWS_REGION = %q, want us-east-1", got)
+	}
+}
+
+// Pool-level env is the default; a Task's own override must win so different
+// Tasks on one pool can target different providers or regions.
+func TestTaskAgentEnvOverridesWinOverPodEnv(t *testing.T) {
+	task := &kelos.Task{
+		Spec: kelos.TaskSpec{
+			Prompt:       "Fix the bug",
+			EnvOverrides: []corev1.EnvVar{{Name: "AWS_REGION", Value: "eu-west-1"}},
+		},
+	}
+
+	env := taskAgentEnv([]string{"AWS_REGION=us-east-1"}, task)
+
+	if got := lastEnvValue(env, "AWS_REGION"); got != "eu-west-1" {
+		t.Errorf("AWS_REGION = %q, want the task override", got)
+	}
+}
+
+// Reserved names are controller-owned: letting a Task overwrite its own identity
+// or the refreshed GitHub token would break task correlation and credential
+// rotation, so those entries are dropped.
+func TestTaskAgentEnvOverridesCannotClobberReservedNames(t *testing.T) {
+	task := &kelos.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "task-real"},
+		Spec: kelos.TaskSpec{
+			Prompt: "Fix the bug",
+			EnvOverrides: []corev1.EnvVar{
+				{Name: "KELOS_TASK_NAME", Value: "task-spoofed"},
+				{Name: "GITHUB_TOKEN", Value: "ghp_attacker"},
+				{Name: "SAFE_VAR", Value: "kept"},
+			},
+		},
+	}
+
+	env := taskAgentEnv([]string{"OTHER=value"}, task)
+
+	if got := lastEnvValue(env, "KELOS_TASK_NAME"); got != "task-real" {
+		t.Errorf("KELOS_TASK_NAME = %q, want the controller value", got)
+	}
+	if got := lastEnvValue(env, "GITHUB_TOKEN"); got == "ghp_attacker" {
+		t.Error("GITHUB_TOKEN was overridden by the Task")
+	}
+	if got := lastEnvValue(env, "SAFE_VAR"); got != "kept" {
+		t.Errorf("SAFE_VAR = %q, want kept", got)
+	}
+}
+
 func TestTaskAgentEnvRefreshesGitHubTokenFromFile(t *testing.T) {
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	if err := os.WriteFile(tokenFile, []byte("ghs_fresh_token\n"), 0o600); err != nil {
