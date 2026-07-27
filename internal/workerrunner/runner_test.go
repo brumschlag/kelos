@@ -291,6 +291,58 @@ func TestTaskAgentEnvOverridesCannotClobberReservedNames(t *testing.T) {
 	}
 }
 
+// A scheduler that hands work to a pool needs the agent's output back, but the
+// pod is short-lived and the model cannot be trusted to run an exact upload
+// command as its last act. postCommands run after the agent exits, in the
+// workspace, with the same per-Task environment.
+func TestPostCommandsRunAfterAgentInWorkspace(t *testing.T) {
+	dir := t.TempDir()
+	task := &kelos.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "task-post"},
+		Spec: kelos.TaskSpec{
+			Prompt:       "do the thing",
+			EnvOverrides: []corev1.EnvVar{{Name: "UPLOAD_TARGET", Value: "sentinel-value"}},
+			PostCommands: [][]string{
+				{"sh", "-c", "printf '%s' \"$UPLOAD_TARGET\" > post-ran.txt"},
+			},
+		},
+	}
+
+	if err := runPostCommands(context.Background(), task, dir); err != nil {
+		t.Fatalf("runPostCommands: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(dir, "post-ran.txt"))
+	if err != nil {
+		t.Fatalf("post command did not run in the workspace: %v", err)
+	}
+	if string(got) != "sentinel-value" {
+		t.Errorf("post command env = %q, want the per-Task override", string(got))
+	}
+}
+
+// A post command that fails must surface, not be swallowed: silently skipping the
+// upload looks identical to "the agent changed nothing", which is the worst
+// failure mode for a scheduler consuming the artifact.
+func TestPostCommandsReportFailure(t *testing.T) {
+	task := &kelos.Task{
+		Spec: kelos.TaskSpec{PostCommands: [][]string{{"sh", "-c", "exit 3"}}},
+	}
+
+	err := runPostCommands(context.Background(), task, t.TempDir())
+	if err == nil {
+		t.Fatal("expected an error from a failing post command")
+	}
+}
+
+func TestPostCommandsNoopWhenUnset(t *testing.T) {
+	task := &kelos.Task{Spec: kelos.TaskSpec{Prompt: "x"}}
+
+	if err := runPostCommands(context.Background(), task, t.TempDir()); err != nil {
+		t.Fatalf("expected no-op, got %v", err)
+	}
+}
+
 func TestTaskAgentEnvRefreshesGitHubTokenFromFile(t *testing.T) {
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	if err := os.WriteFile(tokenFile, []byte("ghs_fresh_token\n"), 0o600); err != nil {

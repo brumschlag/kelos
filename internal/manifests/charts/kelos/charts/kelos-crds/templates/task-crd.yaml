@@ -14240,6 +14240,24 @@ spec:
                       type: object
                     type: array
                 type: object
+              postCommands:
+                description: |-
+                  PostCommands are exec-form commands run by the worker-runner after the
+                  agent exits, in the workspace directory, with the same per-Task
+                  environment as the agent.
+
+                  An external scheduler consuming a Task's output needs the result off the
+                  pod before it is reclaimed, and asking the agent to run the transfer as its
+                  last act is unreliable: it depends on the model following an exact
+                  instruction and costs a turn. This runs in the runtime instead.
+
+                  A non-zero exit fails the Task, because a silently skipped transfer is
+                  indistinguishable from an agent that changed nothing.
+                items:
+                  items:
+                    type: string
+                  type: array
+                type: array
               prompt:
                 description: Prompt is the task prompt to send to the agent.
                 type: string

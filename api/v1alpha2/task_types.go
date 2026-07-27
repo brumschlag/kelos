@@ -362,6 +362,20 @@ type TaskSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self.all(e, !has(e.valueFrom))",message="envOverrides values must be literals; valueFrom is not supported because the worker resolves this environment itself"
 	EnvOverrides []corev1.EnvVar `json:"envOverrides,omitempty"`
 
+	// PostCommands are exec-form commands run by the worker-runner after the
+	// agent exits, in the workspace directory, with the same per-Task
+	// environment as the agent.
+	//
+	// An external scheduler consuming a Task's output needs the result off the
+	// pod before it is reclaimed, and asking the agent to run the transfer as its
+	// last act is unreliable: it depends on the model following an exact
+	// instruction and costs a turn. This runs in the runtime instead.
+	//
+	// A non-zero exit fails the Task, because a silently skipped transfer is
+	// indistinguishable from an agent that changed nothing.
+	// +optional
+	PostCommands [][]string `json:"postCommands,omitempty"`
+
 	// Branch is the git branch this Task works on. When set, an init
 	// container checks out this branch before the agent starts. The
 	// controller ensures only one Task with the same Branch value

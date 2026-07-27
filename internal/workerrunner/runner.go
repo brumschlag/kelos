@@ -280,7 +280,33 @@ func (r *Runner) runAgent(ctx context.Context, task *kelos.Task) error {
 
 	cmd.Env = taskAgentEnv(os.Environ(), task)
 
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+
+	return runPostCommands(ctx, task, cmd.Dir)
+}
+
+// runPostCommands runs the Task's postCommands in the workspace after the agent
+// has exited, with the same per-Task environment. A failure is returned so the
+// Task fails: a skipped transfer would otherwise be indistinguishable from an
+// agent that produced no changes.
+func runPostCommands(ctx context.Context, task *kelos.Task, workdir string) error {
+	for i, argv := range task.Spec.PostCommands {
+		if len(argv) == 0 {
+			continue
+		}
+		log.Printf("Running postCommand %d/%d for task %s", i+1, len(task.Spec.PostCommands), task.Name)
+		cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+		cmd.Dir = workdir
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Env = taskAgentEnv(os.Environ(), task)
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("postCommand %d (%s): %w", i+1, argv[0], err)
+		}
+	}
+	return nil
 }
 
 func taskAgentEnv(base []string, task *kelos.Task) []string {
