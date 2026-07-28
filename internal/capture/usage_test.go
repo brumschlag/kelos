@@ -27,6 +27,40 @@ func TestStreamUsage(t *testing.T) {
 			},
 		},
 		{
+			// A scheduler consuming Task results needs turn counts to reason about
+			// phase cost per turn; claude-code reports them on the same result line.
+			name:      "claude-code result includes turns",
+			agentType: "claude-code",
+			content: `{"type":"result","subtype":"success","is_error":false,"num_turns":7,"total_cost_usd":0.02,"usage":{"input_tokens":100,"output_tokens":50}}
+`,
+			want: map[string]string{
+				"cost-usd":      "0.02",
+				"input-tokens":  "100",
+				"output-tokens": "50",
+				"num-turns":     "7",
+			},
+		},
+		{
+			// Tool activity only exists as tool_use blocks in the assistant stream;
+			// the result line carries no counts. A scheduler needs them to reason
+			// about what a phase actually did, so they are accumulated per name.
+			name:      "claude-code counts tool calls by name",
+			agentType: "claude-code",
+			content: `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Write"}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"thinking"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"},{"type":"tool_use","name":"Write"}]}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":3,"total_cost_usd":0.02,"usage":{"input_tokens":100,"output_tokens":50}}
+`,
+			want: map[string]string{
+				"cost-usd":       "0.02",
+				"input-tokens":   "100",
+				"output-tokens":  "50",
+				"num-turns":      "3",
+				"tool-calls":     "3",
+				"tool-breakdown": "Bash=1,Write=2",
+			},
+		},
+		{
 			name:      "claude-code uses last result",
 			agentType: "claude-code",
 			content: `{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":50}}

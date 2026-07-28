@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/kelos-dev/kelos/internal/claudecode"
@@ -26,7 +28,7 @@ type usageAccumulator interface {
 func newUsageAccumulator(agentType string) usageAccumulator {
 	switch agentType {
 	case "claude-code":
-		return &lastResultAccumulator{extract: extractClaudeCode}
+		return &lastResultAccumulator{extract: extractClaudeCode, countTools: true}
 	case "codex":
 		return &sumAccumulator{event: "turn.completed", extract: extractCodexUsage, extractResponse: extractCodexResponse}
 	case "gemini":
@@ -116,12 +118,19 @@ type lastResultAccumulator struct {
 	extract         func(map[string]any) map[string]string
 	extractResponse func(map[string]any) string
 	response        string
+	// countTools accumulates tool_use blocks by name. Tool activity appears only
+	// in the assistant stream; the result line reports no counts.
+	countTools bool
+	toolCounts map[string]int
 }
 
 func (a *lastResultAccumulator) addLine(line []byte) {
 	m := parseLine(line)
 	if m == nil {
 		return
+	}
+	if a.countTools {
+		a.addToolUses(m)
 	}
 	if m["type"] == "result" {
 		a.last = m
@@ -149,7 +158,60 @@ func (a *lastResultAccumulator) result() map[string]string {
 			r["response"] = base64.StdEncoding.EncodeToString([]byte(a.response))
 		}
 	}
+	if total, breakdown := a.toolSummary(); total > 0 {
+		if r == nil {
+			r = make(map[string]string)
+		}
+		r["tool-calls"] = strconv.FormatInt(int64(total), 10)
+		r["tool-breakdown"] = breakdown
+	}
 	return r
+}
+
+// addToolUses counts tool_use blocks in an assistant message.
+func (a *lastResultAccumulator) addToolUses(m map[string]any) {
+	msg, ok := m["message"].(map[string]any)
+	if !ok {
+		return
+	}
+	blocks, ok := msg["content"].([]any)
+	if !ok {
+		return
+	}
+	for _, raw := range blocks {
+		block, ok := raw.(map[string]any)
+		if !ok || block["type"] != "tool_use" {
+			continue
+		}
+		name, _ := block["name"].(string)
+		if name == "" {
+			name = "unknown"
+		}
+		if a.toolCounts == nil {
+			a.toolCounts = make(map[string]int)
+		}
+		a.toolCounts[name]++
+	}
+}
+
+// toolSummary returns the total tool calls and a name=count breakdown, sorted by
+// name so the output is stable across runs.
+func (a *lastResultAccumulator) toolSummary() (int, string) {
+	if len(a.toolCounts) == 0 {
+		return 0, ""
+	}
+	names := make([]string, 0, len(a.toolCounts))
+	total := 0
+	for name, n := range a.toolCounts {
+		names = append(names, name)
+		total += n
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		parts = append(parts, name+"="+strconv.Itoa(a.toolCounts[name]))
+	}
+	return total, strings.Join(parts, ",")
 }
 
 // sumAccumulator adds per-event input/output token counts as the stream is
@@ -197,6 +259,9 @@ func extractClaudeCode(m map[string]any) map[string]string {
 	result := make(map[string]string)
 	if v, ok := m["total_cost_usd"]; ok {
 		result["cost-usd"] = formatNumber(v)
+	}
+	if v, ok := m["num_turns"]; ok {
+		result["num-turns"] = formatNumber(v)
 	}
 	if usage, ok := m["usage"].(map[string]any); ok {
 		if v, ok := usage["input_tokens"]; ok {
