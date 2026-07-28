@@ -1,0 +1,68 @@
+# Pilot workloads in the kelos-pilot namespace, as deployed.
+#
+# Prerequisite (not created here, since it holds a credential):
+#   secret/honcho-gateway-key, key gateway-api-key — the LiteLLM gateway token.
+# Scratch repo used to exercise the Foreman integration. Public and read-only;
+# real work targets the inpulse workspaces instead.
+apiVersion: kelos.dev/v1alpha2
+kind: Workspace
+metadata:
+  name: envoverrides-scratch
+  namespace: kelos-pilot
+spec:
+  repo: https://github.com/octocat/Hello-World.git
+  ref: master
+---
+# Pre-warmed worker for Foreman phases. A pool avoids re-cloning the repo and
+# re-scheduling a pod per phase; its workspace PVC persists across tasks, which is
+# why each Task records a pre-agent baseline before diffing.
+#
+# Gateway routing and its credential live here rather than on the Task: the CRD
+# forbids podOverrides alongside workerPoolRef. Only per-phase values (model, patch
+# upload URL) travel per-Task via envOverrides.
+apiVersion: kelos.dev/v1alpha2
+kind: WorkerPool
+metadata:
+  name: envoverrides-pool
+  namespace: kelos-pilot
+spec:
+  replicas: 1
+  worker:
+    type: claude-code
+    # The gateway holds the AWS credentials; the pod needs none.
+    credentials:
+      type: none
+    workspaceRef:
+      name: envoverrides-scratch
+    podOverrides:
+      activeDeadlineSeconds: 900
+      env:
+        - name: ANTHROPIC_BASE_URL
+          value: http://bedrock-gateway.honcho.svc.cluster.local
+        - name: ANTHROPIC_AUTH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: honcho-gateway-key
+              key: gateway-api-key
+        - name: MAX_THINKING_TOKENS
+          value: "0"
+  volumeClaimTemplate:
+    accessModes: [ReadWriteOnce]
+    resources:
+      requests:
+        storage: 2Gi
+---
+# Foreman's worktree, for the non-pooled shared-worktree path. Phases run
+# sequentially so one pod mounts at a time and ReadWriteOnce is sufficient; the
+# cluster has no ReadWriteMany class.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: foreman-worktree
+  namespace: kelos-pilot
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: auto-ebs-gp3
+  resources:
+    requests:
+      storage: 2Gi

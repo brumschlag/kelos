@@ -1,0 +1,32 @@
+# Helm values for the kelos-pilot deployment on software-engineering EKS.
+#
+# Only the images built from this fork are overridden. The agent images Foreman
+# does not use (codex, gemini, opencode, cursor) and the spawner, session-runtime
+# and ghproxy images stay on upstream.
+#
+# The image tag is NOT set globally: `--version` supplies the tag for every image,
+# so bumping it would send upstream images to a tag that does not exist. The two
+# fork images carry fully-qualified tags instead, which the controller passes
+# through unchanged (cmd/kelos-controller/main.go imageForVersion).
+
+crds:
+  # Applied separately with --force-conflicts: upstream kelos owns spec.versions
+  # as a server-side-apply field manager, so a plain apply is rejected.
+  install: false
+
+controllerImage: 565715328522.dkr.ecr.us-east-1.amazonaws.com/kelos-controller
+# Tagged separately from image.tag so --version stays on the upstream release.
+controllerImageTag: v0.49.0-envoverrides
+image:
+  # Stays on the upstream release tag. It feeds --version, which supplies the tag
+  # for every image not overridden below, so a fork tag here would point the
+  # upstream images (codex, gemini, spawner, ...) at a tag that does not exist.
+  tag: v0.49.0
+  pullPolicy: IfNotPresent
+
+# Carries the tool_use stream parsing that reports tool-calls/tool-breakdown.
+claudeCodeImage: 565715328522.dkr.ecr.us-east-1.amazonaws.com/claude-code:v0.49.0-tools
+
+workerRunner:
+  # Carries preCommands + postCommands.
+  image: 565715328522.dkr.ecr.us-east-1.amazonaws.com/kelos-worker-runner:v0.49.0-prepost
