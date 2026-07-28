@@ -17,6 +17,11 @@ codexAuthRefresher:
   schedule: "0 */6 * * *"
 
 controllerImage: ghcr.io/kelos-dev/kelos-controller
+# Overrides the controller image tag only. Without this, image.tag sets both the
+# controller tag and --version, and --version supplies the tag for every other
+# image — so running a patched controller alongside upstream agent images is not
+# otherwise expressible.
+controllerImageTag: ""
 ghproxy:
   image: ghcr.io/kelos-dev/ghproxy
   allowedUpstreams: "https://api.github.com"
