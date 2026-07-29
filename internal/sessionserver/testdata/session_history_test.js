@@ -232,9 +232,9 @@ function testSessionProgressLifecycle() {
   activateSessionView(view);
   assert.equal(elements.progress.hidden, true);
 
-  handleEvent({type: 'turn.started', turnId: 'turn-1'});
   const startedAt = Date.parse('2026-07-23T12:00:00Z');
-  state.activeTurnStartedAt = startedAt;
+  handleEvent({type: 'turn.started', turnId: 'turn-1', timestamp: '2026-07-23T12:00:00Z'});
+  assert.equal(state.activeTurnStartedAt, startedAt);
   renderSessionProgress(startedAt + 65000);
   assert.equal(elements.progress.hidden, false);
   assert.equal(elements.progress.dataset.state, 'working');

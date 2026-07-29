@@ -101,7 +101,7 @@ spec:
 			g.Expect(metav1.IsControlledBy(&statefulSet, session)).To(BeTrue())
 			g.Expect(statefulSet.Spec.Replicas).NotTo(BeNil())
 			g.Expect(*statefulSet.Spec.Replicas).To(Equal(int32(1)))
-			g.Expect(statefulSet.Spec.Template.Spec.Containers[0].Command).To(Equal([]string{"/kelos/bin/kelos-session-runtime"}))
+			g.Expect(statefulSet.Spec.Template.Spec.Containers[0].Command).To(Equal(expectedAgentProcessCommand("/kelos/bin/kelos-session-runtime", true)))
 			g.Expect(statefulSet.Spec.VolumeClaimTemplates).To(HaveLen(1))
 			g.Expect(statefulSet.Spec.VolumeClaimTemplates[0].Name).To(Equal("workspace"))
 			g.Expect(metav1.IsControlledBy(&statefulSet.Spec.VolumeClaimTemplates[0], session)).To(BeTrue())

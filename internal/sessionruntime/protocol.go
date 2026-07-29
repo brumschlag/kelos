@@ -1,6 +1,9 @@
 package sessionruntime
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 const (
 	EventHistoryStart     = "history.start"
@@ -24,8 +27,10 @@ const (
 
 // Event is one conversation event exposed through the shared Session control interface.
 type Event struct {
-	ID           int64           `json:"id,omitempty"`
-	Type         string          `json:"type"`
+	ID   int64  `json:"id,omitempty"`
+	Type string `json:"type"`
+	// Timestamp records when a durable conversation event was first appended.
+	Timestamp    *time.Time      `json:"timestamp,omitempty"`
 	RequestID    string          `json:"requestId,omitempty"`
 	TurnID       string          `json:"turnId,omitempty"`
 	Text         string          `json:"text,omitempty"`

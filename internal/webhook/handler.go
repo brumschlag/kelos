@@ -563,7 +563,8 @@ func (h *WebhookHandler) createTask(ctx context.Context, spawner *kelos.TaskSpaw
 
 	switch h.source {
 	case GitHubSource:
-		templateVars = ExtractGitHubWorkItem(parsed.GitHub)
+		changedFiles := changedFilesForSpawner(spawner.Spec.When.GitHubWebhook, eventType, parsed.GitHub)
+		templateVars = ExtractGitHubWorkItem(parsed.GitHub, changedFiles)
 
 	case LinearSource:
 		templateVars = ExtractLinearWorkItem(parsed.Linear)
@@ -727,7 +728,8 @@ func (h *WebhookHandler) processSessionSpawner(ctx context.Context, spawner *kel
 		return false, nil
 	}
 
-	templateVars := ExtractGitHubWorkItem(eventData)
+	changedFiles := changedFilesForSpawner(githubWebhook, eventType, eventData)
+	templateVars := ExtractGitHubWorkItem(eventData, changedFiles)
 	sessionName := webhookSpawnName(spawner.Name, eventType, deliveryID)
 	gvks, _, gvkErr := h.client.Scheme().ObjectKinds(spawner)
 	if gvkErr != nil {
@@ -883,6 +885,12 @@ func webhookSourceKind(eventType string, eventData *GitHubEventData) string {
 		return "pull-request"
 	case "issue_comment":
 		if eventData.PullRequestAPIURL != "" {
+			return "pull-request"
+		}
+		return "issue"
+	case "check_run":
+		// A check_run is associated with a PR when the webhook payload links one.
+		if eventData.Number > 0 {
 			return "pull-request"
 		}
 		return "issue"

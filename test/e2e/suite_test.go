@@ -41,6 +41,17 @@ func (cfg agentTestConfig) credentialsMissing() bool {
 	return cfg.NeedsCredentials && *cfg.SecretValue == ""
 }
 
+func (cfg agentTestConfig) skipIfUnavailable() {
+	// TODO: Re-enable OpenCode e2e tests after replacing the unreliable
+	// unauthenticated opencode/big-pickle provider dependency.
+	if cfg.AgentType == "opencode" {
+		Skip("OpenCode e2e tests are disabled until they use a reliable provider")
+	}
+	if cfg.credentialsMissing() {
+		Skip(cfg.EnvVar + " not set")
+	}
+}
+
 var agentConfigs = []agentTestConfig{
 	{
 		AgentType:        "claude-code",

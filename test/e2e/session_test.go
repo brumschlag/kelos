@@ -678,11 +678,7 @@ func describeSessionProviderTests(cfg agentTestConfig) {
 	Describe(fmt.Sprintf("Session provider [%s]", cfg.AgentType), func() {
 		f := framework.NewFramework(fmt.Sprintf("session-%s", cfg.AgentType))
 
-		BeforeEach(func() {
-			if cfg.credentialsMissing() {
-				Skip(cfg.EnvVar + " not set")
-			}
-		})
+		BeforeEach(cfg.skipIfUnavailable)
 
 		It("starts a provider conversation and accepts a terminal turn", func() {
 			f.CreateSecret(cfg.SecretName, cfg.SecretKey+"="+*cfg.SecretValue)

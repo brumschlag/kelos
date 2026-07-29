@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -229,6 +230,10 @@ func (j *Journal) Append(event Event) error {
 		return j.failureErr
 	}
 
+	if event.Timestamp == nil {
+		now := time.Now().UTC()
+		event.Timestamp = &now
+	}
 	event.ID = j.nextID
 	if j.file != nil {
 		persistedEvent := event

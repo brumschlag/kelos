@@ -121,7 +121,7 @@ var _ = Describe("Task Controller", func() {
 			Expect(createdJob.Spec.Template.Spec.Containers).To(HaveLen(1))
 			container := createdJob.Spec.Template.Spec.Containers[0]
 			Expect(container.Name).To(Equal(kelos.AgentContainerName))
-			Expect(container.Command).To(Equal([]string{"/kelos_entrypoint.sh"}))
+			Expect(container.Command).To(Equal(expectedAgentProcessCommand("/kelos_entrypoint.sh", true)))
 			Expect(container.Args).To(Equal([]string{"Create a hello world program"}))
 
 			By("Verifying the Job has KELOS_MODEL, KELOS_AGENT_TYPE, and API key env vars")
@@ -256,7 +256,7 @@ var _ = Describe("Task Controller", func() {
 
 			By("Verifying the Job uses uniform interface")
 			container := createdJob.Spec.Template.Spec.Containers[0]
-			Expect(container.Command).To(Equal([]string{"/kelos_entrypoint.sh"}))
+			Expect(container.Command).To(Equal(expectedAgentProcessCommand("/kelos_entrypoint.sh", true)))
 			Expect(container.Args).To(Equal([]string{"Create a hello world program"}))
 
 			By("Verifying the Job has KELOS_AGENT_TYPE and OAuth token env vars")
@@ -1401,7 +1401,7 @@ var _ = Describe("Task Controller", func() {
 
 			By("Verifying the main container uses uniform interface")
 			mainContainer := createdJob.Spec.Template.Spec.Containers[0]
-			Expect(mainContainer.Command).To(Equal([]string{"/kelos_entrypoint.sh"}))
+			Expect(mainContainer.Command).To(Equal(expectedAgentProcessCommand("/kelos_entrypoint.sh", true)))
 			Expect(mainContainer.Args).To(Equal([]string{"Create a PR"}))
 
 			By("Verifying the main container has KELOS_AGENT_TYPE, ANTHROPIC_API_KEY, KELOS_BASE_BRANCH, GITHUB_TOKEN, GH_TOKEN, GH_CONFIG_DIR, and KELOS_GITHUB_TOKEN_FILE env vars")
@@ -1882,7 +1882,7 @@ var _ = Describe("Task Controller", func() {
 			By("Verifying the custom image is used with uniform interface")
 			container := createdJob.Spec.Template.Spec.Containers[0]
 			Expect(container.Image).To(Equal("my-custom-agent:v1"))
-			Expect(container.Command).To(Equal([]string{"/kelos_entrypoint.sh"}))
+			Expect(container.Command).To(Equal(expectedAgentProcessCommand("/kelos_entrypoint.sh", false)))
 			Expect(container.Args).To(Equal([]string{"Fix the bug"}))
 
 			By("Verifying KELOS_MODEL and KELOS_AGENT_TYPE are set")
@@ -2104,7 +2104,7 @@ var _ = Describe("Task Controller", func() {
 			container := createdJob.Spec.Template.Spec.Containers[0]
 			Expect(container.Name).To(Equal(kelos.AgentContainerName))
 			Expect(container.Image).To(Equal(controller.CodexImage))
-			Expect(container.Command).To(Equal([]string{"/kelos_entrypoint.sh"}))
+			Expect(container.Command).To(Equal(expectedAgentProcessCommand("/kelos_entrypoint.sh", true)))
 			Expect(container.Args).To(Equal([]string{"Fix the bug"}))
 
 			By("Verifying the Job has KELOS_MODEL, KELOS_AGENT_TYPE, and CODEX_API_KEY env vars")
@@ -2196,7 +2196,7 @@ var _ = Describe("Task Controller", func() {
 			By("Verifying the main container uses codex image with uniform interface")
 			mainContainer := createdJob.Spec.Template.Spec.Containers[0]
 			Expect(mainContainer.Name).To(Equal(kelos.AgentContainerName))
-			Expect(mainContainer.Command).To(Equal([]string{"/kelos_entrypoint.sh"}))
+			Expect(mainContainer.Command).To(Equal(expectedAgentProcessCommand("/kelos_entrypoint.sh", true)))
 			Expect(mainContainer.Args).To(Equal([]string{"Refactor the module"}))
 
 			By("Verifying the main container has KELOS_AGENT_TYPE, CODEX_API_KEY, and KELOS_BASE_BRANCH env vars")
@@ -2362,7 +2362,7 @@ var _ = Describe("Task Controller", func() {
 			container := createdJob.Spec.Template.Spec.Containers[0]
 			Expect(container.Name).To(Equal(kelos.AgentContainerName))
 			Expect(container.Image).To(Equal(controller.OpenCodeImage))
-			Expect(container.Command).To(Equal([]string{"/kelos_entrypoint.sh"}))
+			Expect(container.Command).To(Equal(expectedAgentProcessCommand("/kelos_entrypoint.sh", true)))
 			Expect(container.Args).To(Equal([]string{"Fix the bug"}))
 
 			By("Verifying the Job has KELOS_MODEL, KELOS_AGENT_TYPE, and OPENCODE_API_KEY env vars")

@@ -887,9 +887,10 @@ func TestSessionReconcilerCreatesStatefulSetAndObservesPod(t *testing.T) {
 	if statefulSet.Spec.Template.Annotations[sessionNameAnnotation] != session.Name {
 		t.Fatalf("Session Pod template annotations = %#v", statefulSet.Spec.Template.Annotations)
 	}
-	if len(podSpec.Containers) == 0 || len(podSpec.Containers[0].Command) != 1 || podSpec.Containers[0].Command[0] != sessionRuntimeBinary {
-		t.Fatalf("agent command = %v, want %q", podSpec.Containers[0].Command, sessionRuntimeBinary)
+	if len(podSpec.Containers) == 0 {
+		t.Fatal("Session Pod has no containers")
 	}
+	assertAgentProcessCommand(t, podSpec.Containers[0].Command, sessionRuntimeBinary, false)
 	if podSpec.SecurityContext == nil || podSpec.SecurityContext.FSGroup == nil || *podSpec.SecurityContext.FSGroup != AgentUID {
 		t.Fatalf("pod FSGroup = %#v, want %d", podSpec.SecurityContext, AgentUID)
 	}

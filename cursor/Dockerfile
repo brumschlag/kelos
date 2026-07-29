@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y \
     curl \
     ca-certificates \
     git \
+    tini \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -56,4 +57,4 @@ ENV PATH="/home/agent/.local/bin:${GOPATH}/bin:${PATH}"
 
 WORKDIR /workspace
 
-ENTRYPOINT ["agent"]
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "agent"]

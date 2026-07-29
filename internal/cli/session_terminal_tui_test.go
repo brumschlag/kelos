@@ -400,6 +400,24 @@ func TestSessionTUIShowsTurnProgressUntilCompletion(t *testing.T) {
 	}
 }
 
+func TestSessionTUIRestoresTurnProgressFromHistoryTimestamp(t *testing.T) {
+	model, _ := newSessionTUITestModel()
+	now := time.Date(2026, time.July, 23, 12, 1, 5, 0, time.UTC)
+	startedAt := now.Add(-65 * time.Second)
+	model.now = func() time.Time { return now }
+
+	model.applyEvent(sessionruntime.Event{Type: sessionruntime.EventHistoryEnd})
+	model.applyEvent(sessionruntime.Event{
+		Type:      sessionruntime.EventTurnStarted,
+		TurnID:    "turn-1",
+		Timestamp: &startedAt,
+	})
+
+	if got := strings.TrimSpace(stripSessionTUIANSI(model.progressView())); got != "• Working (1m 05s • esc to interrupt)" {
+		t.Fatalf("restored progress = %q", got)
+	}
+}
+
 func TestSessionTUIEscInterruptsActiveTurn(t *testing.T) {
 	model, requests := newSessionTUITestModel()
 	model.applyEvent(sessionruntime.Event{Type: sessionruntime.EventHistoryEnd})

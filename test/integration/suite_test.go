@@ -51,6 +51,13 @@ var (
 // controller to reconcile after CRD conversion has been enabled.
 const controllerSettleTimeout = 60 * time.Second
 
+func expectedAgentProcessCommand(program string, useTini bool) []string {
+	if !useTini {
+		return []string{program}
+	}
+	return []string{"/usr/bin/tini", "-g", "--", program}
+}
+
 func TestIntegration(t *testing.T) {
 	RegisterFailHandler(Fail)
 	RunSpecs(t, "Integration Suite")

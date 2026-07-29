@@ -858,6 +858,18 @@ func TestWebhookSourceKind(t *testing.T) {
 			eventData: &GitHubEventData{Event: "push"},
 			want:      "issue",
 		},
+		{
+			name:      "check_run linked to PR",
+			eventType: "check_run",
+			eventData: &GitHubEventData{Event: "check_run", Number: 7},
+			want:      "pull-request",
+		},
+		{
+			name:      "check_run without linked PR",
+			eventType: "check_run",
+			eventData: &GitHubEventData{Event: "check_run"},
+			want:      "issue",
+		},
 	}
 
 	for _, tt := range tests {

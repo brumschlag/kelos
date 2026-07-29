@@ -592,6 +592,8 @@ to receive refreshed credentials during long-running work.
 | `spec.when.githubWebhook.filters[].state` | Filter by issue/PR state (`"open"`, `"closed"`) | No |
 | `spec.when.githubWebhook.filters[].branch` | Filter push and create (ref_type=branch) events by branch name (exact match or glob) | No |
 | `spec.when.githubWebhook.filters[].tag` | Filter create (ref_type=tag) and release events by tag name (exact match or glob) | No |
+| `spec.when.githubWebhook.filters[].conclusion` | Filter `check_run` events by the check run's conclusion. One of `success`, `failure`, `cancelled`, `timed_out`, `action_required`, `neutral`, `skipped`, `stale`. Ignored for other events | No |
+| `spec.when.githubWebhook.filters[].checkName` | Filter `check_run` events by the check run's name (exact match or glob, e.g. `"lint"`, `"build-*"`). Ignored for other events | No |
 | `spec.when.githubWebhook.filters[].draft` | Filter PRs by draft status | No |
 | `spec.when.githubWebhook.filters[].author` | Filter by the event sender's username | No |
 | `spec.when.githubWebhook.filters[].excludeAuthors` | Exclude events sent by any of these usernames | No |
@@ -748,10 +750,18 @@ The `promptTemplate` field uses Go `text/template` syntax. Available variables d
 | `{{.IssueID}}` | Parent issue ID | Empty | Empty | Empty | Empty | Parent issue ID (Comment events only) | Empty | Empty |
 | `{{.CommentBody}}` | Comment or review body | Empty | Empty | Comment/review body (`issue_comment`, `pull_request_review`, `pull_request_review_comment` events) | Empty | Empty | Empty | Empty |
 | `{{.CommentURL}}` | Comment or review URL | Empty | Empty | Comment/review HTML URL (`issue_comment`, `pull_request_review`, `pull_request_review_comment` events) | Empty | Empty | Empty | Empty |
+| `{{.ChangedFiles}}` | Changed file paths (list) | Empty | Empty | Push: files from the payload. PR: changed files, but **only** when a matching filter's `filePatterns` forced a fetch (otherwise empty; see note below). Iterate with `{{range .ChangedFiles}}` | Empty | Empty | Empty | Empty |
+| `{{.CheckName}}` | Check run name | Empty | Empty | Check run name (`check_run` events, e.g. `"lint"`) | Empty | Empty | Empty | Empty |
+| `{{.Conclusion}}` | Check run conclusion | Empty | Empty | Check run conclusion (`check_run` events, e.g. `"failure"`) | Empty | Empty | Empty | Empty |
+| `{{.CheckRunURL}}` | Check run URL | Empty | Empty | Link to the check run / CI logs (`check_run` events) | Empty | Empty | Empty | Empty |
+| `{{.HeadSHA}}` | Head commit SHA | Empty | Empty | Commit SHA under test (`check_run` events) | Empty | Empty | Empty | Empty |
+| `{{.CheckApp}}` | Check app name | Empty | Empty | App that produced the check (`check_run` events, e.g. `"GitHub Actions"`) | Empty | Empty | Empty | Empty |
 | `{{.Time}}` | Trigger time (RFC3339) | Empty | Empty | Empty | Empty | Empty | Empty | Cron tick time (e.g., `"2026-02-07T09:00:00Z"`) |
 | `{{.Schedule}}` | Cron schedule expression | Empty | Empty | Empty | Empty | Empty | Empty | Schedule string (e.g., `"0 * * * *"`) |
 
 > **Generic Webhook only:** any additional keys declared in `spec.when.webhook.fieldMapping` are also exposed as top-level template variables (e.g., `fieldMapping: {severity: "$.level"}` makes `{{.severity}}` available).
+
+> **`{{.ChangedFiles}}` and `filePatterns`:** For pull request webhook events, the changed-file list is fetched lazily and only when a filter's `filePatterns` needs it to decide a match. As a result, `{{.ChangedFiles}}` is populated for PR events **only when the matching filter declares `filePatterns`**; without it, `{{.ChangedFiles}}` renders as an empty list. Push events populate `{{.ChangedFiles}}` from the payload regardless.
 
 > **Context sources:** when `spec.taskTemplate.contextSources` is configured, each entry's fetched value is exposed as `{{.Context.NAME}}` (e.g., a source named `jira` is available as `{{.Context.jira}}`). The same `.Context` map is also available in `spec.taskTemplate.branch` and `spec.taskTemplate.metadata` templates. See [Context Sources](#context-sources) for details.
 

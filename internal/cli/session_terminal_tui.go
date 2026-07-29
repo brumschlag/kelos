@@ -521,6 +521,9 @@ func (m *sessionTUIModel) applyEvent(event sessionruntime.Event) sessionTUIComma
 		m.acceptQueuedTurn(event.TurnID)
 		if m.activeTurnID != event.TurnID {
 			m.activeTurnStarted = m.now()
+			if event.Timestamp != nil {
+				m.activeTurnStarted = *event.Timestamp
+			}
 		}
 		m.activeTurnID = event.TurnID
 		m.waitingForInput = false

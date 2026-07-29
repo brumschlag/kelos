@@ -1024,7 +1024,8 @@ func (r *SessionReconciler) buildSessionStatefulSet(session *kelos.Session, work
 		return nil, nil, fmt.Errorf("agent Pod has no containers")
 	}
 	mainContainer := &podSpec.Containers[0]
-	mainContainer.Command = []string{sessionRuntimeBinary}
+	useTini := worker.Image == "" && isBundledAgentImage(mainContainer.Image)
+	mainContainer.Command = agentProcessCommand(sessionRuntimeBinary, useTini)
 	mainContainer.Args = []string{"serve"}
 	setSessionContainerEnv(mainContainer, "KELOS_SESSION_NAME", session.Name)
 	setSessionContainerEnv(mainContainer, "KELOS_SESSION_NAMESPACE", session.Namespace)

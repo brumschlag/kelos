@@ -130,6 +130,8 @@ func TestWorkerPoolReconciler_CreatesStatefulSet(t *testing.T) {
 
 	assert.Equal(t, int32(3), *sts.Spec.Replicas)
 	assert.Equal(t, workerPoolLabelsForTest("my-pool"), sts.Spec.Selector.MatchLabels)
+	require.NotEmpty(t, sts.Spec.Template.Spec.Containers)
+	assertAgentProcessCommand(t, sts.Spec.Template.Spec.Containers[0].Command, "/kelos/bin/kelos-worker-runner", false)
 	require.Len(t, sts.Spec.VolumeClaimTemplates, 1)
 	assert.Equal(t, WorkspaceVolumeName, sts.Spec.VolumeClaimTemplates[0].Name)
 	expectedSize := resource.MustParse("10Gi")

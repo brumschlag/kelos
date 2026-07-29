@@ -1900,7 +1900,8 @@ function handleEvent(event) {
     case 'turn.started':
       endAssistantSegment(event.turnId);
       if (!state.activeTurn || state.activeTurnID !== event.turnId) {
-        state.activeTurnStartedAt = Date.now();
+        const timestamp = Date.parse(event.timestamp || '');
+        state.activeTurnStartedAt = Number.isNaN(timestamp) ? Date.now() : timestamp;
       }
       state.activeTurn = true;
       state.activeTurnID = event.turnId || '';

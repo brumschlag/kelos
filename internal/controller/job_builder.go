@@ -345,9 +345,11 @@ func upstreamRepoEnvValue(remotes []kelos.GitRemote) string {
 // buildAgentJob creates a Job for the given agent type.
 func (b *JobBuilder) buildAgentJob(task *kelos.Task, workspace *kelos.WorkspaceSpec, agentConfig *kelos.AgentConfigSpec, defaultImage string, pullPolicy corev1.PullPolicy, prompt string) (*batchv1.Job, error) {
 	image := defaultImage
-	if img := resolveTaskImage(task); img != "" {
-		image = img
+	imageOverride := resolveTaskImage(task)
+	if imageOverride != "" {
+		image = imageOverride
 	}
+	useTini := imageOverride == "" && isBundledAgentImage(image)
 
 	agentType := resolveTaskType(task)
 	var envVars []corev1.EnvVar
@@ -479,7 +481,7 @@ func (b *JobBuilder) buildAgentJob(task *kelos.Task, workspace *kelos.WorkspaceS
 		Name:            kelos.AgentContainerName,
 		Image:           image,
 		ImagePullPolicy: pullPolicy,
-		Command:         []string{"/kelos_entrypoint.sh"},
+		Command:         agentProcessCommand("/kelos_entrypoint.sh", useTini),
 		Args:            []string{prompt},
 		Env:             envVars,
 	}

@@ -16,11 +16,7 @@ func describeAgentTests(cfg agentTestConfig) {
 	Describe(fmt.Sprintf("Task [%s]", cfg.AgentType), func() {
 		f := framework.NewFramework(fmt.Sprintf("task-%s", cfg.AgentType))
 
-		BeforeEach(func() {
-			if cfg.credentialsMissing() {
-				Skip(cfg.EnvVar + " not set")
-			}
-		})
+		BeforeEach(cfg.skipIfUnavailable)
 
 		It("should run a Task to completion", func() {
 			By("creating credentials secret")
@@ -60,11 +56,7 @@ func describeAgentTests(cfg agentTestConfig) {
 	Describe(fmt.Sprintf("Task with workspace [%s]", cfg.AgentType), func() {
 		f := framework.NewFramework(fmt.Sprintf("ws-%s", cfg.AgentType))
 
-		BeforeEach(func() {
-			if cfg.credentialsMissing() {
-				Skip(cfg.EnvVar + " not set")
-			}
-		})
+		BeforeEach(cfg.skipIfUnavailable)
 
 		It("should run a Task with workspace to completion", func() {
 			By("creating credentials secret")
@@ -121,11 +113,7 @@ func describeAgentTests(cfg agentTestConfig) {
 	Describe(fmt.Sprintf("Task output capture [%s]", cfg.AgentType), func() {
 		f := framework.NewFramework(fmt.Sprintf("output-%s", cfg.AgentType))
 
-		BeforeEach(func() {
-			if cfg.credentialsMissing() {
-				Skip(cfg.EnvVar + " not set")
-			}
-		})
+		BeforeEach(cfg.skipIfUnavailable)
 
 		It("should populate Outputs and Results after task completes", func() {
 			By("creating credentials secret")
@@ -215,11 +203,7 @@ func describeAgentTests(cfg agentTestConfig) {
 	Describe(fmt.Sprintf("Task dependency chain [%s]", cfg.AgentType), func() {
 		f := framework.NewFramework(fmt.Sprintf("deps-%s", cfg.AgentType))
 
-		BeforeEach(func() {
-			if cfg.credentialsMissing() {
-				Skip(cfg.EnvVar + " not set")
-			}
-		})
+		BeforeEach(cfg.skipIfUnavailable)
 
 		It("should start dependent task only after dependency succeeds", func() {
 			By("creating credentials secret")
@@ -276,11 +260,7 @@ func describeAgentTests(cfg agentTestConfig) {
 	Describe(fmt.Sprintf("Task cleanup on failure [%s]", cfg.AgentType), func() {
 		f := framework.NewFramework(fmt.Sprintf("cleanup-%s", cfg.AgentType))
 
-		BeforeEach(func() {
-			if cfg.credentialsMissing() {
-				Skip(cfg.EnvVar + " not set")
-			}
-		})
+		BeforeEach(cfg.skipIfUnavailable)
 
 		It("should clean up namespace resources automatically", func() {
 			By("creating credentials secret")

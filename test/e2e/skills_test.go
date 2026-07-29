@@ -267,11 +267,7 @@ func describePluginTaskTests(cfg agentTestConfig) {
 		f := framework.NewFramework(fmt.Sprintf("plugin-task-%s", cfg.AgentType))
 		taskName := fmt.Sprintf("plugin-task-%s", cfg.AgentType)
 
-		BeforeEach(func() {
-			if cfg.credentialsMissing() {
-				Skip(cfg.EnvVar + " not set")
-			}
-		})
+		BeforeEach(cfg.skipIfUnavailable)
 
 		It("should run a Task with an AgentConfig that has a plugin", func() {
 			By("creating credentials secret")

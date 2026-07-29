@@ -6,7 +6,40 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestJournalTimestampsEventsAndPreservesTimestampAfterReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), journalFileName)
+	journal, err := OpenJournal(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := time.Now().UTC()
+	if err := journal.Append(Event{Type: EventTurnStarted, TurnID: "turn-1"}); err != nil {
+		t.Fatal(err)
+	}
+	after := time.Now().UTC()
+	events := journal.Snapshot()
+	if len(events) != 1 || events[0].Timestamp == nil {
+		t.Fatalf("timestamped events = %#v", events)
+	}
+	timestamp := *events[0].Timestamp
+	if timestamp.Before(before) || timestamp.After(after) {
+		t.Fatalf("event timestamp = %s, want between %s and %s", timestamp, before, after)
+	}
+	journal.Close()
+
+	reopened, err := OpenJournal(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	events = reopened.Snapshot()
+	if len(events) != 1 || events[0].Timestamp == nil || !events[0].Timestamp.Equal(timestamp) {
+		t.Fatalf("reopened events = %#v, want timestamp %s", events, timestamp)
+	}
+}
 
 func TestJournalPersistsEventsAndRecoversInterruptedTurn(t *testing.T) {
 	path := filepath.Join(t.TempDir(), journalFileName)

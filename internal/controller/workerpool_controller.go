@@ -531,9 +531,11 @@ func (r *WorkerPoolReconciler) buildStatefulSet(pool *kelos.WorkerPool, stsName,
 
 	agentImage := r.agentImage(pool.Spec.Worker.Type)
 	agentPullPolicy := r.agentImagePullPolicy(pool.Spec.Worker.Type)
-	if pool.Spec.Worker.Image != "" {
+	customAgentImage := pool.Spec.Worker.Image != ""
+	if customAgentImage {
 		agentImage = pool.Spec.Worker.Image
 	}
+	useTini := !customAgentImage && isBundledAgentImage(agentImage)
 
 	envVars := []corev1.EnvVar{
 		{
@@ -655,7 +657,7 @@ func (r *WorkerPoolReconciler) buildStatefulSet(pool *kelos.WorkerPool, stsName,
 		Name:            kelos.AgentContainerName,
 		Image:           agentImage,
 		ImagePullPolicy: agentPullPolicy,
-		Command:         []string{workerRunnerMountPath + "/kelos-worker-runner"},
+		Command:         agentProcessCommand(workerRunnerMountPath+"/kelos-worker-runner", useTini),
 		Env:             envVars,
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: WorkspaceVolumeName, MountPath: WorkspaceMountPath},

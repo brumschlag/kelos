@@ -83,6 +83,10 @@ var _ = Describe("WorkerPool Controller", func() {
 
 			Expect(createdSTS.Spec.Replicas).NotTo(BeNil())
 			Expect(*createdSTS.Spec.Replicas).To(Equal(int32(2)))
+			Expect(createdSTS.Spec.Template.Spec.Containers).NotTo(BeEmpty())
+			Expect(createdSTS.Spec.Template.Spec.Containers[0].Command).To(
+				Equal(expectedAgentProcessCommand("/kelos/bin/kelos-worker-runner", true)),
+			)
 			Expect(createdSTS.Spec.VolumeClaimTemplates).To(HaveLen(1))
 			expectedSize := resource.MustParse("5Gi")
 			gotSize := createdSTS.Spec.VolumeClaimTemplates[0].Spec.Resources.Requests[corev1.ResourceStorage]
