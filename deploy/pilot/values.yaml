@@ -16,7 +16,7 @@ crds:
 
 controllerImage: 565715328522.dkr.ecr.us-east-1.amazonaws.com/kelos-controller
 # Tagged separately from image.tag so --version stays on the upstream release.
-controllerImageTag: v0.49.0-envoverrides
+controllerImageTag: v0.49.0-preconv
 image:
   # Stays on the upstream release tag. It feeds --version, which supplies the tag
   # for every image not overridden below, so a fork tag here would point the
