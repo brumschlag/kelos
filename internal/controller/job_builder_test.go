@@ -6291,3 +6291,68 @@ func TestBuildJob_WorkerSpecOverridesLegacy(t *testing.T) {
 			"worker-secret", apiKeyEnv.ValueFrom.SecretKeyRef.LocalObjectReference.Name)
 	}
 }
+
+// The helper being correct is not enough — the Job must actually use it. Reverting
+// the call site to agentProcessCommand left every other test passing, so this
+// asserts the wiring itself.
+func TestBuildAgentJob_RunsTaskHookCommands(t *testing.T) {
+	builder := NewJobBuilder()
+	task := &kelos.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-hooks", Namespace: "default"},
+		Spec: kelos.TaskSpec{
+			Type:   AgentTypeClaudeCode,
+			Prompt: "Hello",
+			Credentials: &kelos.Credentials{
+				Type:      kelos.CredentialTypeAPIKey,
+				SecretRef: &kelos.SecretReference{Name: "my-secret"},
+			},
+			PreCommands:  [][]string{{"sh", "-c", "echo kelos-pre-marker"}},
+			PostCommands: [][]string{{"sh", "-c", "echo kelos-post-marker"}},
+		},
+	}
+
+	job, err := builder.Build(task, nil, nil, task.Spec.Prompt)
+	if err != nil {
+		t.Fatalf("Build() returned error: %v", err)
+	}
+
+	command := strings.Join(job.Spec.Template.Spec.Containers[0].Command, " ")
+	if !strings.Contains(command, "kelos-pre-marker") {
+		t.Errorf("preCommands not present in container command: %q", command)
+	}
+	if !strings.Contains(command, "kelos-post-marker") {
+		t.Errorf("postCommands not present in container command: %q", command)
+	}
+	// The prompt is passed via Args, so it must survive as "$@".
+	if !strings.Contains(command, `"$@"`) {
+		t.Errorf("expected the prompt to be forwarded as \"$@\": %q", command)
+	}
+}
+
+// A Task without hooks must keep the plain entrypoint, so the common path gains
+// no shell dependency (which would break shell-less custom images).
+func TestBuildAgentJob_WithoutHooksUsesPlainEntrypoint(t *testing.T) {
+	builder := NewJobBuilder()
+	task := &kelos.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-nohooks", Namespace: "default"},
+		Spec: kelos.TaskSpec{
+			Type:   AgentTypeClaudeCode,
+			Prompt: "Hello",
+			Credentials: &kelos.Credentials{
+				Type:      kelos.CredentialTypeAPIKey,
+				SecretRef: &kelos.SecretReference{Name: "my-secret"},
+			},
+		},
+	}
+
+	job, err := builder.Build(task, nil, nil, task.Spec.Prompt)
+	if err != nil {
+		t.Fatalf("Build() returned error: %v", err)
+	}
+
+	command := job.Spec.Template.Spec.Containers[0].Command
+	last := command[len(command)-1]
+	if last != "/kelos_entrypoint.sh" {
+		t.Errorf("expected the entrypoint to be invoked directly, got %v", command)
+	}
+}

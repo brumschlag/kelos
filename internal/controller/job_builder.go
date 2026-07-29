@@ -481,9 +481,17 @@ func (b *JobBuilder) buildAgentJob(task *kelos.Task, workspace *kelos.WorkspaceS
 		Name:            kelos.AgentContainerName,
 		Image:           image,
 		ImagePullPolicy: pullPolicy,
-		Command:         agentProcessCommand("/kelos_entrypoint.sh", useTini),
-		Args:            []string{prompt},
-		Env:             envVars,
+		// Hooks are wrapped here because a non-pooled Job launches the entrypoint
+		// directly; the pooled path runs them in the worker-runner instead. Without
+		// this they are accepted, stored, and silently ignored.
+		Command: agentProcessCommandWithHooks(
+			"/kelos_entrypoint.sh",
+			useTini,
+			task.Spec.PreCommands,
+			task.Spec.PostCommands,
+		),
+		Args: []string{prompt},
+		Env:  envVars,
 	}
 
 	var initContainers []corev1.Container
