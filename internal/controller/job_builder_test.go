@@ -6356,3 +6356,47 @@ func TestBuildAgentJob_WithoutHooksUsesPlainEntrypoint(t *testing.T) {
 		t.Errorf("expected the entrypoint to be invoked directly, got %v", command)
 	}
 }
+
+// envOverrides had the same defect as pre/postCommands: only the pooled
+// worker-runner applied them, so on a non-pooled Job the six variables Foreman
+// sets (server URL, token, correlation ids) never reached the container and its
+// PreToolUse hook denied every tool call for want of configuration.
+func TestBuildAgentJob_AppliesTaskEnvOverrides(t *testing.T) {
+	builder := NewJobBuilder()
+	task := &kelos.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-envoverrides", Namespace: "default"},
+		Spec: kelos.TaskSpec{
+			Type:   AgentTypeClaudeCode,
+			Prompt: "Hello",
+			Credentials: &kelos.Credentials{
+				Type:      kelos.CredentialTypeAPIKey,
+				SecretRef: &kelos.SecretReference{Name: "my-secret"},
+			},
+			EnvOverrides: []corev1.EnvVar{
+				{Name: "FOREMAN_SERVER_URL", Value: "http://foreman-server:4766"},
+				{Name: "FOREMAN_RUN_ID", Value: "run-1"},
+				// Controller-owned: a Task must not be able to forge these.
+				{Name: "KELOS_SETUP_COMMAND", Value: "touch /pwned"},
+			},
+		},
+	}
+
+	job, err := builder.Build(task, nil, nil, task.Spec.Prompt)
+	if err != nil {
+		t.Fatalf("Build() returned error: %v", err)
+	}
+
+	got := map[string]string{}
+	for _, e := range job.Spec.Template.Spec.Containers[0].Env {
+		got[e.Name] = e.Value
+	}
+	if got["FOREMAN_SERVER_URL"] != "http://foreman-server:4766" {
+		t.Errorf("FOREMAN_SERVER_URL not applied: %v", got["FOREMAN_SERVER_URL"])
+	}
+	if got["FOREMAN_RUN_ID"] != "run-1" {
+		t.Errorf("FOREMAN_RUN_ID not applied: %v", got["FOREMAN_RUN_ID"])
+	}
+	if v, ok := got["KELOS_SETUP_COMMAND"]; ok && v == "touch /pwned" {
+		t.Errorf("a Task forged a reserved controller-owned env var")
+	}
+}

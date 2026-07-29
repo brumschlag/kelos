@@ -474,6 +474,22 @@ func (b *JobBuilder) buildAgentJob(task *kelos.Task, workspace *kelos.WorkspaceS
 		workspaceEnvVars = append(workspaceEnvVars, tokenFileEnv)
 	}
 
+	// Per-Task agent environment. Like pre/postCommands, this was only applied by
+	// the pooled worker-runner, so on a non-pooled Job the values were accepted,
+	// stored, and silently dropped. Appended last so a Task's value wins over a
+	// pod-level default. Reserved names are skipped because they are
+	// controller-owned: letting a Task forge its own identity or KELOS_SETUP_COMMAND
+	// would amount to running arbitrary commands before the agent starts.
+	for _, override := range task.Spec.EnvOverrides {
+		if strings.HasPrefix(override.Name, "KELOS_") {
+			continue
+		}
+		if _, reserved := reservedEnvNames[override.Name]; reserved {
+			continue
+		}
+		envVars = append(envVars, *override.DeepCopy())
+	}
+
 	backoffLimit := int32(1)
 	agentUID := AgentUID
 
