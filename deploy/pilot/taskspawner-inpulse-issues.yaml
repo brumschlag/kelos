@@ -3,7 +3,15 @@
 # Captured from the live cluster: this spawner was created by hand and existed
 # only in the API server, so a 9k-character promptTemplate and the whole agent
 # pod shape had no reviewable record. Everything below except the architecture
-# pin is exactly what was already running.
+# pin is exactly what was already running, verified by comparing every field
+# against the live object rather than by reading the diff.
+#
+# One formatting caveat, because "verbatim" should mean it. The capture first
+# emitted promptTemplate as `|2+`, keeping both of the value's trailing newlines;
+# yamlfmt normalises that to `|2`, which keeps one. So this file's prompt is one
+# trailing newline shorter than the value originally captured. The text is
+# byte-identical otherwise. Re-applying this file settles the difference by
+# writing the clipped value back, after which file and cluster agree exactly.
 #
 # Autonomous GitHub issue work: label an issue `kelos-auto`, then a user with
 # write permission comments `/kelos go`.
@@ -23,53 +31,11 @@ kind: TaskSpawner
 metadata:
   annotations:
     kick: '1788312395'
-    purpose: 'Autonomous work on GitHub issues: label an issue `kelos-auto`, then a write-permission user
-      comments `/kelos go`. The agent investigates, fixes, verifies, pushes a branch and opens a PR against
-      develop.'
-    reporting-note: 'reporting.enabled was flipped false -> true on 2026-09-08. The previous rationale
-      ("stays false because creating check runs is a GitHub-App-only capability, verified 403") conflated
-      two independent fields: reporting.checks creates Check Runs and does require a GitHub App, but reporting.enabled
-      only posts issue comments, which this PAT can do. checksReportingEnabled() inspects ONLY when.githubPullRequests,
-      so an issues-only spawner can never attempt a check run and the 403 cannot apply to it. Verified
-      live: the reporter posted an ''accepted'' status comment on issue #3166 at 2026-09-08T18:46:03Z
-      using this same credential. GOTCHA: the per-Task annotation kelos.dev/github-reporting=enabled is
-      stamped at Task CREATION time, so flipping this flag only affects Tasks created afterwards. To cover
-      an in-flight Task, add that annotation to it by hand.'
-    safety: 'Controls, in order of strength. (1) ENFORCED: the ruleset protect-main-branch blocks direct
-      pushes to main/develop, so work must arrive as a PR, and ci-required must be green to merge. (2)
-      ENFORCED: opt-in label + a /kelos go comment from a minimumPermission=write user. (3) ENFORCED:
-      maxConcurrency and maxTotalTasks caps. (4) PROMPT-ONLY, NOT enforced: "do not touch .github/". The
-      credential is a fine-grained PAT scoped to this repo but it WAS granted Workflows:write (owner decision
-      2026-09-02), so GitHub will NOT reject a workflow-file push - a reviewer must catch it. Also note
-      the PAT acts as a repo admin, who is in the ruleset''s bypass_actors, so (1) may not bind either.
-      Net: human PR review is the backstop.'
-    shallow-clone-note: 'The concurrent-fix guard''s `git log --oneline origin/develop -5 -- <file>` was
-      INERT: the controller clones with --depth 1 (verified on pod issue-3954-5kvrh: git-clone args --branch
-      develop --depth 1 -> /workspace/repo), so there is no history to list and the empty output reads
-      identically to ''develop has no competing change'' - false reassurance on exactly the check that
-      exists to prevent a superseded PR. Fixed 2026-09-09 by prefixing `git fetch --deepen=50 origin develop`
-      and telling the agent the sibling `git show origin/develop:<file>` check is the load-bearing one
-      (it needs no history). If clone depth ever becomes settable on the Workspace/TaskSpawner CR, prefer
-      that over the in-prompt deepen.'
-    testing-note: 'step 0 (read .claude/rules + constitution) and step 5b (RED-first regression test)
-      were added 2026-09-09. Rationale: (1) NOTHING loaded this repo''s rules for the agent - the depth-1
-      clone puts all ~40 .claude/rules/*.md on disk at /workspace/repo and CLAUDE.md auto-loads, but CLAUDE.md
-      has ZERO @-imports and only hyperlinks 5 of the 40, and a markdown link is not a read. Consequence:
-      this prompt had been hand-patched with content that DUPLICATES rules already in the repo (step 6b
-      re-derives approval-gate-not-broken-gate; the concurrent-fix guard re-derives pr-supersession-triage
-      and ci-merge-semantic-conflict; the commit-skill ban re-derives git-commits), i.e. every incident
-      was being re-encoded by hand into this CR field because the pod could not see the rule. (2) The
-      prompt told the agent to RUN tests (step 6) but never to ADD one, while docs/standards/constitution.md
-      mandates TDD - and CI cannot catch the gap because scripts/check-coverage-threshold.sh is an ABSOLUTE
-      repo-wide gate (unit 75 error/80 warn, integration 65/70), not per-diff, so a small fix with no
-      test cannot move that number and merges green. 5b is scoped: RED-then-GREEN evidence in the PR body,
-      behavioural assertions only, and four explicit exemptions (docs/config, baseline-only, dead-code-deletion,
-      and RED-is-unsafe as with a re-bless flag that would overwrite the baseline it defends). The minimality
-      HARD CONSTRAINT was amended in the same edit to carve out the test - left unamended the two instructions
-      conflict and the agent correctly picks minimality, which would make 5b inert. activeDeadlineSeconds
-      3600 -> 5400 because 5b adds a build/test round trip and 1h was already tight for clone + dotnet
-      inject + build + test on this repo; watch for DeadlineExceeded and raise again rather than dropping
-      5b.'
+    purpose: 'Autonomous work on GitHub issues: label an issue `kelos-auto`, then a write-permission user comments `/kelos go`. The agent investigates, fixes, verifies, pushes a branch and opens a PR against develop.'
+    reporting-note: 'reporting.enabled was flipped false -> true on 2026-09-08. The previous rationale ("stays false because creating check runs is a GitHub-App-only capability, verified 403") conflated two independent fields: reporting.checks creates Check Runs and does require a GitHub App, but reporting.enabled only posts issue comments, which this PAT can do. checksReportingEnabled() inspects ONLY when.githubPullRequests, so an issues-only spawner can never attempt a check run and the 403 cannot apply to it. Verified live: the reporter posted an ''accepted'' status comment on issue #3166 at 2026-09-08T18:46:03Z using this same credential. GOTCHA: the per-Task annotation kelos.dev/github-reporting=enabled is stamped at Task CREATION time, so flipping this flag only affects Tasks created afterwards. To cover an in-flight Task, add that annotation to it by hand.'
+    safety: 'Controls, in order of strength. (1) ENFORCED: the ruleset protect-main-branch blocks direct pushes to main/develop, so work must arrive as a PR, and ci-required must be green to merge. (2) ENFORCED: opt-in label + a /kelos go comment from a minimumPermission=write user. (3) ENFORCED: maxConcurrency and maxTotalTasks caps. (4) PROMPT-ONLY, NOT enforced: "do not touch .github/". The credential is a fine-grained PAT scoped to this repo but it WAS granted Workflows:write (owner decision 2026-09-02), so GitHub will NOT reject a workflow-file push - a reviewer must catch it. Also note the PAT acts as a repo admin, who is in the ruleset''s bypass_actors, so (1) may not bind either. Net: human PR review is the backstop.'
+    shallow-clone-note: 'The concurrent-fix guard''s `git log --oneline origin/develop -5 -- <file>` was INERT: the controller clones with --depth 1 (verified on pod issue-3954-5kvrh: git-clone args --branch develop --depth 1 -> /workspace/repo), so there is no history to list and the empty output reads identically to ''develop has no competing change'' - false reassurance on exactly the check that exists to prevent a superseded PR. Fixed 2026-09-09 by prefixing `git fetch --deepen=50 origin develop` and telling the agent the sibling `git show origin/develop:<file>` check is the load-bearing one (it needs no history). If clone depth ever becomes settable on the Workspace/TaskSpawner CR, prefer that over the in-prompt deepen.'
+    testing-note: 'step 0 (read .claude/rules + constitution) and step 5b (RED-first regression test) were added 2026-09-09. Rationale: (1) NOTHING loaded this repo''s rules for the agent - the depth-1 clone puts all ~40 .claude/rules/*.md on disk at /workspace/repo and CLAUDE.md auto-loads, but CLAUDE.md has ZERO @-imports and only hyperlinks 5 of the 40, and a markdown link is not a read. Consequence: this prompt had been hand-patched with content that DUPLICATES rules already in the repo (step 6b re-derives approval-gate-not-broken-gate; the concurrent-fix guard re-derives pr-supersession-triage and ci-merge-semantic-conflict; the commit-skill ban re-derives git-commits), i.e. every incident was being re-encoded by hand into this CR field because the pod could not see the rule. (2) The prompt told the agent to RUN tests (step 6) but never to ADD one, while docs/standards/constitution.md mandates TDD - and CI cannot catch the gap because scripts/check-coverage-threshold.sh is an ABSOLUTE repo-wide gate (unit 75 error/80 warn, integration 65/70), not per-diff, so a small fix with no test cannot move that number and merges green. 5b is scoped: RED-then-GREEN evidence in the PR body, behavioural assertions only, and four explicit exemptions (docs/config, baseline-only, dead-code-deletion, and RED-is-unsafe as with a re-bless flag that would overwrite the baseline it defends). The minimality HARD CONSTRAINT was amended in the same edit to carve out the test - left unamended the two instructions conflict and the agent correctly picks minimality, which would make 5b inert. activeDeadlineSeconds 3600 -> 5400 because 5b adds a build/test round trip and 1h was already tight for clone + dotnet inject + build + test on this repo; watch for DeadlineExceeded and raise again rather than dropping 5b.'
   name: inpulse-issues
   namespace: kelos-pilot
 spec:
@@ -78,7 +44,7 @@ spec:
   suspend: false
   taskTemplate:
     agentConfigRefs:
-    - name: inpulse-knowledge
+      - name: inpulse-knowledge
     credentials:
       type: none
     model: claude-sonnet-46
@@ -86,59 +52,59 @@ spec:
     podOverrides:
       activeDeadlineSeconds: 5400
       env:
-      - name: ANTHROPIC_BASE_URL
-        value: http://bedrock-gateway.honcho.svc.cluster.local
-      - name: ANTHROPIC_AUTH_TOKEN
-        valueFrom:
-          secretKeyRef:
-            key: gateway-api-key
-            name: honcho-gateway-key
-      - name: DOTNET_ROOT
-        value: /shared/dotnet
-      - name: DOTNET_CLI_TELEMETRY_OPTOUT
-        value: '1'
-      - name: LD_LIBRARY_PATH
-        value: /shared/icu
-      - name: PATH
-        value: /shared/dotnet:/home/claude/.local/bin:/home/claude/go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-      - name: CODEARTIFACT_AUTH_TOKEN
-        valueFrom:
-          secretKeyRef:
-            key: CODEARTIFACT_AUTH_TOKEN
-            name: codeartifact-token
-            optional: true
-      - name: GITHUB_TOKEN
-        valueFrom:
-          secretKeyRef:
-            key: GITHUB_TOKEN
-            name: github-token-agent-write
+        - name: ANTHROPIC_BASE_URL
+          value: http://bedrock-gateway.honcho.svc.cluster.local
+        - name: ANTHROPIC_AUTH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              key: gateway-api-key
+              name: honcho-gateway-key
+        - name: DOTNET_ROOT
+          value: /shared/dotnet
+        - name: DOTNET_CLI_TELEMETRY_OPTOUT
+          value: '1'
+        - name: LD_LIBRARY_PATH
+          value: /shared/icu
+        - name: PATH
+          value: /shared/dotnet:/home/claude/.local/bin:/home/claude/go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        - name: CODEARTIFACT_AUTH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              key: CODEARTIFACT_AUTH_TOKEN
+              name: codeartifact-token
+              optional: true
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              key: GITHUB_TOKEN
+              name: github-token-agent-write
       extraInitContainers:
-      - args:
-        - |
-          set -euo pipefail
-          cp -a /usr/share/dotnet /shared/dotnet
-          mkdir -p /shared/icu
-          cp -a /usr/lib/x86_64-linux-gnu/libicu*.so* /shared/icu/
-          chmod -R a+rX /shared/dotnet /shared/icu
-          echo "injected dotnet $(/shared/dotnet/dotnet --version), $(ls /shared/icu | wc -l) icu files"
-        command:
-        - bash
-        - -c
-        image: mcr.microsoft.com/dotnet/sdk:10.0
-        imagePullPolicy: IfNotPresent
-        name: inject-dotnet
-        resources:
-          limits:
-            cpu: '2'
-            memory: 2Gi
-          requests:
-            cpu: 200m
-            memory: 256Mi
-        terminationMessagePath: /dev/termination-log
-        terminationMessagePolicy: File
-        volumeMounts:
-        - mountPath: /shared
-          name: shared
+        - args:
+            - |
+              set -euo pipefail
+              cp -a /usr/share/dotnet /shared/dotnet
+              mkdir -p /shared/icu
+              cp -a /usr/lib/x86_64-linux-gnu/libicu*.so* /shared/icu/
+              chmod -R a+rX /shared/dotnet /shared/icu
+              echo "injected dotnet $(/shared/dotnet/dotnet --version), $(ls /shared/icu | wc -l) icu files"
+          command:
+            - bash
+            - -c
+          image: mcr.microsoft.com/dotnet/sdk:10.0
+          imagePullPolicy: IfNotPresent
+          name: inject-dotnet
+          resources:
+            limits:
+              cpu: '2'
+              memory: 2Gi
+            requests:
+              cpu: 200m
+              memory: 256Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+            - mountPath: /shared
+              name: shared
       nodeSelector:
         kubernetes.io/arch: amd64
         workload: agents
@@ -150,17 +116,17 @@ spec:
           cpu: 500m
           memory: 3Gi
       tolerations:
-      - effect: NoSchedule
-        key: workload
-        operator: Equal
-        value: agents
+        - effect: NoSchedule
+          key: workload
+          operator: Equal
+          value: agents
       volumeMounts:
-      - mountPath: /shared
-        name: shared
+        - mountPath: /shared
+          name: shared
       volumes:
-      - emptyDir: {}
-        name: shared
-    promptTemplate: |2+
+        - emptyDir: {}
+          name: shared
+    promptTemplate: |2
           UNATTENDED EXECUTION - READ FIRST:
           - You are running in a Kubernetes pod. There is NO user watching and NO ONE can
             answer a question. If you stop to ask for approval, your turn ends, the pod
@@ -323,18 +289,18 @@ spec:
         minimumPermission: write
         triggerComment: /kelos go
       excludeLabels:
-      - blocked
-      - do-not-merge
-      - wontfix
+        - blocked
+        - do-not-merge
+        - wontfix
       labels:
-      - kelos-auto
+        - kelos-auto
       pollInterval: 2m
       priorityLabels:
-      - P0
-      - P1
+        - P0
+        - P1
       repo: accuhealthevelyn/inpulse
       reporting:
         enabled: true
       state: open
       types:
-      - issues
+        - issues
