@@ -28,11 +28,14 @@ reports them as phase metrics.
 # 1. CRDs (includes the fork-only Task fields)
 kubectl apply --server-side --force-conflicts -f internal/manifests/install-crd.yaml
 
-# 2. Controller. --force-conflicts is needed because the CRDs were first applied
-#    by upstream kelos, which still owns spec.versions as a field manager.
-helm upgrade --install kelos internal/manifests/charts/kelos \
-  --namespace kelos-system \
-  --values deploy/pilot/values.yaml
+# 2. Controller. `kelos install` renders this same chart and applies it, which
+#    is what produced the live state: there is no Helm release for kelos, no
+#    release secret in kelos-system, and the controller Deployment carries no
+#    Helm ownership metadata. A `helm upgrade --install` would therefore not
+#    upgrade anything -- it would try to create a first release and be rejected
+#    for adopting resources that lack `app.kubernetes.io/managed-by: Helm` and
+#    `meta.helm.sh/release-name`. Use Helm only after deliberately adopting.
+kelos install --namespace kelos-system --values deploy/pilot/values.yaml
 
 # 3. Pilot workloads
 kubectl apply -f deploy/pilot/workloads.yaml
@@ -40,10 +43,18 @@ kubectl apply -f deploy/pilot/workloads.yaml
 
 ## Images
 
-Built from this fork and pushed to both GHCR and ECR; EKS nodes pull from
-same-account ECR via the node role, so no pull secret is needed. Both are
-multi-arch (amd64 + arm64) because the cluster has Graviton nodes — an amd64-only
-image lands on arm64 and fails with `exec format error`.
+Built from this fork and pushed to ECR; EKS nodes pull from same-account ECR via
+the node role, so no pull secret is needed.
+
+The images are **amd64-only**, and the cluster is mixed: 10 amd64 nodes plus 2
+arm64 Graviton (`c6g.large`, added 2026-08-30). An amd64-only image landing on a
+Graviton node fails with `exec format error`, so every kelos workload is pinned
+to `kubernetes.io/arch: amd64` — the chart's `nodeSelector` for the controller
+and telemetry CronJob, and `podOverrides.nodeSelector` for agent pods. Publishing
+multi-arch images would remove that constraint and reclaim the Graviton capacity.
+
+The three fork images share one tag rather than a per-image suffix, since they
+are cut from the same commit and only deployed together.
 
 ```bash
 make image WHAT=cmd/kelos-controller     IMAGE_PLATFORMS=linux/amd64,linux/arm64 \

@@ -68,6 +68,12 @@ spec:
       # sets 900s, which is correct for a batch phase but would kill an
       # interactive Session mid-conversation after 15 minutes. spec.idlePolicy
       # below is the mechanism that bounds an abandoned Session instead.
+      #
+      # The agent image above is amd64-only and the cluster has 2 arm64 Graviton
+      # nodes, where it would fail with `exec format error`. This also pins the
+      # session-runtime init container, which shares the Pod.
+      nodeSelector:
+        kubernetes.io/arch: amd64
       env:
         - name: ANTHROPIC_BASE_URL
           value: http://bedrock-gateway.honcho.svc.cluster.local

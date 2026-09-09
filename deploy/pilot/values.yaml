@@ -19,6 +19,21 @@ crds:
   # as a server-side-apply field manager, so a plain apply is rejected.
   install: false
 
+# The cluster is mixed-architecture: 10 amd64 nodes plus 2 arm64 Graviton
+# (c6g.large, added 2026-08-30). The fork images are built amd64-only, so a pod
+# landing on a Graviton node dies with `exec format error`. Pin the workloads
+# this chart renders -- the controller Deployment and the telemetry CronJob.
+#
+# Agent pods are not rendered by the chart and are pinned separately, through
+# podOverrides.nodeSelector on the WorkerPool in workloads.yaml and on the
+# Session in session.yaml. Any TaskSpawner taskTemplate needs the same.
+#
+# The alternative is publishing multi-arch images, which would let these
+# workloads use the Graviton capacity. Until then this is a real constraint:
+# kelos cannot schedule onto 2 of the 12 nodes.
+nodeSelector:
+  kubernetes.io/arch: amd64
+
 controllerImage: 565715328522.dkr.ecr.us-east-1.amazonaws.com/kelos-controller
 # Tagged separately from image.tag so --version stays on the upstream release.
 controllerImageTag: v0.55.0-pilot1

@@ -36,6 +36,11 @@ spec:
       name: envoverrides-scratch
     podOverrides:
       activeDeadlineSeconds: 900
+      # The fork agent image is amd64-only and the cluster has 2 arm64 Graviton
+      # nodes, where it would fail with `exec format error`. The chart pins the
+      # controller separately; agent pods have to be pinned per-resource.
+      nodeSelector:
+        kubernetes.io/arch: amd64
       env:
         - name: ANTHROPIC_BASE_URL
           value: http://bedrock-gateway.honcho.svc.cluster.local
