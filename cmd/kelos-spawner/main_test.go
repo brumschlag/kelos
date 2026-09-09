@@ -3280,3 +3280,96 @@ func TestRunCycleWithSource_NameTemplateDedup(t *testing.T) {
 		t.Errorf("Expected tasks custom-1 and custom-2, got %v", names)
 	}
 }
+
+func TestBuildSource_Beads(t *testing.T) {
+	limit := int32(25)
+	ts := &kelos.TaskSpawner{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "spawner",
+			Namespace: "default",
+		},
+		Spec: kelos.TaskSpawnerSpec{
+			When: kelos.When{
+				Beads: &kelos.Beads{
+					Remote:        "https://beads.example.com:50051/beads",
+					Database:      "beads",
+					Prefix:        "pain",
+					Labels:        []string{"triaged"},
+					ExcludeLabels: []string{"dispatched"},
+					Limit:         &limit,
+					SecretRef:     kelos.SecretReference{Name: "dolt-creds"},
+				},
+			},
+			TaskTemplate: kelos.TaskTemplate{Type: "claude-code"},
+		},
+	}
+
+	t.Setenv("BEADS_WORKDIR", "/beads")
+
+	src, err := buildSource(context.Background(), ts, "", "", "", noToken, "", "", "", nil)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	beadsSrc, ok := src.(*source.BeadsSource)
+	if !ok {
+		t.Fatalf("Expected *source.BeadsSource, got %T", src)
+	}
+	if beadsSrc.Remote != "https://beads.example.com:50051/beads" {
+		t.Errorf("Remote = %q", beadsSrc.Remote)
+	}
+	if beadsSrc.Database != "beads" {
+		t.Errorf("Database = %q, want beads", beadsSrc.Database)
+	}
+	if beadsSrc.Prefix != "pain" {
+		t.Errorf("Prefix = %q, want pain", beadsSrc.Prefix)
+	}
+	if len(beadsSrc.Labels) != 1 || beadsSrc.Labels[0] != "triaged" {
+		t.Errorf("Labels = %v, want [triaged]", beadsSrc.Labels)
+	}
+	if len(beadsSrc.ExcludeLabels) != 1 || beadsSrc.ExcludeLabels[0] != "dispatched" {
+		t.Errorf("ExcludeLabels = %v, want [dispatched]", beadsSrc.ExcludeLabels)
+	}
+	if beadsSrc.Limit != 25 {
+		t.Errorf("Limit = %d, want 25", beadsSrc.Limit)
+	}
+	if beadsSrc.WorkDir != "/beads" {
+		t.Errorf("WorkDir = %q, want /beads", beadsSrc.WorkDir)
+	}
+}
+
+func TestBuildSource_BeadsDefaultsWorkDirAndLimit(t *testing.T) {
+	ts := &kelos.TaskSpawner{
+		ObjectMeta: metav1.ObjectMeta{Name: "spawner", Namespace: "default"},
+		Spec: kelos.TaskSpawnerSpec{
+			When: kelos.When{
+				Beads: &kelos.Beads{
+					Remote:    "https://beads.example.com:50051/beads",
+					Database:  "beads",
+					Prefix:    "pain",
+					SecretRef: kelos.SecretReference{Name: "dolt-creds"},
+				},
+			},
+			TaskTemplate: kelos.TaskTemplate{Type: "claude-code"},
+		},
+	}
+
+	t.Setenv("BEADS_WORKDIR", "")
+
+	src, err := buildSource(context.Background(), ts, "", "", "", noToken, "", "", "", nil)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	beadsSrc, ok := src.(*source.BeadsSource)
+	if !ok {
+		t.Fatalf("Expected *source.BeadsSource, got %T", src)
+	}
+	if beadsSrc.WorkDir != defaultBeadsWorkDir {
+		t.Errorf("WorkDir = %q, want %q", beadsSrc.WorkDir, defaultBeadsWorkDir)
+	}
+	// An unset limit must leave the CLI's own default in place.
+	if beadsSrc.Limit != 0 {
+		t.Errorf("Limit = %d, want 0 when unset", beadsSrc.Limit)
+	}
+}

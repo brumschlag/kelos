@@ -276,6 +276,9 @@ func collect(ctx context.Context, c client.Client, clientset kubernetes.Interfac
 		if s.Spec.When.Jira != nil {
 			sourceTypes["jira"] = struct{}{}
 		}
+		if s.Spec.When.Beads != nil {
+			sourceTypes["beads"] = struct{}{}
+		}
 	}
 	for st := range sourceTypes {
 		report.Features.SourceTypes = append(report.Features.SourceTypes, st)
@@ -391,6 +394,8 @@ func taskSpawnerSource(when kelos.When) string {
 		return "cron"
 	case when.Jira != nil:
 		return "jira"
+	case when.Beads != nil:
+		return "beads"
 	case when.Slack != nil:
 		return "slack"
 	default:

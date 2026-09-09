@@ -3175,3 +3175,179 @@ func TestReconcileDeployment_KeepsDeploymentWithNewLabels(t *testing.T) {
 		t.Errorf("expected kelos.dev/component label in selector")
 	}
 }
+
+func beadsSpawner() *kelos.TaskSpawner {
+	return &kelos.TaskSpawner{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "beads-spawner",
+			Namespace: "default",
+		},
+		Spec: kelos.TaskSpawnerSpec{
+			When: kelos.When{
+				Beads: &kelos.Beads{
+					Remote:    "https://beads.example.com:50051/beads",
+					Database:  "beads",
+					Prefix:    "pain",
+					SecretRef: kelos.SecretReference{Name: "dolt-creds"},
+				},
+			},
+			TaskTemplate: kelos.TaskTemplate{
+				Type: "claude-code",
+			},
+		},
+	}
+}
+
+func TestDeploymentBuilder_BeadsMountsWritableWorkDir(t *testing.T) {
+	deploy := NewDeploymentBuilder().Build(beadsSpawner(), nil, false)
+
+	volumes := deploy.Spec.Template.Spec.Volumes
+	if len(volumes) != 1 {
+		t.Fatalf("expected 1 volume, got %d", len(volumes))
+	}
+	if volumes[0].Name != BeadsWorkDirVolume {
+		t.Errorf("volume name = %q, want %q", volumes[0].Name, BeadsWorkDirVolume)
+	}
+	if volumes[0].EmptyDir == nil {
+		t.Error("expected the beads workdir to be backed by an emptyDir")
+	}
+
+	spawner := deploy.Spec.Template.Spec.Containers[0]
+	if len(spawner.VolumeMounts) != 1 {
+		t.Fatalf("expected 1 volume mount, got %d", len(spawner.VolumeMounts))
+	}
+	if got := spawner.VolumeMounts[0].MountPath; got != BeadsWorkDir {
+		t.Errorf("mount path = %q, want %q", got, BeadsWorkDir)
+	}
+	if got := spawner.VolumeMounts[0].Name; got != BeadsWorkDirVolume {
+		t.Errorf("mount name = %q, want %q", got, BeadsWorkDirVolume)
+	}
+}
+
+func TestDeploymentBuilder_BeadsEnv(t *testing.T) {
+	deploy := NewDeploymentBuilder().Build(beadsSpawner(), nil, false)
+
+	envMap := make(map[string]corev1.EnvVar)
+	for _, env := range deploy.Spec.Template.Spec.Containers[0].Env {
+		envMap[env.Name] = env
+	}
+
+	// The CLI needs a writable HOME for its own Dolt state, and the spawner
+	// runs as a non-root user with no home directory of its own.
+	for name, want := range map[string]string{
+		"HOME":               BeadsWorkDir,
+		"BEADS_WORKDIR":      BeadsWorkDir,
+		"BD_NON_INTERACTIVE": "1",
+	} {
+		env, ok := envMap[name]
+		if !ok {
+			t.Errorf("expected %s env var, got %v", name, envMap)
+			continue
+		}
+		if env.Value != want {
+			t.Errorf("%s = %q, want %q", name, env.Value, want)
+		}
+	}
+
+	password, ok := envMap["BEADS_DOLT_PASSWORD"]
+	if !ok {
+		t.Fatalf("expected BEADS_DOLT_PASSWORD env var, got %v", envMap)
+	}
+	if password.ValueFrom == nil || password.ValueFrom.SecretKeyRef == nil {
+		t.Fatal("expected BEADS_DOLT_PASSWORD to come from a secret")
+	}
+	if got := password.ValueFrom.SecretKeyRef.Name; got != "dolt-creds" {
+		t.Errorf("password secret = %q, want dolt-creds", got)
+	}
+	if got := password.ValueFrom.SecretKeyRef.Key; got != "BEADS_DOLT_PASSWORD" {
+		t.Errorf("password key = %q, want BEADS_DOLT_PASSWORD", got)
+	}
+	// A missing password is a configuration error, so the key must be required.
+	if password.ValueFrom.SecretKeyRef.Optional != nil && *password.ValueFrom.SecretKeyRef.Optional {
+		t.Error("BEADS_DOLT_PASSWORD must not be optional")
+	}
+
+	user, ok := envMap["BEADS_DOLT_USER"]
+	if !ok {
+		t.Fatalf("expected BEADS_DOLT_USER env var, got %v", envMap)
+	}
+	if user.ValueFrom == nil || user.ValueFrom.SecretKeyRef == nil {
+		t.Fatal("expected BEADS_DOLT_USER to come from a secret")
+	}
+	// The CLI defaults the user, so a Secret carrying only a password is valid.
+	if user.ValueFrom.SecretKeyRef.Optional == nil || !*user.ValueFrom.SecretKeyRef.Optional {
+		t.Error("BEADS_DOLT_USER must be optional")
+	}
+}
+
+func TestDeploymentBuilder_NonBeadsSourceGetsNoVolumes(t *testing.T) {
+	ts := &kelos.TaskSpawner{
+		ObjectMeta: metav1.ObjectMeta{Name: "jira-spawner", Namespace: "default"},
+		Spec: kelos.TaskSpawnerSpec{
+			When: kelos.When{
+				Jira: &kelos.Jira{
+					BaseURL:   "https://mycompany.atlassian.net",
+					Project:   "PROJ",
+					SecretRef: kelos.SecretReference{Name: "jira-creds"},
+				},
+			},
+			TaskTemplate: kelos.TaskTemplate{Type: "claude-code"},
+		},
+	}
+
+	deploy := NewDeploymentBuilder().Build(ts, nil, false)
+
+	if got := len(deploy.Spec.Template.Spec.Volumes); got != 0 {
+		t.Errorf("expected no volumes for a non-beads source, got %d", got)
+	}
+	if got := len(deploy.Spec.Template.Spec.Containers[0].VolumeMounts); got != 0 {
+		t.Errorf("expected no volume mounts for a non-beads source, got %d", got)
+	}
+}
+
+func TestDeploymentBuilder_BeadsUsesBeadsSpawnerImage(t *testing.T) {
+	deploy := NewDeploymentBuilder().Build(beadsSpawner(), nil, false)
+
+	got := deploy.Spec.Template.Spec.Containers[0].Image
+	if got != DefaultSpawnerBeadsImage {
+		t.Errorf("image = %q, want %q", got, DefaultSpawnerBeadsImage)
+	}
+}
+
+func TestDeploymentBuilder_BeadsHonorsConfiguredBeadsImage(t *testing.T) {
+	builder := NewDeploymentBuilder()
+	builder.SpawnerBeadsImage = "registry.example.com/custom-spawner-beads:1.2.3"
+
+	deploy := builder.Build(beadsSpawner(), nil, false)
+
+	got := deploy.Spec.Template.Spec.Containers[0].Image
+	if got != "registry.example.com/custom-spawner-beads:1.2.3" {
+		t.Errorf("image = %q, want the configured beads image", got)
+	}
+}
+
+func TestDeploymentBuilder_NonBeadsSourceUsesDefaultSpawnerImage(t *testing.T) {
+	ts := &kelos.TaskSpawner{
+		ObjectMeta: metav1.ObjectMeta{Name: "jira-spawner", Namespace: "default"},
+		Spec: kelos.TaskSpawnerSpec{
+			When: kelos.When{
+				Jira: &kelos.Jira{
+					BaseURL:   "https://mycompany.atlassian.net",
+					Project:   "PROJ",
+					SecretRef: kelos.SecretReference{Name: "jira-creds"},
+				},
+			},
+			TaskTemplate: kelos.TaskTemplate{Type: "claude-code"},
+		},
+	}
+
+	deploy := NewDeploymentBuilder().Build(ts, nil, false)
+
+	got := deploy.Spec.Template.Spec.Containers[0].Image
+	if got != DefaultSpawnerImage {
+		t.Errorf("image = %q, want %q", got, DefaultSpawnerImage)
+	}
+	if got == DefaultSpawnerBeadsImage {
+		t.Error("a non-beads spawner must not get the beads image")
+	}
+}

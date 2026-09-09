@@ -827,6 +827,14 @@ to receive refreshed credentials during long-running work.
 | `spec.when.webhook.excludeFilters[].pattern` | Exclude the delivery on a regex match against the extracted field value (mutually exclusive with `value`) | Conditional |
 | `spec.when.webhook.gatewayRef.name` | Bind this source to a [WebhookGateway](#webhookgateway) in the same namespace whose `spec.generic` field is set. Generic gateway deliveries remain unauthenticated, and the per-source server ignores this spawner when the reference is present | No |
 | `spec.when.jira.pollInterval` | Per-source poll interval (e.g., `"30s"`, `"5m"`). Defaults to `5m` when omitted | No |
+| `spec.when.beads.remote` | Dolt remote URL of the beads hub (e.g., `"https://beads.example.com:50051/beads"`) | Yes (when using beads) |
+| `spec.when.beads.database` | Dolt database name served by the remote (e.g., `"beads"`) | Yes (when using beads) |
+| `spec.when.beads.prefix` | Bead ID prefix scoping discovery to one project within a shared hub (e.g., `"pain"` for IDs like `pain-16c090ee`) | Yes (when using beads) |
+| `spec.when.beads.secretRef.name` | Secret containing a `BEADS_DOLT_PASSWORD` key (required) and an optional `BEADS_DOLT_USER` key | Yes (when using beads) |
+| `spec.when.beads.labels` | Restrict discovery to beads carrying ALL of these labels | No |
+| `spec.when.beads.excludeLabels` | Skip beads carrying ANY of these labels | No |
+| `spec.when.beads.limit` | Cap on how many ready beads one discovery cycle returns. When omitted, the beads CLI default applies (100) | No |
+| `spec.when.beads.pollInterval` | Per-source poll interval (e.g., `"30s"`, `"5m"`). Defaults to `5m` when omitted | No |
 | `spec.when.cron.schedule` | Cron schedule expression (e.g., `"0 * * * *"`) | Yes (when using cron) |
 | `spec.credentials[].name` | Unique name for a credential distributed by this TaskSpawner. The name is recorded in the `kelos.dev/spawner-credential` label on generated Tasks | Yes when `spec.credentials` is set |
 | `spec.credentials[].type` | Credential type (`api-key` or `oauth`) | Yes when `spec.credentials` is set |
@@ -891,10 +899,41 @@ spec:
 `spec.taskTemplate.worker.credentials`, deprecated
 `spec.taskTemplate.credentials`, and `spec.taskTemplate.workerPoolRef`.
 
+### Beads Source
+
+The `beads` source spawns a Task per ready bead. Readiness is decided by the
+beads CLI, not by Kelos: it covers open beads with no active blockers, and
+excludes beads that are in progress, blocked, deferred, hooked, or ephemeral.
+Beads are returned in the CLI's priority order and spawned in that order, so
+`spec.taskTemplate.priorityLabels` is unnecessary here.
+
+Discovery is read-only — it never claims, labels, or closes a bead, and never
+pushes to the shared hub. Nothing writes back to a bead when its Task finishes,
+so a bead stays ready and would be rediscovered were it not for Task-name
+deduplication. If you want the tracker to reflect progress, have the agent
+itself update the bead as part of its work.
+
+Two consequences worth planning for:
+
+- A finished Task is never retriggered by a bead changing. Editing a bead after
+  its Task completed does not spawn a new Task; delete the Task to rerun it.
+- The backlog can be much larger than the concurrency you want. Use
+  `spec.when.beads.labels` / `excludeLabels` to scope discovery,
+  `spec.when.beads.limit` to cap a cycle, and `spec.maxConcurrency` to bound how
+  many agents run at once.
+
+The spawner clones the remote once into an `emptyDir` and refreshes it each
+cycle, so a restarted spawner re-clones.
+
+A beads source needs the beads CLI and `git`, which the default distroless
+spawner image does not carry. The controller therefore runs beads-sourced
+spawners on a separate image and leaves every other spawner on the default one.
+Override it with `--spawner-beads-image` (Helm: `spawner.beadsImage`).
+
 ### Generated Task Names
 
-For `githubIssues`, `githubPullRequests`, `jira`, and `cron` sources, Kelos first
-lowercases the work item ID when forming the Task name:
+For `githubIssues`, `githubPullRequests`, `jira`, `beads`, and `cron` sources,
+Kelos first lowercases the work item ID when forming the Task name:
 `<TaskSpawner name>-<lowercase work item ID>`.
 
 Lowercasing the Task name does not change the source data exposed to templates
@@ -1004,6 +1043,8 @@ The `promptTemplate` field uses Go `text/template` syntax. Available variables d
 | `{{.Schedule}}` | Cron schedule expression | Empty | Empty | Empty | Empty | Empty | Empty | Schedule string (e.g., `"0 * * * *"`) |
 
 > **Generic Webhook only:** any additional keys declared in `spec.when.webhook.fieldMapping` are also exposed as top-level template variables (e.g., `fieldMapping: {severity: "$.level"}` makes `{{.severity}}` available).
+
+> **Beads:** the `beads` source populates `{{.ID}}` with the bead ID (e.g. `pain-16c090ee`), `{{.Title}}` with the bead title, `{{.Body}}` with its description, `{{.Comments}}` with its notes, `{{.Labels}}` with its labels, and `{{.Kind}}` with the bead's issue type (e.g. `task`, `bug`). `{{.Number}}` is `0` and `{{.URL}}` is empty — beads have neither. All other variables are empty.
 
 > **`{{.ChangedFiles}}` and `filePatterns`:** For pull request webhook events, the changed-file list is fetched lazily and only when a filter's `filePatterns` needs it to decide a match. As a result, `{{.ChangedFiles}}` is populated for PR events **only when the matching filter declares `filePatterns`**; without it, `{{.ChangedFiles}}` renders as an empty list. Push events populate `{{.ChangedFiles}}` from the payload regardless.
 

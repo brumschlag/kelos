@@ -21,16 +21,33 @@ const (
 	// DefaultSpawnerImage is the default image for the spawner binary.
 	DefaultSpawnerImage = SpawnerImageRepository + ":latest"
 
+	// SpawnerBeadsImageRepository holds the spawner variant that carries the
+	// beads CLI and git. The default spawner image is distroless and can run
+	// neither, so beads-sourced spawners need this one.
+	SpawnerBeadsImageRepository = "ghcr.io/kelos-dev/kelos-spawner-beads"
+
+	// DefaultSpawnerBeadsImage is the default image for beads-sourced spawners.
+	DefaultSpawnerBeadsImage = SpawnerBeadsImageRepository + ":latest"
+
 	// SpawnerServiceAccount is the service account used by spawner Deployments.
 	SpawnerServiceAccount = "kelos-spawner"
 
 	// SpawnerClusterRole is the ClusterRole referenced by spawner RoleBindings.
 	SpawnerClusterRole = "kelos-spawner-role"
+
+	// BeadsWorkDir is where a beads-sourced spawner keeps its clone of the
+	// Dolt remote. It doubles as HOME so the beads CLI has a writable place
+	// for its own Dolt state.
+	BeadsWorkDir = "/beads"
+
+	// BeadsWorkDirVolume names the emptyDir backing BeadsWorkDir.
+	BeadsWorkDirVolume = "beads-workdir"
 )
 
 // DeploymentBuilder constructs Kubernetes Deployments for TaskSpawners.
 type DeploymentBuilder struct {
 	SpawnerImage           string
+	SpawnerBeadsImage      string
 	SpawnerImagePullPolicy corev1.PullPolicy
 	SpawnerResources       *corev1.ResourceRequirements
 }
@@ -38,15 +55,28 @@ type DeploymentBuilder struct {
 // NewDeploymentBuilder creates a new DeploymentBuilder.
 func NewDeploymentBuilder() *DeploymentBuilder {
 	return &DeploymentBuilder{
-		SpawnerImage: DefaultSpawnerImage,
+		SpawnerImage:      DefaultSpawnerImage,
+		SpawnerBeadsImage: DefaultSpawnerBeadsImage,
 	}
+}
+
+// spawnerImageFor returns the image that runs this TaskSpawner's spawner
+// container. A beads source needs the beads CLI and git, which the default
+// distroless image does not carry, so it gets the beads variant instead.
+func (b *DeploymentBuilder) spawnerImageFor(ts *kelos.TaskSpawner) string {
+	if ts.Spec.When.Beads != nil {
+		return b.SpawnerBeadsImage
+	}
+	return b.SpawnerImage
 }
 
 // spawnerPodParts holds the components needed to build a spawner pod template.
 type spawnerPodParts struct {
-	args    []string
-	envVars []corev1.EnvVar
-	labels  map[string]string
+	args         []string
+	envVars      []corev1.EnvVar
+	labels       map[string]string
+	volumes      []corev1.Volume
+	volumeMounts []corev1.VolumeMount
 }
 
 // buildPodParts computes the args, env, volumes, and labels that are shared
@@ -181,6 +211,59 @@ func (b *DeploymentBuilder) buildPodParts(ts *kelos.TaskSpawner, workspace *kelo
 		)
 	}
 
+	var volumes []corev1.Volume
+	var volumeMounts []corev1.VolumeMount
+
+	if ts.Spec.When.Beads != nil {
+		beads := ts.Spec.When.Beads
+
+		// The beads CLI clones the Dolt remote and auto-starts a local Dolt
+		// server, so it needs a writable working directory and a writable HOME
+		// (it keeps per-user Dolt state under $HOME/.dolt, and the spawner
+		// runs as a non-root user with no home directory of its own).
+		volumes = append(volumes, corev1.Volume{
+			Name:         BeadsWorkDirVolume,
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		})
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      BeadsWorkDirVolume,
+			MountPath: BeadsWorkDir,
+		})
+
+		// BEADS_DOLT_USER is optional: the CLI defaults it when the Secret
+		// carries only a password.
+		optional := true
+		envVars = append(envVars,
+			corev1.EnvVar{Name: "HOME", Value: BeadsWorkDir},
+			corev1.EnvVar{Name: "BEADS_WORKDIR", Value: BeadsWorkDir},
+			// Keep the CLI from prompting: a spawner has no terminal.
+			corev1.EnvVar{Name: "BD_NON_INTERACTIVE", Value: "1"},
+			corev1.EnvVar{
+				Name: "BEADS_DOLT_USER",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: beads.SecretRef.Name,
+						},
+						Key:      "BEADS_DOLT_USER",
+						Optional: &optional,
+					},
+				},
+			},
+			corev1.EnvVar{
+				Name: "BEADS_DOLT_PASSWORD",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: beads.SecretRef.Name,
+						},
+						Key: "BEADS_DOLT_PASSWORD",
+					},
+				},
+			},
+		)
+	}
+
 	labels := map[string]string{
 		"kelos.dev/name":        "kelos",
 		"kelos.dev/component":   "spawner",
@@ -189,9 +272,11 @@ func (b *DeploymentBuilder) buildPodParts(ts *kelos.TaskSpawner, workspace *kelo
 	}
 
 	return spawnerPodParts{
-		args:    args,
-		envVars: envVars,
-		labels:  labels,
+		args:         args,
+		envVars:      envVars,
+		labels:       labels,
+		volumes:      volumes,
+		volumeMounts: volumeMounts,
 	}
 }
 
@@ -206,10 +291,11 @@ func (b *DeploymentBuilder) Build(ts *kelos.TaskSpawner, workspace *kelos.Worksp
 
 	spawnerContainer := corev1.Container{
 		Name:            "spawner",
-		Image:           b.SpawnerImage,
+		Image:           b.spawnerImageFor(ts),
 		ImagePullPolicy: b.SpawnerImagePullPolicy,
 		Args:            p.args,
 		Env:             p.envVars,
+		VolumeMounts:    p.volumeMounts,
 		Ports: []corev1.ContainerPort{
 			{
 				Name:          "metrics",
@@ -241,6 +327,7 @@ func (b *DeploymentBuilder) Build(ts *kelos.TaskSpawner, workspace *kelos.Worksp
 					ServiceAccountName: SpawnerServiceAccount,
 					RestartPolicy:      corev1.RestartPolicyAlways,
 					Containers:         []corev1.Container{spawnerContainer},
+					Volumes:            p.volumes,
 				},
 			},
 		},
@@ -263,7 +350,7 @@ func (b *DeploymentBuilder) BuildCronJob(ts *kelos.TaskSpawner, workspace *kelos
 
 	spawnerContainer := corev1.Container{
 		Name:            "spawner",
-		Image:           b.SpawnerImage,
+		Image:           b.spawnerImageFor(ts),
 		ImagePullPolicy: b.SpawnerImagePullPolicy,
 		Args:            args,
 		Env:             p.envVars,

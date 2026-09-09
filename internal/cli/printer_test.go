@@ -1591,3 +1591,114 @@ func TestPrintTaskSpawnerDetailShowsPerSourcePollInterval(t *testing.T) {
 		t.Errorf("expected deprecated top-level poll interval (5m) not to appear in line %q", pollLine)
 	}
 }
+
+func TestPrintTaskSpawnerTableBeads(t *testing.T) {
+	spawners := []kelos.TaskSpawner{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "beads-spawner",
+				Namespace: "default",
+			},
+			Spec: kelos.TaskSpawnerSpec{
+				When: kelos.When{
+					Beads: &kelos.Beads{
+						Remote:    "https://beads.example.com:50051/beads",
+						Database:  "beads",
+						Prefix:    "pain",
+						SecretRef: kelos.SecretReference{Name: "dolt-creds"},
+					},
+				},
+				TaskTemplate: kelos.TaskTemplate{Type: "claude-code"},
+			},
+			Status: kelos.TaskSpawnerStatus{
+				Phase:             kelos.TaskSpawnerPhaseRunning,
+				TotalDiscovered:   4,
+				TotalTasksCreated: 2,
+			},
+		},
+	}
+
+	var buf bytes.Buffer
+	printTaskSpawnerTable(&buf, spawners, false)
+	output := buf.String()
+
+	if !strings.Contains(output, "beads (pain)") {
+		t.Errorf("expected the source column to name the beads prefix, got:\n%s", output)
+	}
+}
+
+func TestPrintTaskSpawnerDetailBeads(t *testing.T) {
+	spawner := &kelos.TaskSpawner{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "beads-spawner",
+			Namespace: "default",
+		},
+		Spec: kelos.TaskSpawnerSpec{
+			When: kelos.When{
+				Beads: &kelos.Beads{
+					Remote:        "https://beads.example.com:50051/beads",
+					Database:      "beads",
+					Prefix:        "pain",
+					Labels:        []string{"triaged"},
+					ExcludeLabels: []string{"dispatched"},
+					SecretRef:     kelos.SecretReference{Name: "dolt-creds"},
+				},
+			},
+			TaskTemplate: kelos.TaskTemplate{Type: "claude-code"},
+		},
+		Status: kelos.TaskSpawnerStatus{Phase: kelos.TaskSpawnerPhaseRunning},
+	}
+
+	var buf bytes.Buffer
+	printTaskSpawnerDetail(&buf, spawner)
+	output := buf.String()
+
+	for _, expected := range []string{
+		"Source:             Beads",
+		"Prefix:             pain",
+		"Database:           beads",
+		"Labels:             [triaged]",
+		"Exclude Labels:     [dispatched]",
+	} {
+		if !strings.Contains(output, expected) {
+			t.Errorf("expected %q in detail output, got:\n%s", expected, output)
+		}
+	}
+}
+
+func TestEffectivePollIntervalBeadsOverride(t *testing.T) {
+	ts := &kelos.TaskSpawner{
+		Spec: kelos.TaskSpawnerSpec{
+			When: kelos.When{
+				Beads: &kelos.Beads{
+					Remote:       "https://beads.example.com:50051/beads",
+					Database:     "beads",
+					Prefix:       "pain",
+					PollInterval: "10m",
+				},
+			},
+		},
+	}
+
+	if got := effectivePollInterval(ts); got != "10m" {
+		t.Errorf("effectivePollInterval() = %q, want 10m", got)
+	}
+}
+
+func TestEffectivePollIntervalBeadsDefault(t *testing.T) {
+	ts := &kelos.TaskSpawner{
+		Spec: kelos.TaskSpawnerSpec{
+			When: kelos.When{
+				Beads: &kelos.Beads{
+					Remote:   "https://beads.example.com:50051/beads",
+					Database: "beads",
+					Prefix:   "pain",
+				},
+			},
+		},
+	}
+
+	if got := effectivePollInterval(ts); got != "5m" {
+		t.Errorf("effectivePollInterval() = %q, want the 5m default", got)
+	}
+}

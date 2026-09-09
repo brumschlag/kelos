@@ -217,6 +217,8 @@ func printTaskSpawnerTable(w io.Writer, spawners []kelos.TaskSpawner, allNamespa
 			source = "GitHub Pull Requests"
 		} else if s.Spec.When.Jira != nil {
 			source = s.Spec.When.Jira.Project
+		} else if s.Spec.When.Beads != nil {
+			source = "beads (" + s.Spec.When.Beads.Prefix + ")"
 		} else if s.Spec.When.Cron != nil {
 			source = "cron: " + s.Spec.When.Cron.Schedule
 		} else if s.Spec.When.GitHubWebhook != nil {
@@ -255,6 +257,8 @@ func effectivePollInterval(ts *kelos.TaskSpawner) string {
 		return ts.Spec.When.GitHubPullRequests.PollInterval
 	case ts.Spec.When.Jira != nil && ts.Spec.When.Jira.PollInterval != "":
 		return ts.Spec.When.Jira.PollInterval
+	case ts.Spec.When.Beads != nil && ts.Spec.When.Beads.PollInterval != "":
+		return ts.Spec.When.Beads.PollInterval
 	}
 	return "5m"
 }
@@ -296,6 +300,17 @@ func printTaskSpawnerDetail(w io.Writer, ts *kelos.TaskSpawner) {
 		printField(w, "Project", jira.Project)
 		if jira.JQL != "" {
 			printField(w, "JQL", jira.JQL)
+		}
+	} else if ts.Spec.When.Beads != nil {
+		beads := ts.Spec.When.Beads
+		printField(w, "Source", "Beads")
+		printField(w, "Prefix", beads.Prefix)
+		printField(w, "Database", beads.Database)
+		if len(beads.Labels) > 0 {
+			printField(w, "Labels", fmt.Sprintf("%v", beads.Labels))
+		}
+		if len(beads.ExcludeLabels) > 0 {
+			printField(w, "Exclude Labels", fmt.Sprintf("%v", beads.ExcludeLabels))
 		}
 	} else if ts.Spec.When.Cron != nil {
 		printField(w, "Source", "Cron")

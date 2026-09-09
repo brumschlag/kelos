@@ -87,6 +87,7 @@ func main() {
 	var cursorImage string
 	var cursorImagePullPolicy string
 	var spawnerImage string
+	var spawnerBeadsImage string
 	var spawnerImagePullPolicy string
 	var spawnerResourceRequests string
 	var spawnerResourceLimits string
@@ -122,6 +123,7 @@ func main() {
 	flag.StringVar(&cursorImagePullPolicy, "cursor-image-pull-policy", "", "The image pull policy for Cursor CLI agent containers (e.g., Always, Never, IfNotPresent).")
 	flag.StringVar(&spawnerImage, "spawner-image", controller.SpawnerImageRepository, "The image repository or tagged image to use for spawner Deployments.")
 	flag.StringVar(&spawnerImagePullPolicy, "spawner-image-pull-policy", "", "The image pull policy for spawner Deployments (e.g., Always, Never, IfNotPresent).")
+	flag.StringVar(&spawnerBeadsImage, "spawner-beads-image", controller.SpawnerBeadsImageRepository, "The image repository or tagged image to use for spawner Deployments with a beads source. This variant carries the beads CLI and git, which the default spawner image does not.")
 	flag.StringVar(&spawnerResourceRequests, "spawner-resource-requests", "", "Resource requests for spawner containers as comma-separated name=value pairs (e.g., cpu=250m,memory=512Mi).")
 	flag.StringVar(&spawnerResourceLimits, "spawner-resource-limits", "", "Resource limits for spawner containers as comma-separated name=value pairs (e.g., cpu=1,memory=1Gi).")
 	flag.StringVar(&ghProxyImage, "ghproxy-image", controller.GHProxyImageRepository, "The image repository or tagged image to use for workspace ghproxy Deployments.")
@@ -159,6 +161,7 @@ func main() {
 		{name: "opencode-image", value: &openCodeImage},
 		{name: "cursor-image", value: &cursorImage},
 		{name: "spawner-image", value: &spawnerImage},
+		{name: "spawner-beads-image", value: &spawnerBeadsImage},
 		{name: "ghproxy-image", value: &ghProxyImage},
 		{name: "worker-runner-image", value: &workerRunnerImage},
 		{name: "session-runtime-image", value: &sessionRuntimeImage},
@@ -302,6 +305,7 @@ func main() {
 
 	deploymentBuilder := controller.NewDeploymentBuilder()
 	deploymentBuilder.SpawnerImage = spawnerImage
+	deploymentBuilder.SpawnerBeadsImage = spawnerBeadsImage
 	deploymentBuilder.SpawnerImagePullPolicy = corev1.PullPolicy(spawnerImagePullPolicy)
 	deploymentBuilder.SpawnerResources = spawnerResources
 	workspaceProxyBuilder := controller.NewWorkspaceGHProxyBuilder()

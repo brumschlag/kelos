@@ -76,6 +76,9 @@ opencodeImage: ghcr.io/kelos-dev/opencode
 cursorImage: ghcr.io/kelos-dev/cursor
 spawner:
   image: ghcr.io/kelos-dev/kelos-spawner
+  # Used only by TaskSpawners with a beads source. It carries the beads CLI and
+  # git, which the default distroless spawner image cannot run.
+  beadsImage: ghcr.io/kelos-dev/kelos-spawner-beads
   resources:
     requests: ""
     limits: ""

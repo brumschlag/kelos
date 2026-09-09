@@ -132,6 +132,8 @@ func resolvedPollInterval(ts *kelos.TaskSpawner) time.Duration {
 		sourceInterval = ts.Spec.When.GitHubPullRequests.PollInterval
 	case ts.Spec.When.Jira != nil:
 		sourceInterval = ts.Spec.When.Jira.PollInterval
+	case ts.Spec.When.Beads != nil:
+		sourceInterval = ts.Spec.When.Beads.PollInterval
 	}
 	if sourceInterval != "" {
 		return parsePollInterval(sourceInterval)

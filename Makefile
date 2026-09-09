@@ -3,7 +3,7 @@ REGISTRY ?= ghcr.io/kelos-dev
 VERSION ?= latest
 # Release image tags may be architecture-specific while KELOS_VERSION remains shared.
 KELOS_VERSION ?= $(VERSION)
-IMAGE_DIRS ?= cmd/kelos-controller cmd/kelos-spawner cmd/kelos-worker-runner cmd/kelos-session-runtime cmd/kelos-console-server cmd/ghproxy cmd/kelos-webhook-server claude-code codex gemini opencode cursor cmd/kelos-slack-server
+IMAGE_DIRS ?= cmd/kelos-controller cmd/kelos-spawner cmd/kelos-worker-runner cmd/kelos-session-runtime cmd/kelos-console-server cmd/ghproxy cmd/kelos-webhook-server claude-code codex gemini opencode cursor cmd/kelos-slack-server kelos-spawner-beads
 LOCAL_ARCH ?= $(shell go env GOARCH)
 
 # Version injection – only set ldflags when an explicit version is given so

@@ -38,6 +38,10 @@ type When struct {
 	// +optional
 	Jira *Jira `json:"jira,omitempty"`
 
+	// Beads discovers ready work from a beads issue tracker.
+	// +optional
+	Beads *Beads `json:"beads,omitempty"`
+
 	// GitHubWebhook triggers task spawning on GitHub webhook events.
 	// +optional
 	GitHubWebhook *GitHubWebhook `json:"githubWebhook,omitempty"`
@@ -376,6 +380,55 @@ type Jira struct {
 	// (Jira Data Center/Server PAT).
 	// +kubebuilder:validation:Required
 	SecretRef SecretReference `json:"secretRef"`
+
+	// PollInterval is how often this source is polled (e.g., "30s", "5m").
+	// When empty, a default of 5m is used.
+	// +optional
+	PollInterval string `json:"pollInterval,omitempty"`
+}
+
+// Beads discovers ready work from a beads issue tracker.
+// Readiness is evaluated by the beads CLI itself — issues that are open with no
+// active blockers, excluding in-progress, blocked, deferred, hooked, and
+// ephemeral ones. Kelos does not re-derive that set, so it follows the
+// tracker's own semantics rather than a copy of them.
+// Authentication is provided via a Secret referenced in the TaskSpawner's
+// namespace. The secret must contain a "BEADS_DOLT_PASSWORD" key, and may
+// contain a "BEADS_DOLT_USER" key (defaults to "sync").
+type Beads struct {
+	// Remote is the Dolt remote URL of the beads hub
+	// (e.g., "https://beads.example.com:50051/beads").
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern="^https?://.+"
+	Remote string `json:"remote"`
+
+	// Database is the Dolt database name served by the remote (e.g., "beads").
+	// +kubebuilder:validation:Required
+	Database string `json:"database"`
+
+	// Prefix is the bead ID prefix that scopes discovery to one project within
+	// a shared hub (e.g., "pain" for bead IDs like "pain-16c090ee").
+	// +kubebuilder:validation:Required
+	Prefix string `json:"prefix"`
+
+	// SecretRef references a Secret containing a "BEADS_DOLT_PASSWORD" key
+	// (required) and an optional "BEADS_DOLT_USER" key.
+	// +kubebuilder:validation:Required
+	SecretRef SecretReference `json:"secretRef"`
+
+	// Labels restricts discovery to issues carrying ALL of these labels.
+	// +optional
+	Labels []string `json:"labels,omitempty"`
+
+	// ExcludeLabels skips issues carrying ANY of these labels.
+	// +optional
+	ExcludeLabels []string `json:"excludeLabels,omitempty"`
+
+	// Limit caps how many ready issues one discovery cycle returns. When
+	// omitted, the beads CLI default applies.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	Limit *int32 `json:"limit,omitempty"`
 
 	// PollInterval is how often this source is polled (e.g., "30s", "5m").
 	// When empty, a default of 5m is used.

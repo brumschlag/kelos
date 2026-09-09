@@ -33,6 +33,12 @@ import (
 	"github.com/kelos-dev/kelos/internal/taskbuilder"
 )
 
+// defaultBeadsWorkDir is where a beads-sourced spawner keeps its clone when
+// BEADS_WORKDIR is unset. In-cluster the controller always sets that variable
+// to the path it mounted, so this default only applies when the spawner is run
+// by hand.
+const defaultBeadsWorkDir = "/beads"
+
 var scheme = runtime.NewScheme()
 
 func init() {
@@ -825,6 +831,34 @@ func buildSourceWithProxy(ctx context.Context, ts *kelos.TaskSpawner, owner, rep
 			JQL:     jiraJQL,
 			User:    user,
 			Token:   token,
+		}, nil
+	}
+
+	if ts.Spec.When.Beads != nil {
+		beads := ts.Spec.When.Beads
+
+		// Unlike the other polled sources, the beads settings are read straight
+		// from the spec: none of them need resolving against a flag the
+		// controller had to compute. BEADS_WORKDIR is the exception — it is a
+		// property of the pod the controller built, not of the spec.
+		workDir := os.Getenv("BEADS_WORKDIR")
+		if workDir == "" {
+			workDir = defaultBeadsWorkDir
+		}
+
+		var limit int32
+		if beads.Limit != nil {
+			limit = *beads.Limit
+		}
+
+		return &source.BeadsSource{
+			Remote:        beads.Remote,
+			Database:      beads.Database,
+			Prefix:        beads.Prefix,
+			Labels:        beads.Labels,
+			ExcludeLabels: beads.ExcludeLabels,
+			Limit:         limit,
+			WorkDir:       workDir,
 		}, nil
 	}
 

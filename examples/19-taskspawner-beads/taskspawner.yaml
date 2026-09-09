@@ -1,0 +1,66 @@
+apiVersion: kelos.dev/v1alpha2
+kind: TaskSpawner
+metadata:
+  name: beads-ready-work
+spec:
+  when:
+    beads:
+      # TODO: Replace with your beads hub's Dolt remote.
+      remote: https://beads.example.com:50051/beads
+      database: beads
+      # Scopes discovery to one project's beads within a shared hub. Bead IDs
+      # look like "pain-16c090ee", so the prefix here is "pain".
+      prefix: pain
+
+      # Must carry BEADS_DOLT_PASSWORD; BEADS_DOLT_USER is optional.
+      secretRef:
+        name: beads-dolt-creds
+
+      # Only beads triage has already looked at, and not ones an agent has
+      # already been dispatched for. Scope this narrowly: a shared hub can hold
+      # hundreds of ready beads, and each one becomes an agent session.
+      labels:
+        - triaged
+      excludeLabels:
+        - dispatched
+
+      # Cap one discovery cycle. Without this the beads CLI returns up to 100.
+      limit: 10
+
+      pollInterval: 10m
+
+  taskTemplate:
+    worker:
+      type: claude-code
+      credentials:
+        type: api-key
+        secretRef:
+          name: anthropic-api-key
+    workspaceRef:
+      name: my-workspace
+
+    # {{.ID}} is the bead ID, which makes the Task name deterministic and stops
+    # the same bead being spawned twice on later cycles.
+    branch: "bead-{{.ID}}"
+    promptTemplate: |
+      You are fixing a tracked issue from the beads tracker.
+
+      Bead:  {{.ID}}
+      Type:  {{.Kind}}
+      Title: {{.Title}}
+
+      Description:
+      {{.Body}}
+
+      Triage notes:
+      {{.Comments}}
+
+      Investigate, make the change, run the tests, and open a PR.
+
+      Nothing updates the tracker for you: when you are done, record the
+      outcome on the bead itself and push it, so the next discovery cycle
+      does not treat this as outstanding work.
+    ttlSecondsAfterFinished: 3600
+
+  # Bound how many agents run at once — readiness says nothing about capacity.
+  maxConcurrency: 3

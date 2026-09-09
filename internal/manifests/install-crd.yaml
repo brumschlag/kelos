@@ -60083,6 +60083,66 @@ spec:
               when:
                 description: When defines the conditions that trigger task spawning.
                 properties:
+                  beads:
+                    description: Beads discovers ready work from a beads issue tracker.
+                    properties:
+                      database:
+                        description: Database is the Dolt database name served by
+                          the remote (e.g., "beads").
+                        type: string
+                      excludeLabels:
+                        description: ExcludeLabels skips issues carrying ANY of these
+                          labels.
+                        items:
+                          type: string
+                        type: array
+                      labels:
+                        description: Labels restricts discovery to issues carrying
+                          ALL of these labels.
+                        items:
+                          type: string
+                        type: array
+                      limit:
+                        description: |-
+                          Limit caps how many ready issues one discovery cycle returns. When
+                          omitted, the beads CLI default applies.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      pollInterval:
+                        description: |-
+                          PollInterval is how often this source is polled (e.g., "30s", "5m").
+                          When empty, a default of 5m is used.
+                        type: string
+                      prefix:
+                        description: |-
+                          Prefix is the bead ID prefix that scopes discovery to one project within
+                          a shared hub (e.g., "pain" for bead IDs like "pain-16c090ee").
+                        type: string
+                      remote:
+                        description: |-
+                          Remote is the Dolt remote URL of the beads hub
+                          (e.g., "https://beads.example.com:50051/beads").
+                        pattern: ^https?://.+
+                        type: string
+                      secretRef:
+                        description: |-
+                          SecretRef references a Secret containing a "BEADS_DOLT_PASSWORD" key
+                          (required) and an optional "BEADS_DOLT_USER" key.
+                        properties:
+                          name:
+                            description: Name is the name of the secret.
+                            minLength: 1
+                            type: string
+                        required:
+                        - name
+                        type: object
+                    required:
+                    - database
+                    - prefix
+                    - remote
+                    - secretRef
+                    type: object
                   cron:
                     description: Cron triggers task spawning on a cron schedule.
                     properties:
