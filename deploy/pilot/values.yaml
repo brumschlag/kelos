@@ -16,7 +16,7 @@ crds:
 
 controllerImage: 565715328522.dkr.ecr.us-east-1.amazonaws.com/kelos-controller
 # Tagged separately from image.tag so --version stays on the upstream release.
-controllerImageTag: v0.49.0-preconv
+controllerImageTag: v0.49.0-hooks2
 image:
   # Stays on the upstream release tag. It feeds --version, which supplies the tag
   # for every image not overridden below, so a fork tag here would point the
@@ -30,3 +30,15 @@ claudeCodeImage: 565715328522.dkr.ecr.us-east-1.amazonaws.com/claude-code:v0.49.
 workerRunner:
   # Carries preCommands + postCommands.
   image: 565715328522.dkr.ecr.us-east-1.amazonaws.com/kelos-worker-runner:v0.49.0-prepost
+
+sessionRuntime:
+  # Pinned rather than left on the chart default, which is an unqualified
+  # repository resolving to :latest. Every other image here is pinned, and the
+  # session runtime is the one component that would otherwise drift out from
+  # under the v0.49.0 controller on any node that re-pulls.
+  #
+  # Upstream only, deliberately: the fork changes nothing in the session runtime,
+  # and this image is not mirrored to ECR. That makes it the one image the pilot
+  # pulls from ghcr.io at Session start, which is unproven on this cluster —
+  # verify the first Session pod pulls before relying on it.
+  image: ghcr.io/kelos-dev/kelos-session-runtime:v0.49.0

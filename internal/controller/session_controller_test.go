@@ -1181,6 +1181,45 @@ func TestSessionOpenCodePodUsesPersistentDirectories(t *testing.T) {
 	}
 }
 
+// A Session's worker.image reaches the agent container through the synthetic Task
+// that buildSessionStatefulSet hands to the JobBuilder, so it is honored without
+// the Session controller referencing the field itself. Only the tini decision
+// reads worker.Image directly, which made this contract easy to misread as
+// unsupported. The session-runtime init container is a separate, controller-level
+// image and must stay on SessionRuntimeImage.
+func TestSessionHonorsCustomAgentImage(t *testing.T) {
+	t.Parallel()
+	session := testSession("custom-agent-image", "claude-code")
+	session.Spec.Worker.Image = "custom.registry/claude-code:fork"
+	reconciler := testSessionReconciler(nil, nil)
+	statefulSet, _, err := reconciler.buildSessionStatefulSet(session, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent := statefulSet.Spec.Template.Spec.Containers[0]
+	if agent.Image != "custom.registry/claude-code:fork" {
+		t.Fatalf("Session agent image = %q, want custom.registry/claude-code:fork", agent.Image)
+	}
+	// A custom image is launched directly: it is not required to ship Tini or a
+	// shell, so wrapping it would break shell-less images.
+	if len(agent.Command) == 0 || agent.Command[0] == tiniPath {
+		t.Fatalf("Session agent command = %v, want the runtime binary launched directly", agent.Command)
+	}
+	var runtimeInit *corev1.Container
+	for i := range statefulSet.Spec.Template.Spec.InitContainers {
+		if statefulSet.Spec.Template.Spec.InitContainers[i].Name == sessionRuntimeContainerName {
+			runtimeInit = &statefulSet.Spec.Template.Spec.InitContainers[i]
+			break
+		}
+	}
+	if runtimeInit == nil {
+		t.Fatal("Session has no session-runtime init container")
+	}
+	if runtimeInit.Image != "runtime:test" {
+		t.Fatalf("session-runtime image = %q, want runtime:test (unaffected by worker.image)", runtimeInit.Image)
+	}
+}
+
 func TestSessionRuntimeUsesConfiguredServiceAccount(t *testing.T) {
 	t.Parallel()
 	session := testSession("custom-service-account", "codex")

@@ -1,0 +1,82 @@
+# Interactive Session in the kelos-pilot namespace.
+#
+# Adapted from upstream examples/16-session. Three things differ from upstream,
+# all forced by how this cluster is wired:
+#
+#   1. No ANTHROPIC_API_KEY secret. Agent pods hold no provider credential; they
+#      reach Bedrock through the LiteLLM gateway, so credentials.type is `none`
+#      and the gateway token arrives via podOverrides — the same shape as the
+#      envoverrides-pool WorkerPool in workloads.yaml. Upstream's
+#      credentials-secret.yaml is dropped entirely.
+#   2. `model` is REQUIRED here. The gateway serves its own model names
+#      (claude-haiku, claude-sonnet, claude-opus, minimax) and refuses anything
+#      unmapped rather than substituting. Claude Code's built-in default model id
+#      is NOT one of them, so omitting `model` fails at first turn.
+#   3. storageClassName is pinned. The cluster has no ReadWriteMany class;
+#      auto-ebs-gp3 / ReadWriteOnce is the only option, which is fine because a
+#      Session is a single-replica StatefulSet.
+#
+# Prerequisite (not created here, since it holds a credential):
+#   secret/honcho-gateway-key, key gateway-api-key — the LiteLLM gateway token.
+#
+# Apply, then watch it come up:
+#   kubectl apply -f deploy/pilot/session.yaml
+#   kelos get session interactive-review -n kelos-pilot
+#   kelos session connect interactive-review -n kelos-pilot
+apiVersion: kelos.dev/v1alpha2
+kind: Session
+metadata:
+  name: interactive-review
+  namespace: kelos-pilot
+spec:
+  initialBranch: interactive-review
+  initialPrompt: |
+    Inspect this repository and ask what I would like to work on.
+  worker:
+    type: claude-code
+    # The gateway holds the AWS credentials; the pod needs none.
+    credentials:
+      type: none
+    # Must be a name the gateway serves. An unmapped model is refused, not
+    # substituted, so this fails loudly rather than running on something else.
+    model: claude-sonnet
+    # The fork's claude-code image, same one the Tasks use. Sessions honor
+    # worker.image because buildSessionStatefulSet routes a synthetic Task
+    # through the JobBuilder; only the session-runtime init container is fixed
+    # by the controller's --session-runtime-image.
+    #
+    # Note the side effect: a non-bundled image is launched WITHOUT Tini, since
+    # isBundledAgentImage only matches the ghcr.io/kelos-dev repositories. This
+    # ECR image is a rebuild of the bundled one and does ship /usr/bin/tini, but
+    # Kelos will not use it, so orphaned processes are not reaped in-container.
+    # Drop this field to run the upstream bundled image under Tini instead.
+    image: 565715328522.dkr.ecr.us-east-1.amazonaws.com/claude-code:v0.49.0-tools
+    # Smoke-test target: public, read-only Hello-World. To drive real work,
+    # switch to `inpulse-write` (repo accuhealthevelyn/inpulse, ref develop,
+    # secretRef github-token-agent-write) — that token can push the Session
+    # branch and open a PR.
+    workspaceRef:
+      name: envoverrides-scratch
+    podOverrides:
+      # NOTE: deliberately NO activeDeadlineSeconds here. The envoverrides-pool
+      # sets 900s, which is correct for a batch phase but would kill an
+      # interactive Session mid-conversation after 15 minutes.
+      env:
+        - name: ANTHROPIC_BASE_URL
+          value: http://bedrock-gateway.honcho.svc.cluster.local
+        - name: ANTHROPIC_AUTH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: honcho-gateway-key
+              key: gateway-api-key
+        - name: MAX_THINKING_TOKENS
+          value: "0"
+  # Persistent workspace keeps conversation history across Pod replacement, which
+  # is also what stops initialPrompt being replayed. An emptyDir workspace would
+  # resubmit it after every Pod swap.
+  volumeClaimTemplate:
+    accessModes: [ReadWriteOnce]
+    storageClassName: auto-ebs-gp3
+    resources:
+      requests:
+        storage: 10Gi
