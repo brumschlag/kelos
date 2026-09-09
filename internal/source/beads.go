@@ -169,6 +169,24 @@ func (s *BeadsSource) sync(ctx context.Context) error {
 		return fmt.Errorf("creating beads workDir %s: %w", s.WorkDir, err)
 	}
 
+	// First-time setup is treated as one unit. A failed clone still leaves a
+	// partial .beads behind, which the next cycle would mistake for a finished
+	// clone and try to pull from — failing with "no remote" forever, so an
+	// unreachable hub at startup would wedge the source permanently instead of
+	// retrying. Discarding the partial state keeps the retry honest.
+	if err := s.setUp(ctx); err != nil {
+		if rmErr := os.RemoveAll(filepath.Join(s.WorkDir, ".beads")); rmErr != nil {
+			return fmt.Errorf("%w (discarding the partial clone also failed: %v)", err, rmErr)
+		}
+		return err
+	}
+
+	return nil
+}
+
+// setUp clones the remote and turns off the CLI's usage metrics. Its caller
+// discards the working directory if any step fails.
+func (s *BeadsSource) setUp(ctx context.Context) error {
 	if _, err := s.run(ctx, "init", "--non-interactive",
 		"--database", s.Database, "--prefix", s.Prefix, "--remote", s.Remote); err != nil {
 		return fmt.Errorf("initializing beads clone from %s: %w", s.Remote, err)

@@ -923,7 +923,17 @@ Two consequences worth planning for:
   many agents run at once.
 
 The spawner clones the remote once into an `emptyDir` and refreshes it each
-cycle, so a restarted spawner re-clones.
+cycle, so a restarted spawner re-clones. If a cycle cannot reach the hub, the
+partial clone is discarded so the next cycle retries the clone rather than
+pulling from an incomplete one.
+
+`remote` is dialled from inside the cluster, so it must name a host that pods can
+reach and whose TLS certificate matches that name. A hub published through an
+external load balancer often fails both tests at once: the name resolves to an
+address pods cannot route to, while the certificate covers only that external
+name, so pointing `remote` at the in-cluster Service name fails verification
+instead. Resolve the external name to the in-cluster address in cluster DNS
+rather than working around it per workload.
 
 A beads source needs the beads CLI and `git`, which the default distroless
 spawner image does not carry. The controller therefore runs beads-sourced

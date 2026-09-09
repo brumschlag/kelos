@@ -259,3 +259,71 @@ func TestBeadsDiscoverEmptyResult(t *testing.T) {
 		t.Errorf("expected no items, got %d", len(items))
 	}
 }
+
+// TestBeadsDiscoverRetriesAfterFailedClone covers the wedge found running this
+// source in a cluster: the CLI creates .beads before it fails to reach the
+// remote, so a naive "does .beads exist?" check sends every later cycle down
+// the pull path, which fails with "no remote" forever.
+func TestBeadsDiscoverRetriesAfterFailedClone(t *testing.T) {
+	t.Setenv(beadsPasswordEnv, "secret")
+	dir := t.TempDir()
+
+	var calls [][]string
+	failInit := true
+	s := &BeadsSource{
+		Remote:   "https://beads.example.com:50051/beads",
+		Database: "beads",
+		Prefix:   "pain",
+		WorkDir:  dir,
+		Run: func(_ context.Context, workDir string, args ...string) ([]byte, error) {
+			calls = append(calls, args)
+			if args[0] == "init" {
+				// The real CLI leaves this behind even when the clone fails.
+				if err := os.MkdirAll(filepath.Join(workDir, ".beads"), 0o700); err != nil {
+					t.Fatalf("seeding partial clone: %v", err)
+				}
+				if failInit {
+					return nil, errors.New("could not access dolt url: i/o timeout")
+				}
+				return nil, nil
+			}
+			if args[0] == "ready" {
+				return []byte(readyJSON), nil
+			}
+			return nil, nil
+		},
+	}
+
+	if _, err := s.Discover(context.Background()); err == nil {
+		t.Fatal("expected the failed clone to surface as an error")
+	}
+
+	// The partial clone must not survive, or the next cycle pulls from a
+	// repository that has no remote configured.
+	if _, err := os.Stat(filepath.Join(dir, ".beads")); !os.IsNotExist(err) {
+		t.Fatalf("expected the partial clone to be discarded, stat err = %v", err)
+	}
+
+	// Second cycle: the remote is reachable now, so it must retry init.
+	failInit = false
+	calls = nil
+	if _, err := s.Discover(context.Background()); err != nil {
+		t.Fatalf("expected recovery on the next cycle, got %v", err)
+	}
+
+	var sawInit, sawPull bool
+	for _, c := range calls {
+		switch {
+		case c[0] == "init":
+			sawInit = true
+		case c[0] == "dolt" && len(c) > 1 && c[1] == "pull":
+			sawPull = true
+		}
+	}
+	if !sawInit {
+		t.Errorf("expected a retried init, got calls %v", calls)
+	}
+	if sawPull {
+		t.Errorf("expected no pull against a never-completed clone, got calls %v", calls)
+	}
+}
