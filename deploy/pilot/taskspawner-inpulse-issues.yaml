@@ -226,6 +226,25 @@ spec:
                  unsafe and what you read instead as evidence.
            Silence is not an exemption. "It is a small change", "the existing tests
            cover it" and "the fix is obvious" are not exemptions.
+      5c. CHECKPOINT - PUSH BEFORE THE LONG VERIFY. The workspace is an emptyDir:
+         if this pod dies, or the 90-minute activeDeadlineSeconds expires, anything
+         you have not pushed is GONE. A retry gets a fresh clone and nothing to
+         resume from, so it redoes all of this from zero. Step 6 is normally the
+         longest step, so save the work before spending that time:
+           git add <the files you changed>
+           git commit -m "wip(#{{.Number}}): checkpoint before verification"
+           git push -u origin kelos/issue-{{.Number}}
+         This gates nothing and costs nothing. There are no git hooks in this
+         clone, and CI runs only on `pull_request`, so a branch with no PR open
+         triggers no checks and notifies nobody.
+         It is a BACKUP, not the deliverable. You still owe step 6's verification
+         and step 7's commit, and a checkpoint is never evidence that anything
+         works - do not report it as though it were. Step 7 may amend this commit
+         or add to it, whichever leaves the history readable.
+         If the push is REJECTED, report the exact error and STOP. A rejection
+         here is a credential or branch-protection problem that step 7 would hit
+         anyway, and finding it now costs nothing instead of a whole verification
+         cycle.
       6. VERIFY IT. Build the affected project, and run the narrowest relevant test
          filter - which MUST include the new test from step 5b.
          Give each Bash call an explicit long timeout and do NOT background
