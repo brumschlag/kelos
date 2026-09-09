@@ -67,6 +67,13 @@ spec:
     # branch and open a PR.
     workspaceRef:
       name: envoverrides-scratch
+    # Gives the Session the graphiti-internal MCP server, the same knowledge
+    # graph the inpulse-issues Tasks use. Sessions do get MCP servers despite
+    # replacing /kelos_entrypoint.sh with the session runtime: the runtime
+    # re-runs that entrypoint with KELOS_SESSION_SETUP_ONLY=1, which is what
+    # writes KELOS_MCP_SERVERS into the user-scoped Claude config.
+    agentConfigRefs:
+      - name: inpulse-knowledge
     podOverrides:
       # NOTE: deliberately NO activeDeadlineSeconds here. The envoverrides-pool
       # sets 900s, which is correct for a batch phase but would kill an
