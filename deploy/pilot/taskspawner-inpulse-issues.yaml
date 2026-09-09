@@ -1,0 +1,340 @@
+# The inpulse-issues TaskSpawner, as deployed in kelos-pilot.
+#
+# Captured from the live cluster: this spawner was created by hand and existed
+# only in the API server, so a 9k-character promptTemplate and the whole agent
+# pod shape had no reviewable record. Everything below except the architecture
+# pin is exactly what was already running.
+#
+# Autonomous GitHub issue work: label an issue `kelos-auto`, then a user with
+# write permission comments `/kelos go`.
+#
+# On scheduling -- the agent pods run on a dedicated, tainted nodepool
+# (`workload: agents` selector plus the matching NoSchedule toleration). Those
+# nodes are all amd64, which is why the amd64-only fork images have worked here,
+# but nothing said so: the constraint was accidental. `kubernetes.io/arch: amd64`
+# now states it, so provisioning an arm64 node into the agents pool cannot
+# silently break every spawned Task. The dotnet init container below already
+# assumed it too, copying from /usr/lib/x86_64-linux-gnu.
+#
+# taskTemplate.image is deliberately unset: Tasks inherit the controller's
+# --claude-code-image, so the fork image is bumped in one place (values.yaml).
+apiVersion: kelos.dev/v1alpha2
+kind: TaskSpawner
+metadata:
+  annotations:
+    kick: '1788312395'
+    purpose: 'Autonomous work on GitHub issues: label an issue `kelos-auto`, then a write-permission user
+      comments `/kelos go`. The agent investigates, fixes, verifies, pushes a branch and opens a PR against
+      develop.'
+    reporting-note: 'reporting.enabled was flipped false -> true on 2026-09-08. The previous rationale
+      ("stays false because creating check runs is a GitHub-App-only capability, verified 403") conflated
+      two independent fields: reporting.checks creates Check Runs and does require a GitHub App, but reporting.enabled
+      only posts issue comments, which this PAT can do. checksReportingEnabled() inspects ONLY when.githubPullRequests,
+      so an issues-only spawner can never attempt a check run and the 403 cannot apply to it. Verified
+      live: the reporter posted an ''accepted'' status comment on issue #3166 at 2026-09-08T18:46:03Z
+      using this same credential. GOTCHA: the per-Task annotation kelos.dev/github-reporting=enabled is
+      stamped at Task CREATION time, so flipping this flag only affects Tasks created afterwards. To cover
+      an in-flight Task, add that annotation to it by hand.'
+    safety: 'Controls, in order of strength. (1) ENFORCED: the ruleset protect-main-branch blocks direct
+      pushes to main/develop, so work must arrive as a PR, and ci-required must be green to merge. (2)
+      ENFORCED: opt-in label + a /kelos go comment from a minimumPermission=write user. (3) ENFORCED:
+      maxConcurrency and maxTotalTasks caps. (4) PROMPT-ONLY, NOT enforced: "do not touch .github/". The
+      credential is a fine-grained PAT scoped to this repo but it WAS granted Workflows:write (owner decision
+      2026-09-02), so GitHub will NOT reject a workflow-file push - a reviewer must catch it. Also note
+      the PAT acts as a repo admin, who is in the ruleset''s bypass_actors, so (1) may not bind either.
+      Net: human PR review is the backstop.'
+    shallow-clone-note: 'The concurrent-fix guard''s `git log --oneline origin/develop -5 -- <file>` was
+      INERT: the controller clones with --depth 1 (verified on pod issue-3954-5kvrh: git-clone args --branch
+      develop --depth 1 -> /workspace/repo), so there is no history to list and the empty output reads
+      identically to ''develop has no competing change'' - false reassurance on exactly the check that
+      exists to prevent a superseded PR. Fixed 2026-09-09 by prefixing `git fetch --deepen=50 origin develop`
+      and telling the agent the sibling `git show origin/develop:<file>` check is the load-bearing one
+      (it needs no history). If clone depth ever becomes settable on the Workspace/TaskSpawner CR, prefer
+      that over the in-prompt deepen.'
+    testing-note: 'step 0 (read .claude/rules + constitution) and step 5b (RED-first regression test)
+      were added 2026-09-09. Rationale: (1) NOTHING loaded this repo''s rules for the agent - the depth-1
+      clone puts all ~40 .claude/rules/*.md on disk at /workspace/repo and CLAUDE.md auto-loads, but CLAUDE.md
+      has ZERO @-imports and only hyperlinks 5 of the 40, and a markdown link is not a read. Consequence:
+      this prompt had been hand-patched with content that DUPLICATES rules already in the repo (step 6b
+      re-derives approval-gate-not-broken-gate; the concurrent-fix guard re-derives pr-supersession-triage
+      and ci-merge-semantic-conflict; the commit-skill ban re-derives git-commits), i.e. every incident
+      was being re-encoded by hand into this CR field because the pod could not see the rule. (2) The
+      prompt told the agent to RUN tests (step 6) but never to ADD one, while docs/standards/constitution.md
+      mandates TDD - and CI cannot catch the gap because scripts/check-coverage-threshold.sh is an ABSOLUTE
+      repo-wide gate (unit 75 error/80 warn, integration 65/70), not per-diff, so a small fix with no
+      test cannot move that number and merges green. 5b is scoped: RED-then-GREEN evidence in the PR body,
+      behavioural assertions only, and four explicit exemptions (docs/config, baseline-only, dead-code-deletion,
+      and RED-is-unsafe as with a re-bless flag that would overwrite the baseline it defends). The minimality
+      HARD CONSTRAINT was amended in the same edit to carve out the test - left unamended the two instructions
+      conflict and the agent correctly picks minimality, which would make 5b inert. activeDeadlineSeconds
+      3600 -> 5400 because 5b adds a build/test round trip and 1h was already tight for clone + dotnet
+      inject + build + test on this repo; watch for DeadlineExceeded and raise again rather than dropping
+      5b.'
+  name: inpulse-issues
+  namespace: kelos-pilot
+spec:
+  maxConcurrency: 2
+  maxTotalTasks: 50
+  suspend: false
+  taskTemplate:
+    agentConfigRefs:
+    - name: inpulse-knowledge
+    credentials:
+      type: none
+    model: claude-sonnet-46
+    nameTemplate: issue-{{.Number}}
+    podOverrides:
+      activeDeadlineSeconds: 5400
+      env:
+      - name: ANTHROPIC_BASE_URL
+        value: http://bedrock-gateway.honcho.svc.cluster.local
+      - name: ANTHROPIC_AUTH_TOKEN
+        valueFrom:
+          secretKeyRef:
+            key: gateway-api-key
+            name: honcho-gateway-key
+      - name: DOTNET_ROOT
+        value: /shared/dotnet
+      - name: DOTNET_CLI_TELEMETRY_OPTOUT
+        value: '1'
+      - name: LD_LIBRARY_PATH
+        value: /shared/icu
+      - name: PATH
+        value: /shared/dotnet:/home/claude/.local/bin:/home/claude/go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      - name: CODEARTIFACT_AUTH_TOKEN
+        valueFrom:
+          secretKeyRef:
+            key: CODEARTIFACT_AUTH_TOKEN
+            name: codeartifact-token
+            optional: true
+      - name: GITHUB_TOKEN
+        valueFrom:
+          secretKeyRef:
+            key: GITHUB_TOKEN
+            name: github-token-agent-write
+      extraInitContainers:
+      - args:
+        - |
+          set -euo pipefail
+          cp -a /usr/share/dotnet /shared/dotnet
+          mkdir -p /shared/icu
+          cp -a /usr/lib/x86_64-linux-gnu/libicu*.so* /shared/icu/
+          chmod -R a+rX /shared/dotnet /shared/icu
+          echo "injected dotnet $(/shared/dotnet/dotnet --version), $(ls /shared/icu | wc -l) icu files"
+        command:
+        - bash
+        - -c
+        image: mcr.microsoft.com/dotnet/sdk:10.0
+        imagePullPolicy: IfNotPresent
+        name: inject-dotnet
+        resources:
+          limits:
+            cpu: '2'
+            memory: 2Gi
+          requests:
+            cpu: 200m
+            memory: 256Mi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /shared
+          name: shared
+      nodeSelector:
+        kubernetes.io/arch: amd64
+        workload: agents
+      resources:
+        limits:
+          cpu: '2'
+          memory: 10Gi
+        requests:
+          cpu: 500m
+          memory: 3Gi
+      tolerations:
+      - effect: NoSchedule
+        key: workload
+        operator: Equal
+        value: agents
+      volumeMounts:
+      - mountPath: /shared
+        name: shared
+      volumes:
+      - emptyDir: {}
+        name: shared
+    promptTemplate: |2+
+          UNATTENDED EXECUTION - READ FIRST:
+          - You are running in a Kubernetes pod. There is NO user watching and NO ONE can
+            answer a question. If you stop to ask for approval, your turn ends, the pod
+            exits, and every change you made is DISCARDED (the workspace is ephemeral).
+          - Therefore: do NOT invoke the commit skill, Skill("commit"), or any /commit
+            slash command, and do NOT present a commit plan for approval. This repo's
+            rules mandate that skill for interactive work; it is wrong here and it has
+            already silently destroyed one run's work. Run git add / git commit / git push
+            DIRECTLY.
+          - Never write that you verified something you did not actually run. If a step did
+            not happen, or did not produce the result you expected, SAY THAT. A report
+            claiming a verification that is absent from your command output is a failure,
+            and it is checked against the raw logs.
+
+      You are fixing GitHub issue #{{.Number}} in accuhealthevelyn/inpulse and
+      opening a pull request.
+
+      Title: {{.Title}}
+      Labels: {{.Labels}}
+      URL: {{.URL}}
+
+      --- issue body ---
+      {{.Body}}
+      --- comments ---
+      {{.Comments}}
+      --- end ---
+
+      HARD CONSTRAINTS. Violating any is a failure:
+      - NEVER create, modify or delete anything under .github/ . Your credential is
+        NOT blocked from doing so, so this rule is the only thing preventing it. If
+        the issue genuinely requires a workflow change, do NOT make it: say so in
+        your PR body and leave it for a human.
+      - NEVER push to develop or main, and never force-push. Work only on the branch
+        named below.
+      - Change the MINIMUM necessary. Do not reformat, do not "improve" unrelated
+        code, do not bump dependencies, do not fix unrelated warnings. ONE EXCEPTION:
+        the regression test required by step 5b is not "unrelated" and is not scope
+        creep - it is part of the minimum. Do not skip it to keep the diff small.
+      - Do NOT merge, and do NOT enable auto-merge. A human decides that.
+      - NEVER hand-edit a GENERATED baseline file. Schema baselines under
+        docs/architecture/schemas/, the *.verified.txt API-surface baselines and
+        Contracts/event-schema.baseline.json are all machine-generated. Editing one by
+        hand looks like it works and then fails CI on the sibling file you did not
+        think of. Regenerate them (step 6b) instead.
+
+      STEPS:
+      0. LOAD THIS REPO'S RULES FIRST. `.claude/rules/` holds ~40 short DO/DON'T
+         notes on failure modes that have ALREADY bitten this repo, and nothing
+         loads them for you: CLAUDE.md has no @-imports and only hyperlinks five of
+         them, and a markdown link is not a read. So read them yourself:
+           - Read .claude/rules/README.md (the categorised index).
+           - Then Read every rule whose title plausibly touches your change.
+           - If you will touch a test, a gate, a ratchet or a baseline, you must read
+             at least approval-gate-not-broken-gate.md, quality-gate-ratchet.md and
+             test-existence-is-not-coverage.md.
+           - Also read docs/standards/constitution.md sections relevant to your
+             change - it is NORMATIVE where the rules are advisory.
+         Report which rules you read and which ones changed what you did. If a rule
+         contradicts this prompt, this prompt wins - but say so explicitly.
+      1. Query the graphiti-internal MCP server (search_memory_facts /
+         search_nodes, group_ids ["inpulse"]) for gotchas relevant to this change.
+         Report what you found, or state plainly that nothing relevant came back.
+      2. Read the code. Confirm the reported problem is REAL and quote the exact
+         file and lines. If it is not real, open no PR - post a comment explaining
+         why and stop.
+      3. Set git identity if unset:
+           git config user.email "kelos-agent@ai.tellihealth.com"
+           git config user.name  "kelos agent"
+      4. git checkout -b kelos/issue-{{.Number}}
+      5. Make the minimal fix.
+      5b. ADD A REGRESSION TEST, AND SEE IT FAIL FIRST. This repo's normative
+         methodology is TDD (docs/standards/constitution.md, "Development
+         Methodology"). CI will NOT enforce this for you and cannot:
+         scripts/check-coverage-threshold.sh measures a REPO-WIDE percentage (unit
+         75 error / 80 warn, integration 65 / 70), so a small fix carrying no test
+         moves that number by essentially nothing and the gate passes green. Your
+         test is the only evidence the defect is actually closed and stays closed.
+         - Run the new test against the UNFIXED behaviour so you observe it RED, then
+           against the fix so you observe it GREEN. Paste BOTH outputs in the PR body.
+           A test that has only ever been seen green does not prove it detects
+           anything - it may assert something that was always true.
+         - Assert on BEHAVIOUR: call the thing and check its result or side effect.
+           `Assert.NotNull(x)` on its own, a typeof/exists check, a bare import, or a
+           --help string grep are NOT coverage. See
+           .claude/rules/test-existence-is-not-coverage.md.
+         - Put it beside the existing tests for that code and match their conventions,
+           traits and naming. Do not invent a new test project or a new fixture.
+         - LEGITIMATE EXEMPTIONS. Take one only if it genuinely applies, then state
+           which and why, verbatim, in the PR body under a "No test added:" heading:
+             (a) the change is pure docs, comments or config with no behaviour;
+             (b) the change is a regenerated baseline (step 6b) and nothing else;
+             (c) the change only deletes dead or unreachable code;
+             (d) observing RED is itself UNSAFE - e.g. running a gate with its update
+                 flag set would OVERWRITE the committed baseline it defends, or the
+                 issue's own Verification section forbids exercising the pre-fix
+                 behaviour. Then test the POST-fix behaviour, and say why RED was
+                 unsafe and what you read instead as evidence.
+           Silence is not an exemption. "It is a small change", "the existing tests
+           cover it" and "the fix is obvious" are not exemptions.
+      6. VERIFY IT. Build the affected project, and run the narrowest relevant test
+         filter - which MUST include the new test from step 5b.
+         Give each Bash call an explicit long timeout and do NOT background
+         it - a backgrounded command is killed when your turn ends and you lose the
+         result. Scope builds to ONE project; a solution-wide build will time out.
+      6b. IF YOU CHANGED A CONTRACT, REGENERATE THE BASELINES. A contract change is
+         any edit to a domain event, command, query, read model or DTO - including
+         just adding a property. Two committed baselines go stale and CI will fail:
+           scripts/regen-schema-baseline.sh        # ALL schemas under docs/architecture/schemas
+           scripts/rebless-contract-baselines.sh   # the *.verified.txt / event-schema baselines
+         Run the SCRIPTS - they regenerate every affected file. Do not update the one
+         baseline you noticed; there is almost always a sibling. Two consecutive agent
+         PRs failed exactly here: #3145 changed two events and left
+         docs/architecture/schemas/events/*.json stale, and #3156 updated the COMMAND
+         schema for a new property but missed the READ MODEL schema for the same
+         property, then also left DomainCommands_PublicApi_MatchesBaseline red.
+         Then read the resulting diff before committing it: the gate exists to catch an
+         UNINTENDED surface change, so a baseline you regenerate without reading can
+         bless a leak. Confirm clean with:
+           scripts/regen-schema-baseline.sh --check   # expect: no drift
+
+      7. Commit referencing the issue, then:
+           git push -u origin kelos/issue-{{.Number}}
+      8. Open the PR: gh pr create --base develop . Body must state the cause, the
+         fix, the verbatim build/test output proving it works - including the RED
+         and GREEN runs of the step-5b test, or a "No test added:" exemption - and
+         "Closes #{{.Number}}". Be explicit about what you verified versus what you are
+         inferring.
+      9. Post a short comment on the issue linking the PR. Then report the PR URL
+         and `git diff --stat develop...HEAD` so a reviewer can see it is minimal.
+
+      If any step fails, report the exact error and STOP. Do not route around a
+      rejection by trying a different branch, a different push target, or --force.
+
+          CONCURRENT-FIX GUARD - do this as the LAST step BEFORE you push:
+          - Re-read the issue (gh issue view). If it has been CLOSED since you started, or
+            a linked PR now exists, STOP: post a comment saying so and open NO PR.
+          - Re-check whether the target branch already contains an equivalent fix:
+              git fetch --deepen=50 origin develop || git fetch origin develop
+              git log --oneline origin/develop -5 -- <each file you changed>
+              git show origin/develop:<each file you changed> | grep -n <the thing you changed>
+            Your clone is SHALLOW (the controller clones with --depth 1), so WITHOUT the
+            --deepen that git log prints NOTHING, and an empty result looks identical to
+            "no competing change" - do not read it that way. The git show check needs no
+            history and is the load-bearing one; trust it over the log.
+            If develop already fixes it, STOP. Post a comment naming the commit/PR that
+            fixed it and open NO PR. Do NOT try to resolve a conflict in your favour: the
+            branch that landed first may carry detail yours does not, and overwriting it
+            loses that.
+          - This is not hypothetical. On issue #3079 an agent worked for ~18 minutes while
+            PR #3089 fixed the same defect and merged; the resulting PR #3090 conflicted and
+            had to be closed as superseded, because develop's version was a superset.
+
+    ttlSecondsAfterFinished: 172800
+    type: claude-code
+    workspaceRef:
+      name: inpulse-write
+  when:
+    githubIssues:
+      commentPolicy:
+        minimumPermission: write
+        triggerComment: /kelos go
+      excludeLabels:
+      - blocked
+      - do-not-merge
+      - wontfix
+      labels:
+      - kelos-auto
+      pollInterval: 2m
+      priorityLabels:
+      - P0
+      - P1
+      repo: accuhealthevelyn/inpulse
+      reporting:
+        enabled: true
+      state: open
+      types:
+      - issues

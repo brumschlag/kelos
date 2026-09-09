@@ -39,7 +39,26 @@ kelos install --namespace kelos-system --values deploy/pilot/values.yaml
 
 # 3. Pilot workloads
 kubectl apply -f deploy/pilot/workloads.yaml
+
+# 4. The autonomous GitHub-issue spawner. Kept in its own file because its
+#    promptTemplate is ~9k characters. `kelos install` must run first: the
+#    spawner's Tasks inherit the controller's --claude-code-image.
+kubectl apply -f deploy/pilot/taskspawner-inpulse-issues.yaml
+
+# 5. Optional: an interactive Session. Requires the v0.55.0 CRDs from step 1,
+#    since spec.idlePolicy did not exist in v0.49.0.
+kubectl apply -f deploy/pilot/session.yaml
 ```
+
+Note that `kelos install` needs a `kelos` binary built from this fork, not the
+one on `PATH`: the chart is compiled into the CLI, so an older binary silently
+installs its own older chart and drops values it does not recognise. Build it
+with `make build WHAT=cmd/kelos` and run `./bin/kelos`.
+
+Applying CRDs needs cluster-admin. The kubeconfig's exec block pins
+`AWS_PROFILE=tellihealth-dev-bedrock`, and that role (group `kelos-operators`)
+cannot create or patch CRDs, so step 1 requires the break-glass profile. Steps
+3-5 work as the normal role.
 
 ## Images
 
