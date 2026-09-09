@@ -43,20 +43,24 @@ spec:
     # The gateway holds the AWS credentials; the pod needs none.
     credentials:
       type: none
-    # Must be a name the gateway serves. An unmapped model is refused, not
-    # substituted, so this fails loudly rather than running on something else.
-    model: claude-sonnet
-    # The fork's claude-code image, same one the Tasks use. Sessions honor
-    # worker.image because buildSessionStatefulSet routes a synthetic Task
-    # through the JobBuilder; only the session-runtime init container is fixed
-    # by the controller's --session-runtime-image.
+    # Use the name the agent understands, not the gateway's own model name.
+    # `claude-sonnet` is what the LiteLLM gateway serves, but Claude Code
+    # validates the name itself and rejects it with
+    # `[claude-code:unrecognized_model]`; it normalizes `claude-sonnet-46` to
+    # claude-sonnet-4-6 and the gateway routes that. This is the value the
+    # inpulse-issues spawner and every Task that has run here use.
+    model: claude-sonnet-46
+    # No worker.image. The controller's --claude-code-image already resolves to
+    # the fork image from values.yaml, so pinning it here duplicates a value that
+    # then has to be bumped in two places -- and did drift: this file kept
+    # v0.49.0-tools through the v0.55.0 retag and the first Session came up on the
+    # old image.
     #
-    # Note the side effect: a non-bundled image is launched WITHOUT Tini, since
-    # isBundledAgentImage only matches the ghcr.io/kelos-dev repositories. This
-    # ECR image is a rebuild of the bundled one and does ship /usr/bin/tini, but
-    # Kelos will not use it, so orphaned processes are not reaped in-container.
-    # Drop this field to run the upstream bundled image under Tini instead.
-    image: 565715328522.dkr.ecr.us-east-1.amazonaws.com/claude-code:v0.49.0-tools
+    # Sessions do honor worker.image (buildSessionStatefulSet routes a synthetic
+    # Task through the JobBuilder), so set it only to run something other than the
+    # cluster default. Note that setting it also disables Tini, because
+    # isBundledAgentImage matches only the ghcr.io/kelos-dev repositories.
+    #
     # Smoke-test target: public, read-only Hello-World. To drive real work,
     # switch to `inpulse-write` (repo accuhealthevelyn/inpulse, ref develop,
     # secretRef github-token-agent-write) — that token can push the Session
