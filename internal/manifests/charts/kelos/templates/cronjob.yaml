@@ -22,6 +22,18 @@ spec:
           serviceAccountName: kelos-controller
           securityContext:
             runAsNonRoot: true
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           restartPolicy: OnFailure
           containers:
             - name: telemetry

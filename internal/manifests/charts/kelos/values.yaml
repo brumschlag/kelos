@@ -6,6 +6,19 @@ image:
   tag: "latest"
   pullPolicy: ""
 
+# nodeSelector, tolerations and affinity constrain where the workloads rendered
+# by this chart run: the controller Deployment and the telemetry CronJob, which
+# both run the controller image. Agent pods are not rendered here and are
+# scheduled per-resource through Task.spec.podOverrides and its equivalents on
+# Session and WorkerPool.
+#
+# A mixed-architecture cluster is the common reason to set these: a controller
+# image built for one architecture needs pinning to nodes of that architecture,
+# for example nodeSelector: {kubernetes.io/arch: amd64}.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
 telemetry:
   enabled: true
 

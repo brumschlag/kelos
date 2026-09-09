@@ -219,6 +219,95 @@ func TestRender_ControllerImageTagAppliesToEveryControllerWorkload(t *testing.T)
 	}
 }
 
+// A mixed-architecture cluster needs the control plane constrained to the
+// architecture its images are built for, and there is no other way to express
+// that: podOverrides.nodeSelector covers agent pods, but the controller
+// Deployment and the telemetry CronJob are rendered by this chart. Both run the
+// controller image, so both must honor the same scheduling values.
+func TestRender_ControllerSchedulingAppliesToEveryControllerWorkload(t *testing.T) {
+	data, err := Render(manifests.ChartFS, map[string]interface{}{
+		"nodeSelector": map[string]interface{}{"kubernetes.io/arch": "amd64"},
+		"tolerations": []interface{}{
+			map[string]interface{}{
+				"key":      "workload",
+				"operator": "Equal",
+				"value":    "control",
+				"effect":   "NoSchedule",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("rendering chart: %v", err)
+	}
+
+	workloads := map[string]string{
+		"Deployment": "kelos-controller-manager",
+		"CronJob":    "kelos-telemetry",
+	}
+	for kind, name := range workloads {
+		spec := podSpecOf(t, data, kind, name)
+		if spec == nil {
+			t.Fatalf("%s %s not found in rendered output", kind, name)
+		}
+		sel, _ := spec["nodeSelector"].(map[string]interface{})
+		if sel["kubernetes.io/arch"] != "amd64" {
+			t.Errorf("%s %s nodeSelector = %v, want kubernetes.io/arch=amd64", kind, name, spec["nodeSelector"])
+		}
+		if tol, _ := spec["tolerations"].([]interface{}); len(tol) != 1 {
+			t.Errorf("%s %s tolerations = %v, want exactly one", kind, name, spec["tolerations"])
+		}
+	}
+}
+
+// TestRender_ControllerSchedulingOmittedByDefault guards the opposite direction:
+// an unset value must not render an empty key, which would otherwise replace a
+// scheduling decision made elsewhere with a no-op field.
+func TestRender_ControllerSchedulingOmittedByDefault(t *testing.T) {
+	data, err := Render(manifests.ChartFS, nil)
+	if err != nil {
+		t.Fatalf("rendering chart: %v", err)
+	}
+	for kind, name := range map[string]string{
+		"Deployment": "kelos-controller-manager",
+		"CronJob":    "kelos-telemetry",
+	} {
+		spec := podSpecOf(t, data, kind, name)
+		if spec == nil {
+			t.Fatalf("%s %s not found in rendered output", kind, name)
+		}
+		for _, key := range []string{"nodeSelector", "tolerations", "affinity"} {
+			if _, exists := spec[key]; exists {
+				t.Errorf("%s %s rendered %s with no value set", kind, name, key)
+			}
+		}
+	}
+}
+
+// podSpecOf returns the pod spec of the named workload from a rendered
+// multi-document manifest, reaching through the CronJob's nested job template.
+func podSpecOf(t *testing.T, data []byte, kind, name string) map[string]interface{} {
+	t.Helper()
+	for _, doc := range strings.Split(string(data), "\n---\n") {
+		var obj map[string]interface{}
+		if err := sigyaml.Unmarshal([]byte(doc), &obj); err != nil || obj == nil {
+			continue
+		}
+		meta, _ := obj["metadata"].(map[string]interface{})
+		if obj["kind"] != kind || meta["name"] != name {
+			continue
+		}
+		spec, _ := obj["spec"].(map[string]interface{})
+		if kind == "CronJob" {
+			jt, _ := spec["jobTemplate"].(map[string]interface{})
+			spec, _ = jt["spec"].(map[string]interface{})
+		}
+		tmpl, _ := spec["template"].(map[string]interface{})
+		podSpec, _ := tmpl["spec"].(map[string]interface{})
+		return podSpec
+	}
+	return nil
+}
+
 func TestRender_PullPolicy(t *testing.T) {
 	vals := map[string]interface{}{
 		"image": map[string]interface{}{
