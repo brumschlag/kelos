@@ -1,0 +1,39 @@
+apiVersion: kelos.dev/v1alpha2
+kind: Workspace
+metadata:
+  name: kelos-agent
+spec:
+  repo: https://github.com/kelos-dev/kelos.git
+  ref: main
+  secretRef:
+    name: kelos-agent-credentials
+---
+apiVersion: kelos.dev/v1alpha2
+kind: Workspace
+metadata:
+  name: agora-agent
+spec:
+  repo: https://github.com/kelos-dev/agora.git
+  ref: main
+  secretRef:
+    name: kelos-agent-credentials
+---
+apiVersion: kelos.dev/v1alpha2
+kind: Workspace
+metadata:
+  name: kanon-agent
+spec:
+  repo: https://github.com/kelos-dev/kanon.git
+  ref: main
+  secretRef:
+    name: kelos-agent-credentials
+---
+apiVersion: kelos.dev/v1alpha2
+kind: Workspace
+metadata:
+  name: open-actions-agent
+spec:
+  repo: https://github.com/kelos-dev/open-actions.git
+  ref: main
+  secretRef:
+    name: kelos-agent-credentials

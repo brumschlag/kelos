@@ -401,6 +401,389 @@ func TestTaskSpawnerConvert_NameTemplateRoundTrips(t *testing.T) {
 	}
 }
 
+func TestTaskSpawnerConvert_GatewayRefRoundTrips(t *testing.T) {
+	tests := []struct {
+		name   string
+		when   v1alpha2.When
+		getRef func(v1alpha2.When) *v1alpha2.GatewayReference
+	}{
+		{
+			name: "github",
+			when: v1alpha2.When{GitHubWebhook: &v1alpha2.GitHubWebhook{
+				Events:     []string{"issues"},
+				GatewayRef: &v1alpha2.GatewayReference{Name: "github-gateway"},
+			}},
+			getRef: func(when v1alpha2.When) *v1alpha2.GatewayReference { return when.GitHubWebhook.GatewayRef },
+		},
+		{
+			name: "linear",
+			when: v1alpha2.When{LinearWebhook: &v1alpha2.LinearWebhook{
+				Types:      []string{"Issue"},
+				GatewayRef: &v1alpha2.GatewayReference{Name: "linear-gateway"},
+			}},
+			getRef: func(when v1alpha2.When) *v1alpha2.GatewayReference { return when.LinearWebhook.GatewayRef },
+		},
+		{
+			name: "generic",
+			when: v1alpha2.When{GenericWebhook: &v1alpha2.GenericWebhook{
+				Source:       "source",
+				FieldMapping: map[string]string{"id": "$.id"},
+				GatewayRef:   &v1alpha2.GatewayReference{Name: "generic-gateway"},
+			}},
+			getRef: func(when v1alpha2.When) *v1alpha2.GatewayReference { return when.GenericWebhook.GatewayRef },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hub := &v1alpha2.TaskSpawner{Spec: v1alpha2.TaskSpawnerSpec{When: tt.when}}
+			spoke := &v1alpha1.TaskSpawner{}
+			if err := taskSpawnerFromHub(context.Background(), hub, spoke); err != nil {
+				t.Fatalf("taskSpawnerFromHub() error = %v", err)
+			}
+			if spoke.Annotations[preservedWebhookGatewayRefsAnnotation] == "" {
+				t.Fatal("gateway reference preservation annotation is empty")
+			}
+
+			back := &v1alpha2.TaskSpawner{}
+			if err := taskSpawnerToHub(context.Background(), spoke, back); err != nil {
+				t.Fatalf("taskSpawnerToHub() error = %v", err)
+			}
+			if got := tt.getRef(back.Spec.When); got == nil || got.Name != tt.getRef(tt.when).Name {
+				t.Fatalf("round-tripped gatewayRef = %+v, want %+v", got, tt.getRef(tt.when))
+			}
+			if _, ok := back.Annotations[preservedWebhookGatewayRefsAnnotation]; ok {
+				t.Fatal("preservation annotation remained on hub")
+			}
+		})
+	}
+}
+
+func TestTaskSpawnerConvert_GitHubCommentsReportingRoundTrips(t *testing.T) {
+	tests := []struct {
+		name               string
+		configureHub       func(*v1alpha2.When, *v1alpha2.GitHubReporting)
+		spokeReporting     func(*v1alpha1.When) *v1alpha1.GitHubReporting
+		roundTripReporting func(*v1alpha2.When) *v1alpha2.GitHubReporting
+	}{
+		{
+			name: "issues",
+			configureHub: func(when *v1alpha2.When, reporting *v1alpha2.GitHubReporting) {
+				when.GitHubIssues = &v1alpha2.GitHubIssues{Reporting: reporting}
+			},
+			spokeReporting: func(when *v1alpha1.When) *v1alpha1.GitHubReporting {
+				return when.GitHubIssues.Reporting
+			},
+			roundTripReporting: func(when *v1alpha2.When) *v1alpha2.GitHubReporting {
+				return when.GitHubIssues.Reporting
+			},
+		},
+		{
+			name: "pull requests",
+			configureHub: func(when *v1alpha2.When, reporting *v1alpha2.GitHubReporting) {
+				when.GitHubPullRequests = &v1alpha2.GitHubPullRequests{Reporting: reporting}
+			},
+			spokeReporting: func(when *v1alpha1.When) *v1alpha1.GitHubReporting {
+				return when.GitHubPullRequests.Reporting
+			},
+			roundTripReporting: func(when *v1alpha2.When) *v1alpha2.GitHubReporting {
+				return when.GitHubPullRequests.Reporting
+			},
+		},
+		{
+			name: "webhook",
+			configureHub: func(when *v1alpha2.When, reporting *v1alpha2.GitHubReporting) {
+				when.GitHubWebhook = &v1alpha2.GitHubWebhook{Reporting: reporting}
+			},
+			spokeReporting: func(when *v1alpha1.When) *v1alpha1.GitHubReporting {
+				return when.GitHubWebhook.Reporting
+			},
+			roundTripReporting: func(when *v1alpha2.When) *v1alpha2.GitHubReporting {
+				return when.GitHubWebhook.Reporting
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hub := &v1alpha2.TaskSpawner{ObjectMeta: metav1.ObjectMeta{Name: "reporter", Namespace: "default"}}
+			tt.configureHub(&hub.Spec.When, &v1alpha2.GitHubReporting{
+				Comments: &v1alpha2.GitHubCommentsReporting{Mode: v1alpha2.GitHubCommentModeSticky},
+			})
+
+			spoke := &v1alpha1.TaskSpawner{}
+			if err := taskSpawnerFromHub(context.Background(), hub, spoke); err != nil {
+				t.Fatalf("taskSpawnerFromHub() error = %v", err)
+			}
+			if !tt.spokeReporting(&spoke.Spec.When).Enabled {
+				t.Error("v1alpha1 fallback did not enable comment reporting")
+			}
+			if _, ok := spoke.Annotations[preservedGitHubCommentsReportingAnnotation]; !ok {
+				t.Fatal("expected preserved GitHub comments reporting annotation on spoke")
+			}
+
+			back := &v1alpha2.TaskSpawner{}
+			if err := taskSpawnerToHub(context.Background(), spoke, back); err != nil {
+				t.Fatalf("taskSpawnerToHub() error = %v", err)
+			}
+			reporting := tt.roundTripReporting(&back.Spec.When)
+			if reporting.Comments == nil || reporting.Comments.Mode != v1alpha2.GitHubCommentModeSticky {
+				t.Fatalf("round-tripped comments = %#v, want Sticky", reporting.Comments)
+			}
+			if reporting.Enabled {
+				t.Error("deprecated enabled field was not restored to false")
+			}
+			if _, ok := back.Annotations[preservedGitHubCommentsReportingAnnotation]; ok {
+				t.Error("internal preservation annotation leaked onto hub object")
+			}
+		})
+	}
+}
+
+func TestTaskSpawnerConvert_V1Alpha1CanDisablePreservedCommentsReporting(t *testing.T) {
+	hub := &v1alpha2.TaskSpawner{
+		ObjectMeta: metav1.ObjectMeta{Name: "reporter", Namespace: "default"},
+		Spec: v1alpha2.TaskSpawnerSpec{
+			When: v1alpha2.When{
+				GitHubWebhook: &v1alpha2.GitHubWebhook{
+					Reporting: &v1alpha2.GitHubReporting{
+						Comments: &v1alpha2.GitHubCommentsReporting{Mode: v1alpha2.GitHubCommentModeSticky},
+					},
+				},
+			},
+		},
+	}
+
+	spoke := &v1alpha1.TaskSpawner{}
+	if err := taskSpawnerFromHub(context.Background(), hub, spoke); err != nil {
+		t.Fatalf("taskSpawnerFromHub() error = %v", err)
+	}
+	spoke.Spec.When.GitHubWebhook.Reporting.Enabled = false
+
+	back := &v1alpha2.TaskSpawner{}
+	if err := taskSpawnerToHub(context.Background(), spoke, back); err != nil {
+		t.Fatalf("taskSpawnerToHub() error = %v", err)
+	}
+	reporting := back.Spec.When.GitHubWebhook.Reporting
+	if reporting.Enabled || reporting.Comments != nil {
+		t.Errorf("round-tripped reporting = %#v, want comments disabled", reporting)
+	}
+}
+
+func TestTaskSpawnerConvert_CredentialsRoundTrip(t *testing.T) {
+	hub := &v1alpha2.TaskSpawner{
+		ObjectMeta: metav1.ObjectMeta{Name: "multi-account", Namespace: "default"},
+		Spec: v1alpha2.TaskSpawnerSpec{
+			When: v1alpha2.When{Cron: &v1alpha2.Cron{Schedule: "0 9 * * 1"}},
+			TaskTemplate: v1alpha2.TaskTemplate{
+				Worker: &v1alpha2.WorkerSpec{Type: "claude-code"},
+			},
+			Credentials: []v1alpha2.SpawnerCredential{
+				{Name: "account-b", Type: v1alpha2.CredentialTypeOAuth, SecretRef: v1alpha2.SecretReference{Name: "secret-b"}},
+				{Name: "account-a", Type: v1alpha2.CredentialTypeAPIKey, SecretRef: v1alpha2.SecretReference{Name: "secret-a"}},
+			},
+		},
+	}
+
+	spoke := &v1alpha1.TaskSpawner{}
+	if err := taskSpawnerFromHub(context.Background(), hub, spoke); err != nil {
+		t.Fatalf("taskSpawnerFromHub() error = %v", err)
+	}
+	if _, ok := spoke.Annotations[preservedTaskSpawnerCredentialsAnnotation]; !ok {
+		t.Fatal("expected preserved TaskSpawner credentials annotation on spoke")
+	}
+	if got := spoke.Spec.TaskTemplate.Credentials.SecretRef; got == nil || got.Name != "secret-a" {
+		t.Fatalf("v1alpha1 fallback SecretRef = %#v, want secret-a", got)
+	}
+
+	back := &v1alpha2.TaskSpawner{}
+	if err := taskSpawnerToHub(context.Background(), spoke, back); err != nil {
+		t.Fatalf("taskSpawnerToHub() error = %v", err)
+	}
+	if _, ok := back.Annotations[preservedTaskSpawnerCredentialsAnnotation]; ok {
+		t.Error("internal preservation annotation leaked onto hub object")
+	}
+	if back.Spec.TaskTemplate.Credentials != nil {
+		t.Errorf("fallback taskTemplate.credentials was not cleared: %#v", back.Spec.TaskTemplate.Credentials)
+	}
+	if len(back.Spec.Credentials) != 2 {
+		t.Fatalf("round-tripped credentials len = %d, want 2", len(back.Spec.Credentials))
+	}
+	byName := map[string]v1alpha2.SpawnerCredential{}
+	for _, credential := range back.Spec.Credentials {
+		byName[credential.Name] = credential
+	}
+	if got := byName["account-a"].SecretRef.Name; got != "secret-a" {
+		t.Errorf("account-a SecretRef.Name = %q, want secret-a", got)
+	}
+	if got := byName["account-b"].SecretRef.Name; got != "secret-b" {
+		t.Errorf("account-b SecretRef.Name = %q, want secret-b", got)
+	}
+}
+
+func TestTaskSpawnerConvert_EditedV1Alpha1CredentialsReplacePool(t *testing.T) {
+	hub := &v1alpha2.TaskSpawner{
+		ObjectMeta: metav1.ObjectMeta{Name: "multi-account", Namespace: "default"},
+		Spec: v1alpha2.TaskSpawnerSpec{
+			When: v1alpha2.When{Cron: &v1alpha2.Cron{Schedule: "0 9 * * 1"}},
+			TaskTemplate: v1alpha2.TaskTemplate{
+				Worker: &v1alpha2.WorkerSpec{Type: "claude-code"},
+			},
+			Credentials: []v1alpha2.SpawnerCredential{
+				{Name: "account-b", Type: v1alpha2.CredentialTypeOAuth, SecretRef: v1alpha2.SecretReference{Name: "secret-b"}},
+				{Name: "account-a", Type: v1alpha2.CredentialTypeAPIKey, SecretRef: v1alpha2.SecretReference{Name: "secret-a"}},
+			},
+		},
+	}
+
+	spoke := &v1alpha1.TaskSpawner{}
+	if err := taskSpawnerFromHub(context.Background(), hub, spoke); err != nil {
+		t.Fatalf("taskSpawnerFromHub() error = %v", err)
+	}
+	spoke.Spec.TaskTemplate.Credentials = v1alpha1.Credentials{
+		Type:      v1alpha1.CredentialTypeOAuth,
+		SecretRef: &v1alpha1.SecretReference{Name: "edited-secret"},
+	}
+
+	back := &v1alpha2.TaskSpawner{}
+	if err := taskSpawnerToHub(context.Background(), spoke, back); err != nil {
+		t.Fatalf("taskSpawnerToHub() error = %v", err)
+	}
+	if len(back.Spec.Credentials) != 0 {
+		t.Fatalf("round-tripped credentials = %#v, want no credential pool", back.Spec.Credentials)
+	}
+	if got := back.Spec.TaskTemplate.Credentials; got == nil || got.Type != v1alpha2.CredentialTypeOAuth || got.SecretRef == nil || got.SecretRef.Name != "edited-secret" {
+		t.Errorf("round-tripped taskTemplate.credentials = %#v, want edited OAuth credential", got)
+	}
+	if _, ok := back.Annotations[preservedTaskSpawnerCredentialsAnnotation]; ok {
+		t.Error("internal preservation annotation leaked onto hub object")
+	}
+}
+
+func TestTaskSpawnerConvert_ContextGitHubAppAuthRoundTrips(t *testing.T) {
+	hub := &v1alpha2.TaskSpawner{
+		ObjectMeta: metav1.ObjectMeta{Name: "enrich", Namespace: "default"},
+		Spec: v1alpha2.TaskSpawnerSpec{
+			When: v1alpha2.When{GitHubWebhook: &v1alpha2.GitHubWebhook{Events: []string{"pull_request"}}},
+			TaskTemplate: v1alpha2.TaskTemplate{
+				ContextSources: []v1alpha2.ContextSource{
+					{
+						Name: "pr",
+						HTTP: &v1alpha2.HTTPContextSource{
+							URL: "https://api.github.com/repos/o/r/pulls/1",
+							GitHubAppAuth: &v1alpha2.GitHubAppContextAuth{
+								SecretRef:  v1alpha2.SecretReference{Name: "gh-app"},
+								APIBaseURL: "https://github.example.com/api/v3",
+							},
+						},
+					},
+					{
+						Name: "plain",
+						HTTP: &v1alpha2.HTTPContextSource{URL: "https://example.com/data"},
+					},
+				},
+			},
+		},
+	}
+
+	// hub -> spoke: v1alpha1 has no githubAppAuth field, so it is preserved in
+	// an internal annotation rather than dropped.
+	spoke := &v1alpha1.TaskSpawner{}
+	if err := taskSpawnerFromHub(context.Background(), hub, spoke); err != nil {
+		t.Fatalf("taskSpawnerFromHub() error = %v", err)
+	}
+	if _, ok := spoke.Annotations[preservedContextGitHubAppAuthAnnotation]; !ok {
+		t.Fatal("expected preserved githubAppAuth annotation on spoke")
+	}
+
+	// spoke -> hub: the field is restored onto the matching context source and
+	// the internal annotation removed.
+	back := &v1alpha2.TaskSpawner{}
+	if err := taskSpawnerToHub(context.Background(), spoke, back); err != nil {
+		t.Fatalf("taskSpawnerToHub() error = %v", err)
+	}
+	if _, ok := back.Annotations[preservedContextGitHubAppAuthAnnotation]; ok {
+		t.Error("internal preservation annotation leaked onto hub object")
+	}
+
+	sources := back.Spec.TaskTemplate.ContextSources
+	if len(sources) != 2 {
+		t.Fatalf("round-tripped contextSources len = %d, want 2", len(sources))
+	}
+	got := sources[0].HTTP.GitHubAppAuth
+	if got == nil {
+		t.Fatal("githubAppAuth not restored on 'pr' context source")
+	}
+	if got.SecretRef.Name != "gh-app" {
+		t.Errorf("restored SecretRef.Name = %q, want %q", got.SecretRef.Name, "gh-app")
+	}
+	if got.APIBaseURL != "https://github.example.com/api/v3" {
+		t.Errorf("restored APIBaseURL = %q, want %q", got.APIBaseURL, "https://github.example.com/api/v3")
+	}
+	if sources[1].HTTP.GitHubAppAuth != nil {
+		t.Error("unexpected githubAppAuth restored on 'plain' context source")
+	}
+}
+
+func TestTaskSpawnerToHub_MalformedContextGitHubAppAuthAnnotationIgnored(t *testing.T) {
+	// The preservation annotation is user-editable; a malformed value must not
+	// block conversion to the storage version. It is treated as absent and
+	// stripped from the hub object.
+	spoke := &v1alpha1.TaskSpawner{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "enrich",
+			Namespace: "default",
+			Annotations: map[string]string{
+				preservedContextGitHubAppAuthAnnotation: "{not valid json",
+			},
+		},
+		Spec: v1alpha1.TaskSpawnerSpec{
+			When: v1alpha1.When{GitHubWebhook: &v1alpha1.GitHubWebhook{Events: []string{"pull_request"}}},
+			TaskTemplate: v1alpha1.TaskTemplate{
+				ContextSources: []v1alpha1.ContextSource{
+					{Name: "pr", HTTP: &v1alpha1.HTTPContextSource{URL: "https://api.github.com/repos/o/r/pulls/1"}},
+				},
+			},
+		},
+	}
+
+	hub := &v1alpha2.TaskSpawner{}
+	if err := taskSpawnerToHub(context.Background(), spoke, hub); err != nil {
+		t.Fatalf("taskSpawnerToHub() error = %v", err)
+	}
+	if _, ok := hub.Annotations[preservedContextGitHubAppAuthAnnotation]; ok {
+		t.Error("malformed internal preservation annotation leaked onto hub object")
+	}
+	sources := hub.Spec.TaskTemplate.ContextSources
+	if len(sources) != 1 {
+		t.Fatalf("contextSources len = %d, want 1", len(sources))
+	}
+	if sources[0].HTTP.GitHubAppAuth != nil {
+		t.Error("githubAppAuth should not be restored from a malformed annotation")
+	}
+}
+
+func TestTaskSpawnerFromHub_NoContextGitHubAppAuthOmitsAnnotation(t *testing.T) {
+	hub := &v1alpha2.TaskSpawner{
+		ObjectMeta: metav1.ObjectMeta{Name: "enrich", Namespace: "default"},
+		Spec: v1alpha2.TaskSpawnerSpec{
+			When: v1alpha2.When{Cron: &v1alpha2.Cron{Schedule: "0 9 * * 1"}},
+			TaskTemplate: v1alpha2.TaskTemplate{
+				ContextSources: []v1alpha2.ContextSource{
+					{Name: "plain", HTTP: &v1alpha2.HTTPContextSource{URL: "https://example.com/data"}},
+				},
+			},
+		},
+	}
+	spoke := &v1alpha1.TaskSpawner{}
+	if err := taskSpawnerFromHub(context.Background(), hub, spoke); err != nil {
+		t.Fatalf("taskSpawnerFromHub() error = %v", err)
+	}
+	if _, ok := spoke.Annotations[preservedContextGitHubAppAuthAnnotation]; ok {
+		t.Error("annotation should not be set when no context source uses GitHub App auth")
+	}
+}
+
 func TestTaskSpawnerFromHub_NoNameTemplateOmitsAnnotation(t *testing.T) {
 	hub := &v1alpha2.TaskSpawner{
 		ObjectMeta: metav1.ObjectMeta{Name: "responder", Namespace: "default"},

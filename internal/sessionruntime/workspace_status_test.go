@@ -30,20 +30,100 @@ func (r fakeWorkspaceStatusRunner) run(_ context.Context, workingDir, name strin
 	return result.output, result.err
 }
 
+func workspaceStatusCommands(branch, remote, fetchURL, pushURL string) map[string]workspaceStatusResult {
+	if remote == "" {
+		remote = "origin"
+	}
+	return map[string]workspaceStatusResult{
+		"/repo: git rev-parse --is-inside-work-tree":                               {output: "true"},
+		"/repo: git branch --show-current":                                         {output: branch},
+		"/repo: git for-each-ref --format=%(push:remotename) refs/heads/" + branch: {output: remote},
+		"/repo: git remote get-url " + remote:                                      {output: fetchURL},
+		"/repo: git remote get-url --push " + remote:                               {output: pushURL},
+	}
+}
+
+func pullRequestDiscoveryCommand(repository, head string) string {
+	return "/repo: gh api --hostname github.com --method GET repos/" + repository + "/pulls -f state=all -f head=" + head + " -F per_page=1"
+}
+
+func pullRequestStatusCommand(owner, repository, number string) string {
+	return "/repo: gh api --hostname github.com graphql -f owner=" + owner + " -f repo=" + repository + " -F number=" + number + " -f query=" + pullRequestStatusQuery
+}
+
 func TestCaptureWorkspaceStatus(t *testing.T) {
-	runner := fakeWorkspaceStatusRunner{commands: map[string]workspaceStatusResult{
-		"/repo: git rev-parse --is-inside-work-tree":                                    {output: "true"},
-		"/repo: git branch --show-current":                                              {output: "feature/status"},
-		"/repo: git for-each-ref --format=%(push:remotename) refs/heads/feature/status": {output: ""},
-		"/repo: git remote get-url --push origin":                                       {output: "https://github.com/kelos-dev/kelos.git"},
-		"/repo: gh pr list --head feature/status --state all --json url,headRepositoryOwner,state,isDraft --limit 100": {
-			output: `[{"url":"https://github.com/kelos-dev/kelos/pull/42","state":"OPEN","isDraft":false,"headRepositoryOwner":{"login":"kelos-dev"}}]`,
-		},
-	}}
+	commands := workspaceStatusCommands("feature/status", "origin", "https://github.com/kelos-dev/kelos.git", "https://github.com/kelos-dev/kelos.git")
+	commands[pullRequestDiscoveryCommand("kelos-dev/kelos", "kelos-dev:feature/status")] = workspaceStatusResult{
+		output: `[{"html_url":"https://github.com/kelos-dev/kelos/pull/42","state":"open","draft":false,"merged_at":null}]`,
+	}
+	commands[pullRequestStatusCommand("kelos-dev", "kelos", "42")] = workspaceStatusResult{
+		output: `{"data":{"repository":{"pullRequest":{"url":"https://github.com/kelos-dev/kelos/pull/42","state":"OPEN","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"},{"__typename":"CheckRun","status":"IN_PROGRESS","conclusion":""},{"__typename":"StatusContext","state":"SUCCESS"}]}}}}]},"mergeQueueEntry":null}}}}`,
+	}
+	runner := fakeWorkspaceStatusRunner{commands: commands}
 
 	got, err := captureWorkspaceStatus(context.Background(), runner, "/repo", nil)
 	if err != nil {
 		t.Fatal(err)
+	}
+	want := WorkspaceStatus{
+		Branch: "feature/status",
+		PullRequest: &kelos.SessionPullRequest{
+			URL:   "https://github.com/kelos-dev/kelos/pull/42",
+			State: kelos.SessionPullRequestStateOpen,
+			Checks: &kelos.SessionPullRequestChecks{
+				State:     kelos.SessionPullRequestChecksStatePending,
+				Completed: 2,
+				Total:     3,
+			},
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("captureWorkspaceStatus() = %#v, want %#v", got, want)
+	}
+}
+
+func TestCaptureWorkspaceStatusUsesMergeQueueChecks(t *testing.T) {
+	commands := workspaceStatusCommands("feature/status", "origin", "https://github.com/kelos-dev/kelos.git", "https://github.com/kelos-dev/kelos.git")
+	commands[pullRequestDiscoveryCommand("kelos-dev/kelos", "kelos-dev:feature/status")] = workspaceStatusResult{
+		output: `[{"html_url":"https://github.com/kelos-dev/kelos/pull/42","state":"open","draft":false,"merged_at":null}]`,
+	}
+	commands[pullRequestStatusCommand("kelos-dev", "kelos", "42")] = workspaceStatusResult{
+		output: `{"data":{"repository":{"pullRequest":{"url":"https://github.com/kelos-dev/kelos/pull/42","state":"OPEN","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"}]}}}}]},"mergeQueueEntry":{"headCommit":{"statusCheckRollup":{"contexts":{"nodes":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"},{"__typename":"CheckRun","status":"IN_PROGRESS","conclusion":""}]}}}}}}}}`,
+	}
+	runner := fakeWorkspaceStatusRunner{commands: commands}
+
+	got, err := captureWorkspaceStatus(context.Background(), runner, "/repo", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := WorkspaceStatus{
+		Branch: "feature/status",
+		PullRequest: &kelos.SessionPullRequest{
+			URL:   "https://github.com/kelos-dev/kelos/pull/42",
+			State: kelos.SessionPullRequestStateQueued,
+			Checks: &kelos.SessionPullRequestChecks{
+				State:     kelos.SessionPullRequestChecksStatePending,
+				Completed: 1,
+				Total:     2,
+			},
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("captureWorkspaceStatus() = %#v, want %#v", got, want)
+	}
+}
+
+func TestCaptureWorkspaceStatusReturnsDiscoveredPullRequestOnStatusLookupError(t *testing.T) {
+	commands := workspaceStatusCommands("feature/status", "origin", "https://github.com/kelos-dev/kelos.git", "https://github.com/kelos-dev/kelos.git")
+	commands[pullRequestDiscoveryCommand("kelos-dev/kelos", "kelos-dev:feature/status")] = workspaceStatusResult{
+		output: `[{"html_url":"https://github.com/kelos-dev/kelos/pull/42","state":"open","draft":false,"merged_at":null}]`,
+	}
+	commands[pullRequestStatusCommand("kelos-dev", "kelos", "42")] = workspaceStatusResult{err: errors.New("status unavailable")}
+	runner := fakeWorkspaceStatusRunner{commands: commands}
+
+	got, err := captureWorkspaceStatus(context.Background(), runner, "/repo", nil)
+	if err == nil {
+		t.Fatal("captureWorkspaceStatus() error = nil, want status lookup error")
 	}
 	want := WorkspaceStatus{
 		Branch: "feature/status",
@@ -58,15 +138,14 @@ func TestCaptureWorkspaceStatus(t *testing.T) {
 }
 
 func TestCaptureWorkspaceStatusUsesBranchPushRemote(t *testing.T) {
-	runner := fakeWorkspaceStatusRunner{commands: map[string]workspaceStatusResult{
-		"/repo: git rev-parse --is-inside-work-tree":                                    {output: "true"},
-		"/repo: git branch --show-current":                                              {output: "feature/status"},
-		"/repo: git for-each-ref --format=%(push:remotename) refs/heads/feature/status": {output: "fork"},
-		"/repo: git remote get-url --push fork":                                         {output: "git@github.com:gjkim/kelos.git"},
-		"/repo: gh pr list --head feature/status --state all --json url,headRepositoryOwner,state,isDraft --limit 100": {
-			output: `[{"url":"https://github.com/kelos-dev/kelos/pull/42","state":"OPEN","isDraft":false,"headRepositoryOwner":{"login":"gjkim"}}]`,
-		},
-	}}
+	commands := workspaceStatusCommands("feature/status", "fork", "https://github.com/kelos-dev/kelos.git", "git@github.com:gjkim/kelos.git")
+	commands[pullRequestDiscoveryCommand("kelos-dev/kelos", "gjkim:feature/status")] = workspaceStatusResult{
+		output: `[{"html_url":"https://github.com/kelos-dev/kelos/pull/42","state":"open","draft":false,"merged_at":null}]`,
+	}
+	commands[pullRequestStatusCommand("kelos-dev", "kelos", "42")] = workspaceStatusResult{
+		output: `{"data":{"repository":{"pullRequest":{"url":"https://github.com/kelos-dev/kelos/pull/42","state":"OPEN","isDraft":false,"commits":{"nodes":[]},"mergeQueueEntry":null}}}}`,
+	}
+	runner := fakeWorkspaceStatusRunner{commands: commands}
 
 	got, err := captureWorkspaceStatus(context.Background(), runner, "/repo", nil)
 	if err != nil {
@@ -101,18 +180,15 @@ func TestCaptureWorkspaceStatusWithoutGitRepository(t *testing.T) {
 }
 
 func TestCaptureWorkspaceStatusUsesUpstreamRepository(t *testing.T) {
-	runner := fakeWorkspaceStatusRunner{commands: map[string]workspaceStatusResult{
-		"/repo: git rev-parse --is-inside-work-tree":                                    {output: "true"},
-		"/repo: git branch --show-current":                                              {output: "feature/status"},
-		"/repo: git for-each-ref --format=%(push:remotename) refs/heads/feature/status": {output: "origin"},
-		"/repo: git remote get-url --push origin":                                       {output: "git@github.com:gjkim/kelos.git"},
-		"/repo: gh pr list --head feature/status --state all --json url,headRepositoryOwner,state,isDraft --limit 100": {
-			output: "[]",
-		},
-		"/repo: gh pr list --head feature/status --state all --json url,headRepositoryOwner,state,isDraft --limit 100 --repo kelos-dev/kelos": {
-			output: `[{"url":"https://github.com/kelos-dev/kelos/pull/41","state":"OPEN","isDraft":false,"headRepositoryOwner":{"login":"another-fork"}},{"url":"https://github.com/kelos-dev/kelos/pull/42","state":"OPEN","isDraft":true,"headRepositoryOwner":{"login":"gjkim"}}]`,
-		},
-	}}
+	commands := workspaceStatusCommands("feature/status", "origin", "git@github.com:gjkim/kelos.git", "git@github.com:gjkim/kelos.git")
+	commands[pullRequestDiscoveryCommand("gjkim/kelos", "gjkim:feature/status")] = workspaceStatusResult{output: "[]"}
+	commands[pullRequestDiscoveryCommand("kelos-dev/kelos", "gjkim:feature/status")] = workspaceStatusResult{
+		output: `[{"html_url":"https://github.com/kelos-dev/kelos/pull/42","state":"open","draft":true,"merged_at":null}]`,
+	}
+	commands[pullRequestStatusCommand("kelos-dev", "kelos", "42")] = workspaceStatusResult{
+		output: `{"data":{"repository":{"pullRequest":{"url":"https://github.com/kelos-dev/kelos/pull/42","state":"OPEN","isDraft":true,"commits":{"nodes":[]},"mergeQueueEntry":null}}}}`,
+	}
+	runner := fakeWorkspaceStatusRunner{commands: commands}
 
 	got, err := captureWorkspaceStatus(context.Background(), runner, "/repo", []string{"KELOS_UPSTREAM_REPO=kelos-dev/kelos"})
 	if err != nil {
@@ -146,10 +222,10 @@ func TestRefreshWorkspaceStatusPreservesPullRequestOnLookupError(t *testing.T) {
 		"/repo: git rev-parse --is-inside-work-tree":                                    {output: "true"},
 		"/repo: git branch --show-current":                                              {output: "feature/status"},
 		"/repo: git for-each-ref --format=%(push:remotename) refs/heads/feature/status": {output: "origin"},
-		"/repo: git remote get-url --push origin":                                       {err: errors.New("temporary git failure")},
+		"/repo: git remote get-url origin":                                              {err: errors.New("temporary git failure")},
 	}}
 
-	_, err := refreshWorkspaceStatusWithRunner(context.Background(), runner, stateDir, "/repo", nil)
+	_, err := refreshWorkspaceStatusWithRunner(context.Background(), runner, stateDir, "/repo", nil, true)
 	if err == nil {
 		t.Fatal("refreshWorkspaceStatusWithRunner() error = nil, want GitHub failure")
 	}
@@ -178,7 +254,7 @@ func TestRefreshWorkspaceStatusReturnsRecordedStatusOnGitError(t *testing.T) {
 		"/repo: git rev-parse --is-inside-work-tree": {err: errors.New("temporary git failure")},
 	}}
 
-	got, err := refreshWorkspaceStatusWithRunner(context.Background(), runner, stateDir, "/repo", nil)
+	got, err := refreshWorkspaceStatusWithRunner(context.Background(), runner, stateDir, "/repo", nil, true)
 	if err == nil {
 		t.Fatal("refreshWorkspaceStatusWithRunner() error = nil, want Git failure")
 	}
@@ -205,17 +281,11 @@ func TestRefreshWorkspaceStatusClearsPullRequestAfterSuccessfulLookup(t *testing
 	}); err != nil {
 		t.Fatal(err)
 	}
-	runner := fakeWorkspaceStatusRunner{commands: map[string]workspaceStatusResult{
-		"/repo: git rev-parse --is-inside-work-tree":                                    {output: "true"},
-		"/repo: git branch --show-current":                                              {output: "feature/status"},
-		"/repo: git for-each-ref --format=%(push:remotename) refs/heads/feature/status": {output: "origin"},
-		"/repo: git remote get-url --push origin":                                       {output: "https://github.com/kelos-dev/kelos.git"},
-		"/repo: gh pr list --head feature/status --state all --json url,headRepositoryOwner,state,isDraft --limit 100": {
-			output: "[]",
-		},
-	}}
+	commands := workspaceStatusCommands("feature/status", "origin", "https://github.com/kelos-dev/kelos.git", "https://github.com/kelos-dev/kelos.git")
+	commands[pullRequestDiscoveryCommand("kelos-dev/kelos", "kelos-dev:feature/status")] = workspaceStatusResult{output: "[]"}
+	runner := fakeWorkspaceStatusRunner{commands: commands}
 
-	if _, err := refreshWorkspaceStatusWithRunner(context.Background(), runner, stateDir, "/repo", nil); err != nil {
+	if _, err := refreshWorkspaceStatusWithRunner(context.Background(), runner, stateDir, "/repo", nil, false); err != nil {
 		t.Fatal(err)
 	}
 	got, err := readRecordedWorkspaceStatus(stateDir)
@@ -225,6 +295,46 @@ func TestRefreshWorkspaceStatusClearsPullRequestAfterSuccessfulLookup(t *testing
 	want := WorkspaceStatus{Branch: "feature/status"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("recorded workspace status = %#v, want %#v", got, want)
+	}
+}
+
+func TestRefreshWorkspaceStatusUsesCachedPullRequest(t *testing.T) {
+	stateDir := t.TempDir()
+	if err := writeWorkspaceStatus(stateDir, WorkspaceStatus{
+		Branch: "feature/status",
+		PullRequest: &kelos.SessionPullRequest{
+			URL:   "https://github.com/kelos-dev/kelos/pull/42",
+			State: kelos.SessionPullRequestStateOpen,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runner := fakeWorkspaceStatusRunner{commands: map[string]workspaceStatusResult{
+		"/repo: git rev-parse --is-inside-work-tree": {output: "true"},
+		"/repo: git branch --show-current":           {output: "feature/status"},
+		pullRequestStatusCommand("kelos-dev", "kelos", "42"): {
+			output: `{"data":{"repository":{"pullRequest":{"url":"https://github.com/kelos-dev/kelos/pull/42","state":"OPEN","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"}]}}}}]},"mergeQueueEntry":null}}}}`,
+		},
+	}}
+
+	got, err := refreshWorkspaceStatusWithRunner(context.Background(), runner, stateDir, "/repo", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := WorkspaceStatus{
+		Branch: "feature/status",
+		PullRequest: &kelos.SessionPullRequest{
+			URL:   "https://github.com/kelos-dev/kelos/pull/42",
+			State: kelos.SessionPullRequestStateOpen,
+			Checks: &kelos.SessionPullRequestChecks{
+				State:     kelos.SessionPullRequestChecksStateSuccess,
+				Completed: 1,
+				Total:     1,
+			},
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("refreshWorkspaceStatusWithRunner() = %#v, want %#v", got, want)
 	}
 }
 
@@ -256,28 +366,98 @@ func TestSessionPullRequestState(t *testing.T) {
 	}
 }
 
-func TestRepositoryOwnerFromRemoteURL(t *testing.T) {
+func TestSessionPullRequestChecks(t *testing.T) {
+	tests := []struct {
+		name   string
+		checks []githubStatusCheck
+		want   *kelos.SessionPullRequestChecks
+	}{
+		{name: "none"},
+		{
+			name: "successful",
+			checks: []githubStatusCheck{
+				{TypeName: "CheckRun", Status: "COMPLETED", Conclusion: "SUCCESS"},
+				{TypeName: "CheckRun", Status: "COMPLETED", Conclusion: "SKIPPED"},
+				{TypeName: "StatusContext", State: "SUCCESS"},
+			},
+			want: &kelos.SessionPullRequestChecks{State: kelos.SessionPullRequestChecksStateSuccess, Completed: 3, Total: 3},
+		},
+		{
+			name: "pending",
+			checks: []githubStatusCheck{
+				{TypeName: "CheckRun", Status: "COMPLETED", Conclusion: "NEUTRAL"},
+				{TypeName: "CheckRun", Status: "IN_PROGRESS"},
+				{TypeName: "StatusContext", State: "EXPECTED"},
+			},
+			want: &kelos.SessionPullRequestChecks{State: kelos.SessionPullRequestChecksStatePending, Completed: 1, Total: 3},
+		},
+		{
+			name: "failed while pending",
+			checks: []githubStatusCheck{
+				{TypeName: "CheckRun", Status: "COMPLETED", Conclusion: "FAILURE"},
+				{TypeName: "CheckRun", Status: "QUEUED"},
+			},
+			want: &kelos.SessionPullRequestChecks{State: kelos.SessionPullRequestChecksStateFailure, Completed: 1, Total: 2},
+		},
+		{
+			name:   "cancelled",
+			checks: []githubStatusCheck{{TypeName: "CheckRun", Status: "COMPLETED", Conclusion: "CANCELLED"}},
+			want:   &kelos.SessionPullRequestChecks{State: kelos.SessionPullRequestChecksStateFailure, Completed: 1, Total: 1},
+		},
+		{
+			name:   "unknown remains pending",
+			checks: []githubStatusCheck{{TypeName: "FutureCheck", Status: "COMPLETED", Conclusion: "SUCCESS"}},
+			want:   &kelos.SessionPullRequestChecks{State: kelos.SessionPullRequestChecksStatePending, Total: 1},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sessionPullRequestChecks(tt.checks)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("sessionPullRequestChecks() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRepositoryFromRemoteURL(t *testing.T) {
 	tests := []struct {
 		name      string
 		remoteURL string
-		want      string
+		want      githubRepository
 		wantError bool
 	}{
-		{name: "HTTPS", remoteURL: "https://github.com/kelos-dev/kelos.git", want: "kelos-dev"},
-		{name: "SSH", remoteURL: "git@github.com:gjkim/kelos.git", want: "gjkim"},
-		{name: "SSH URL", remoteURL: "ssh://git@github.example.com/team/kelos.git", want: "team"},
+		{name: "HTTPS", remoteURL: "https://github.com/kelos-dev/kelos.git", want: githubRepository{Host: "github.com", Owner: "kelos-dev", Name: "kelos"}},
+		{name: "SSH", remoteURL: "git@github.com:gjkim/kelos.git", want: githubRepository{Host: "github.com", Owner: "gjkim", Name: "kelos"}},
+		{name: "SSH URL", remoteURL: "ssh://git@github.example.com/team/kelos.git", want: githubRepository{Host: "github.example.com", Owner: "team", Name: "kelos"}},
 		{name: "invalid", remoteURL: "kelos", wantError: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := repositoryOwnerFromRemoteURL(tt.remoteURL)
+			got, err := repositoryFromRemoteURL(tt.remoteURL)
 			if (err != nil) != tt.wantError {
-				t.Fatalf("repositoryOwnerFromRemoteURL() error = %v, wantError %t", err, tt.wantError)
+				t.Fatalf("repositoryFromRemoteURL() error = %v, wantError %t", err, tt.wantError)
 			}
-			if got != tt.want {
-				t.Fatalf("repositoryOwnerFromRemoteURL() = %q, want %q", got, tt.want)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("repositoryFromRemoteURL() = %#v, want %#v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestPullRequestCoordinatesFromURL(t *testing.T) {
+	repository, number, err := pullRequestCoordinatesFromURL("https://github.example.com/team/kelos/pull/42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (githubRepository{Host: "github.example.com", Owner: "team", Name: "kelos"}); !reflect.DeepEqual(repository, want) {
+		t.Fatalf("pullRequestCoordinatesFromURL() repository = %#v, want %#v", repository, want)
+	}
+	if number != 42 {
+		t.Fatalf("pullRequestCoordinatesFromURL() number = %d, want 42", number)
+	}
+	if _, _, err := pullRequestCoordinatesFromURL("https://github.com/team/kelos/issues/42"); err == nil {
+		t.Fatal("pullRequestCoordinatesFromURL() error = nil, want invalid URL error")
 	}
 }
 

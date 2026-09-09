@@ -323,7 +323,11 @@ func parseGitHubRepo(repoURL string) (host, owner, repo string) {
 	repoURL = strings.TrimSuffix(repoURL, ".git")
 
 	if m := httpsRepoRe.FindStringSubmatch(repoURL); len(m) == 4 {
-		return m[1], m[2], m[3]
+		host := m[1]
+		if parsed, err := url.Parse(repoURL); err == nil && parsed.Host != "" {
+			host = parsed.Host
+		}
+		return host, m[2], m[3]
 	}
 	if m := sshRepoRe.FindStringSubmatch(repoURL); len(m) == 4 {
 		return m[1], m[2], m[3]
@@ -366,7 +370,7 @@ func taskSpawnerNeedsGitHubToken(ts *kelos.TaskSpawner, ghProxyConfigured bool) 
 }
 
 func gitHubReportingNeedsToken(reporting *kelos.GitHubReporting) bool {
-	return reporting != nil && (reporting.Enabled || reporting.Checks != nil)
+	return reporting != nil && (reporting.Enabled || reporting.Comments != nil || reporting.Checks != nil)
 }
 
 func workspaceUsesGHProxy(workspace *kelos.WorkspaceSpec) bool {

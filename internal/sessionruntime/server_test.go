@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -26,13 +27,72 @@ import (
 )
 
 type fakeProvider struct {
-	mu        sync.Mutex
-	prompts   []string
-	resume    chan struct{}
-	closed    bool
-	done      chan struct{}
-	doneOnce  sync.Once
-	closeOnce sync.Once
+	mu              sync.Mutex
+	prompts         []string
+	inputs          []TurnInput
+	shellCommands   []shellCommandRecord
+	shellCommandErr error
+	resume          chan struct{}
+	closed          bool
+	done            chan struct{}
+	doneOnce        sync.Once
+	closeOnce       sync.Once
+}
+
+type fakeGoalProvider struct {
+	fakeProvider
+	goalCommands chan goalCommand
+	goal         *Goal
+	goalStarted  chan struct{}
+	goalStopped  chan struct{}
+	startOnce    sync.Once
+	stopOnce     sync.Once
+}
+
+func (p *fakeGoalProvider) RunGoal(ctx context.Context, command goalCommand, sink EventSink) error {
+	p.goalCommands <- command
+	p.mu.Lock()
+	p.goal = &Goal{Objective: command.objective, Status: "active"}
+	p.mu.Unlock()
+	if p.goalStarted != nil {
+		p.startOnce.Do(func() { close(p.goalStarted) })
+	}
+	if p.goalStopped != nil {
+		select {
+		case <-p.goalStopped:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	p.mu.Lock()
+	p.goal.Status = "complete"
+	goal := cloneGoal(p.goal)
+	p.mu.Unlock()
+	sink.Emit(Event{Type: EventGoalUpdated, Goal: goal, Status: goal.Status})
+	return nil
+}
+
+func (p *fakeGoalProvider) ControlGoal(_ context.Context, command goalCommand, sink EventSink) error {
+	p.goalCommands <- command
+	p.mu.Lock()
+	goal := cloneGoal(p.goal)
+	p.mu.Unlock()
+	if sink != nil {
+		sink.Emit(Event{Type: EventGoalUpdated, Goal: goal, Status: goalEventStatus(goal, "empty")})
+	}
+	if p.goalStopped != nil && (command.action == goalCommandPause || command.action == goalCommandClear) {
+		p.stopOnce.Do(func() { close(p.goalStopped) })
+	}
+	return nil
+}
+
+func (p *fakeGoalProvider) ActiveGoal() *Goal {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.goal == nil || p.goal.Status != "active" {
+		return nil
+	}
+	return cloneGoal(p.goal)
 }
 
 type inputProvider struct {
@@ -41,7 +101,7 @@ type inputProvider struct {
 	closeOnce sync.Once
 }
 
-func (p *inputProvider) RunTurn(ctx context.Context, _ string, sink EventSink) error {
+func (p *inputProvider) RunTurn(ctx context.Context, _ TurnInput, sink EventSink) error {
 	answers, err := sink.RequestInput(ctx, InputRequest{
 		ID: "input-test",
 		Questions: []InputQuestion{
@@ -73,7 +133,103 @@ type interruptProvider struct {
 	closeOnce   sync.Once
 }
 
-func (p *interruptProvider) RunTurn(context.Context, string, EventSink) error {
+type stuckInterruptProvider struct {
+	started                chan struct{}
+	interruptCalled        chan struct{}
+	runStopped             chan struct{}
+	done                   chan struct{}
+	acknowledge            bool
+	ignoreInterruptContext bool
+	interruptErr           error
+	startOnce              sync.Once
+	interruptOnce          sync.Once
+	closeOnce              sync.Once
+}
+
+type turnCompletionRaceProvider struct {
+	mu              sync.Mutex
+	runCount        int
+	firstStarted    chan struct{}
+	secondStarted   chan struct{}
+	finishFirst     chan struct{}
+	interruptCalled chan struct{}
+	finishInterrupt chan struct{}
+	done            chan struct{}
+	interruptOnce   sync.Once
+	closeOnce       sync.Once
+}
+
+func (p *turnCompletionRaceProvider) RunTurn(ctx context.Context, _ TurnInput, _ EventSink) error {
+	p.mu.Lock()
+	p.runCount++
+	runCount := p.runCount
+	p.mu.Unlock()
+	switch runCount {
+	case 1:
+		close(p.firstStarted)
+		select {
+		case <-p.finishFirst:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	case 2:
+		close(p.secondStarted)
+		<-ctx.Done()
+		return ctx.Err()
+	default:
+		return errors.New("unexpected provider turn")
+	}
+}
+
+func (p *turnCompletionRaceProvider) Interrupt(ctx context.Context) error {
+	p.interruptOnce.Do(func() { close(p.interruptCalled) })
+	select {
+	case <-p.finishInterrupt:
+		return ErrNoActiveTurn
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (p *turnCompletionRaceProvider) Done() <-chan struct{} { return p.done }
+func (p *turnCompletionRaceProvider) Close() error {
+	p.closeOnce.Do(func() { close(p.done) })
+	return nil
+}
+
+func (p *stuckInterruptProvider) RunTurn(ctx context.Context, _ TurnInput, _ EventSink) error {
+	p.startOnce.Do(func() { close(p.started) })
+	<-p.runStopped
+	return ctx.Err()
+}
+
+func (p *stuckInterruptProvider) Interrupt(ctx context.Context) error {
+	p.interruptOnce.Do(func() { close(p.interruptCalled) })
+	if p.interruptErr != nil {
+		return p.interruptErr
+	}
+	if p.acknowledge {
+		return nil
+	}
+	if p.ignoreInterruptContext {
+		<-p.done
+		return errors.New("provider stopped")
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (p *stuckInterruptProvider) Done() <-chan struct{} { return p.done }
+func (p *stuckInterruptProvider) Close() error {
+	p.closeOnce.Do(func() {
+		close(p.runStopped)
+		close(p.done)
+	})
+	return nil
+}
+
+func (p *interruptProvider) RunTurn(context.Context, TurnInput, EventSink) error {
 	p.startOnce.Do(func() { close(p.started) })
 	<-p.interrupted
 	return ErrTurnInterrupted
@@ -90,9 +246,10 @@ func (p *interruptProvider) Close() error {
 	return nil
 }
 
-func (p *fakeProvider) RunTurn(ctx context.Context, prompt string, sink EventSink) error {
+func (p *fakeProvider) RunTurn(ctx context.Context, input TurnInput, sink EventSink) error {
 	p.mu.Lock()
-	p.prompts = append(p.prompts, prompt)
+	p.prompts = append(p.prompts, input.Text)
+	p.inputs = append(p.inputs, input)
 	p.mu.Unlock()
 	sink.Emit(Event{Type: EventAssistantDelta, Text: "working"})
 	if p.resume != nil {
@@ -103,6 +260,16 @@ func (p *fakeProvider) RunTurn(ctx context.Context, prompt string, sink EventSin
 		}
 	}
 	sink.Emit(Event{Type: EventAssistantDelta, Text: " done"})
+	return nil
+}
+
+func (p *fakeProvider) recordShellCommand(_ context.Context, record shellCommandRecord) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.shellCommandErr != nil {
+		return p.shellCommandErr
+	}
+	p.shellCommands = append(p.shellCommands, record)
 	return nil
 }
 
@@ -124,6 +291,177 @@ func (p *fakeProvider) Close() error {
 		close(p.done)
 	})
 	return nil
+}
+
+func TestServerSubmitsAttachmentToProviderAndJournal(t *testing.T) {
+	stateDir := t.TempDir()
+	store, err := NewAttachmentStore(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachment, err := store.Put("notes.txt", strings.NewReader("important context"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := NewJournal()
+	t.Cleanup(journal.Close)
+	provider := &fakeProvider{}
+	server := NewServer(Config{StateDir: stateDir}, journal, provider)
+	if err := server.submitMessage("review this", "request-attachment", attachment.ID); err != nil {
+		t.Fatal(err)
+	}
+	turn := <-server.turns
+	<-turn.accepted
+	server.runTurn(t.Context(), turn)
+
+	provider.mu.Lock()
+	inputs := append([]TurnInput(nil), provider.inputs...)
+	provider.mu.Unlock()
+	if len(inputs) != 1 || inputs[0].Text != "review this" || len(inputs[0].Attachments) != 1 {
+		t.Fatalf("provider inputs = %#v", inputs)
+	}
+	if inputs[0].Attachments[0].ID != attachment.ID || !strings.HasSuffix(inputs[0].Attachments[0].Path, filepath.Join(attachment.ID, attachmentDataFileName)) {
+		t.Fatalf("resolved provider attachment = %#v", inputs[0].Attachments[0])
+	}
+	events := journal.Snapshot()
+	if len(events) == 0 || events[0].Type != EventUserMessage || !reflect.DeepEqual(events[0].Attachments, []Attachment{attachment}) {
+		t.Fatalf("journal events = %#v", events)
+	}
+}
+
+func TestServerEditsPendingMessage(t *testing.T) {
+	journal := NewJournal()
+	t.Cleanup(journal.Close)
+	provider := &fakeProvider{}
+	server := NewServer(Config{StateDir: t.TempDir()}, journal, provider)
+	attachment, err := server.attachmentStore.Put("notes.txt", strings.NewReader("context"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.submitMessage("original", "request-message", attachment.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.editMessage("turn-1", "revised", 1, "request-edit"); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.editMessage("turn-1", "stale", 1, "request-stale"); err == nil || !strings.Contains(err.Error(), "revision is 2, not 1") {
+		t.Fatalf("stale edit error = %v", err)
+	}
+
+	turn := <-server.turns
+	<-turn.accepted
+	pending, exists := server.takePendingTurn(turn)
+	if !exists {
+		t.Fatal("pending turn was not available")
+	}
+	server.runTurn(t.Context(), pending)
+
+	provider.mu.Lock()
+	prompts := append([]string(nil), provider.prompts...)
+	inputs := append([]TurnInput(nil), provider.inputs...)
+	provider.mu.Unlock()
+	if !reflect.DeepEqual(prompts, []string{"revised"}) {
+		t.Fatalf("provider prompts = %v, want revised message", prompts)
+	}
+	if len(inputs) != 1 || len(inputs[0].Attachments) != 1 || inputs[0].Attachments[0].ID != attachment.ID {
+		t.Fatalf("provider inputs = %#v, want retained attachment", inputs)
+	}
+	if err := server.editMessage("turn-1", "too late", 2, "request-late"); err == nil || !strings.Contains(err.Error(), `turn "turn-1" is no longer pending`) {
+		t.Fatalf("late edit error = %v", err)
+	}
+
+	events := journal.Snapshot()
+	assertEventTypes(t, events, EventUserMessage, EventUserMessageUpdated, EventTurnStarted, EventAssistantDelta, EventAssistantDelta, EventTurnCompleted)
+	if events[1].Text != "revised" || events[1].Revision != 2 || events[1].RequestID != "request-edit" || !reflect.DeepEqual(events[1].Attachments, []Attachment{attachment}) {
+		t.Fatalf("message update = %#v", events[1])
+	}
+}
+
+func TestServerCombinesSubmissionsIntoPendingMessage(t *testing.T) {
+	journal := NewJournal()
+	t.Cleanup(journal.Close)
+	server := NewServer(Config{StateDir: t.TempDir()}, journal, &fakeProvider{})
+	firstAttachment, err := server.attachmentStore.Put("first.txt", strings.NewReader("first"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondAttachment, err := server.attachmentStore.Put("second.txt", strings.NewReader("second"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.submitMessage("first follow-up", "request-first", firstAttachment.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.submitMessage("second follow-up", "request-second", secondAttachment.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(server.turns) != 1 || server.outstanding != 1 {
+		t.Fatalf("pending runtime state = turns %d outstanding %d", len(server.turns), server.outstanding)
+	}
+	if server.pendingTurn == nil || server.pendingTurn.id != "turn-1" || server.pendingTurn.text != "first follow-up\n\nsecond follow-up" || server.pendingTurn.revision != 2 {
+		t.Fatalf("pending turn = %#v", server.pendingTurn)
+	}
+	if !reflect.DeepEqual(server.pendingTurn.attachments, []Attachment{firstAttachment, secondAttachment}) {
+		t.Fatalf("pending attachments = %#v", server.pendingTurn.attachments)
+	}
+	events := journal.Snapshot()
+	assertEventTypes(t, events, EventUserMessage, EventUserMessageUpdated)
+	if events[1].RequestID != "request-second" || events[1].TurnID != "turn-1" || events[1].Text != "first follow-up\n\nsecond follow-up" {
+		t.Fatalf("combined pending message = %#v", events[1])
+	}
+}
+
+func TestServerRemovesPendingMessage(t *testing.T) {
+	journal := NewJournal()
+	t.Cleanup(journal.Close)
+	server := NewServer(Config{}, journal, &fakeProvider{})
+	if err := server.submitMessage("pending work", "request-message"); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.removePendingMessage("turn-1", 2, "request-stale"); err == nil || !strings.Contains(err.Error(), "revision is 1, not 2") {
+		t.Fatalf("stale removal error = %v", err)
+	}
+	if err := server.removePendingMessage("turn-1", 1, "request-remove"); err != nil {
+		t.Fatal(err)
+	}
+	if server.pendingTurn != nil || server.outstanding != 0 || len(server.turns) != 0 {
+		t.Fatalf("pending runtime state = turn %#v outstanding %d buffered %d", server.pendingTurn, server.outstanding, len(server.turns))
+	}
+	if server.completedTurnID.Load() != 1 {
+		t.Fatalf("completed turn ID = %d, want 1", server.completedTurnID.Load())
+	}
+	events := journal.Snapshot()
+	assertEventTypes(t, events, EventUserMessage, EventUserMessageRemoved)
+	if events[1].RequestID != "request-remove" || events[1].TurnID != "turn-1" || events[1].Revision != 2 || events[1].Status != "removed" {
+		t.Fatalf("removed message event = %#v", events[1])
+	}
+	items, state, _ := projectHistory(events)
+	if len(items) != 0 || state.PendingTurn != nil {
+		t.Fatalf("removed pending history = items %#v state %#v", items, state)
+	}
+	if err := server.submitMessage("replacement", "request-replacement"); err != nil {
+		t.Fatalf("submitting replacement: %v", err)
+	}
+	if server.pendingTurn == nil || server.pendingTurn.id != "turn-2" || len(server.turns) != 1 {
+		t.Fatalf("replacement pending turn = %#v buffered %d", server.pendingTurn, len(server.turns))
+	}
+}
+
+func TestServerDoesNotRunPendingMessageRemovedAfterDispatch(t *testing.T) {
+	journal := NewJournal()
+	t.Cleanup(journal.Close)
+	server := NewServer(Config{}, journal, &fakeProvider{})
+	if err := server.submitMessage("pending work", "request-message"); err != nil {
+		t.Fatal(err)
+	}
+	turn := <-server.turns
+	<-turn.accepted
+	if err := server.removePendingMessage("turn-1", 1, "request-remove"); err != nil {
+		t.Fatal(err)
+	}
+	if pending, exists := server.takePendingTurn(turn); exists {
+		t.Fatalf("removed pending turn remained runnable: %#v", pending)
+	}
 }
 
 func TestSessionSetupEnvironmentKeepsWorkspaceSetupCommand(t *testing.T) {
@@ -148,13 +486,16 @@ func TestRunTurnQueuesWorkspaceStatusRefresh(t *testing.T) {
 	server := NewServer(Config{}, journal, &fakeProvider{})
 	refreshStarted := make(chan struct{})
 	releaseRefresh := make(chan struct{})
-	server.refreshWorkspaceStatus = func(ctx context.Context) error {
+	server.refreshWorkspaceStatus = func(ctx context.Context, forceDiscovery bool) (WorkspaceStatus, error) {
+		if !forceDiscovery {
+			t.Error("turn completion did not force pull request discovery")
+		}
 		close(refreshStarted)
 		select {
 		case <-releaseRefresh:
-			return nil
+			return WorkspaceStatus{}, nil
 		case <-ctx.Done():
-			return ctx.Err()
+			return WorkspaceStatus{}, ctx.Err()
 		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -180,16 +521,404 @@ func TestRunTurnQueuesWorkspaceStatusRefresh(t *testing.T) {
 	close(releaseRefresh)
 }
 
+func TestRunTurnExecutesShellCommandInWorkspace(t *testing.T) {
+	workingDir := t.TempDir()
+	journal := NewJournal()
+	t.Cleanup(journal.Close)
+	provider := &fakeProvider{}
+	server := NewServer(Config{WorkingDir: workingDir, Environment: os.Environ()}, journal, provider)
+
+	server.runTurn(t.Context(), turnRequest{id: "turn-1", text: "!printf 'shell output'", command: sessionCommand{kind: sessionCommandShell, text: "printf 'shell output'"}})
+
+	events := journal.Snapshot()
+	assertEventTypes(t, events, EventTurnStarted, EventToolStarted, EventToolDelta, EventToolCompleted, EventTurnCompleted)
+	if events[1].ToolName != "printf 'shell output'" || events[2].Output != "shell output" {
+		t.Fatalf("shell command events = %#v", events)
+	}
+	if events[3].Status != "completed" || events[3].Output != "shell output" {
+		t.Fatalf("shell command completion = %#v", events[3])
+	}
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	if len(provider.prompts) != 0 {
+		t.Fatalf("shell command was sent to provider: %#v", provider.prompts)
+	}
+	if len(provider.shellCommands) != 1 {
+		t.Fatalf("shell command context = %#v, want one record", provider.shellCommands)
+	}
+	record := provider.shellCommands[0]
+	if record.command != "printf 'shell output'" || record.exitCode != 0 || record.output != "shell output" || record.duration <= 0 {
+		t.Fatalf("shell command context = %#v", record)
+	}
+}
+
+func TestRunTurnFailsWhenShellContextRecordingFails(t *testing.T) {
+	journal := NewJournal()
+	t.Cleanup(journal.Close)
+	provider := &fakeProvider{shellCommandErr: errors.New("recording shell context failed")}
+	server := NewServer(Config{WorkingDir: t.TempDir(), Environment: os.Environ()}, journal, provider)
+
+	server.runTurn(t.Context(), turnRequest{id: "turn-1", command: sessionCommand{kind: sessionCommandShell, text: "printf output"}})
+
+	events := journal.Snapshot()
+	assertEventTypes(t, events, EventTurnStarted, EventToolStarted, EventToolDelta, EventToolCompleted, EventError, EventTurnCompleted)
+	if events[4].Text != "recording shell context failed" || events[4].Status != "failed" {
+		t.Fatalf("shell context error event = %#v", events[4])
+	}
+	if events[5].Status != "failed" {
+		t.Fatalf("shell command completion = %#v", events[5])
+	}
+}
+
+func TestServerInterruptsShellCommandWithoutStoppingProvider(t *testing.T) {
+	workingDir := t.TempDir()
+	journal := NewJournal()
+	t.Cleanup(journal.Close)
+	provider := &fakeProvider{}
+	server := NewServer(Config{WorkingDir: workingDir, Environment: os.Environ()}, journal, provider)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	runDone := make(chan struct{})
+	go func() {
+		server.runTurns(ctx)
+		close(runDone)
+	}()
+
+	pidPath := filepath.Join(workingDir, "shell-pid")
+	if err := server.submitClientMessage(t.Context(), "!printf '%d\\n' $$ > shell-pid; while :; do sleep 60; done", "request-shell"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	var shellPID int
+	for {
+		data, err := os.ReadFile(pidPath)
+		if err == nil {
+			shellPID, err = strconv.Atoi(strings.TrimSpace(string(data)))
+			if err != nil {
+				t.Fatalf("shell PID = %q: %v", data, err)
+			}
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("shell command did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if err := server.interruptTurn(t.Context(), "request-interrupt"); err != nil {
+		t.Fatalf("interruptTurn() error = %v", err)
+	}
+	provider.mu.Lock()
+	providerClosed := provider.closed
+	provider.mu.Unlock()
+	if providerClosed {
+		t.Fatal("interrupting shell command stopped the provider")
+	}
+	events := journal.Snapshot()
+	var toolInterrupted bool
+	for _, event := range events {
+		if event.Type == EventToolCompleted && event.Status == "interrupted" {
+			toolInterrupted = true
+		}
+	}
+	if !toolInterrupted {
+		t.Fatalf("shell tool was not interrupted: %#v", events)
+	}
+	if completion := events[len(events)-1]; completion.Type != EventTurnCompleted || completion.Status != "interrupted" {
+		t.Fatalf("shell command completion = %#v", completion)
+	}
+	provider.mu.Lock()
+	if len(provider.shellCommands) != 1 || provider.shellCommands[0].exitCode != -1 {
+		provider.mu.Unlock()
+		t.Fatalf("interrupted shell command context = %#v", provider.shellCommands)
+	}
+	provider.mu.Unlock()
+	if err := syscall.Kill(shellPID, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("shell process %d remains after interrupt: %v", shellPID, err)
+	}
+
+	cancel()
+	<-runDone
+}
+
+func TestRunTurnCompletesWhenBackgroundProcessKeepsOutputOpen(t *testing.T) {
+	workingDir := t.TempDir()
+	journal := NewJournal()
+	t.Cleanup(journal.Close)
+	server := NewServer(Config{WorkingDir: workingDir, Environment: os.Environ()}, journal, &fakeProvider{})
+
+	started := time.Now()
+	server.runTurn(t.Context(), turnRequest{
+		id:      "turn-1",
+		text:    "!sleep 30 & printf '%d\\n' $! > background-pid",
+		command: sessionCommand{kind: sessionCommandShell, text: "sleep 30 & printf '%d\\n' $! > background-pid"},
+	})
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("shell command took %s after its shell exited", elapsed)
+	}
+
+	data, err := os.ReadFile(filepath.Join(workingDir, "background-pid"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	backgroundPID, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		t.Fatalf("background PID = %q: %v", data, err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(backgroundPID, syscall.SIGKILL) })
+
+	events := journal.Snapshot()
+	assertEventTypes(t, events, EventTurnStarted, EventToolStarted, EventToolCompleted, EventTurnCompleted)
+	if events[2].Status != "completed" || events[3].Status != "completed" {
+		t.Fatalf("shell command completion = %#v", events)
+	}
+}
+
+func TestRunTurnDispatchesGoalToCodexProvider(t *testing.T) {
+	journal := NewJournal()
+	t.Cleanup(journal.Close)
+	provider := &fakeGoalProvider{goalCommands: make(chan goalCommand, 1)}
+	server := NewServer(Config{}, journal, provider)
+
+	server.runTurn(t.Context(), turnRequest{id: "turn-1", text: "/goal improve coverage", command: sessionCommand{kind: sessionCommandGoal, goal: goalCommand{action: goalCommandCreate, objective: "improve coverage"}}})
+
+	command := <-provider.goalCommands
+	if command.action != goalCommandCreate || command.objective != "improve coverage" {
+		t.Fatalf("goal command = %#v", command)
+	}
+	events := journal.Snapshot()
+	assertEventTypes(t, events, EventTurnStarted, EventGoalUpdated, EventTurnCompleted)
+	if events[1].Goal == nil || events[1].Goal.Objective != "improve coverage" {
+		t.Fatalf("goal event = %#v", events[1])
+	}
+}
+
+func TestRunTurnsResumesRecoveredGoalBeforePendingMessage(t *testing.T) {
+	journal := NewJournal()
+	t.Cleanup(journal.Close)
+	provider := &fakeGoalProvider{goalCommands: make(chan goalCommand)}
+	server := NewServer(Config{}, journal, provider)
+	accepted := make(chan struct{})
+	close(accepted)
+	if err := server.restoreTurn(&turnRequest{id: "turn-1", text: "pending work", revision: 1, accepted: accepted}); err != nil {
+		t.Fatal(err)
+	}
+	server.recoveredGoalTurn = &turnRequest{id: "turn-2", text: "/goal resume", revision: 1, command: sessionCommand{kind: sessionCommandGoal, goal: goalCommand{action: goalCommandResume}}}
+	server.outstanding++
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	runDone := make(chan struct{})
+	go func() {
+		server.runTurns(ctx)
+		close(runDone)
+	}()
+
+	select {
+	case command := <-provider.goalCommands:
+		if command.action != goalCommandResume {
+			t.Fatalf("recovered goal command = %#v", command)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("recovered goal did not resume")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		provider.mu.Lock()
+		prompts := append([]string(nil), provider.prompts...)
+		provider.mu.Unlock()
+		if reflect.DeepEqual(prompts, []string{"pending work"}) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("provider prompts = %#v, want pending work", prompts)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	cancel()
+	<-runDone
+}
+
+func TestSubmitClientMessageControlsActiveGoal(t *testing.T) {
+	journal := NewJournal()
+	t.Cleanup(journal.Close)
+	provider := &fakeGoalProvider{
+		goalCommands: make(chan goalCommand, 2),
+		goalStarted:  make(chan struct{}),
+		goalStopped:  make(chan struct{}),
+	}
+	server := NewServer(Config{}, journal, provider)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	runDone := make(chan struct{})
+	go func() {
+		server.runTurns(ctx)
+		close(runDone)
+	}()
+
+	if err := server.submitClientMessage(t.Context(), "/goal improve coverage", "request-goal"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-provider.goalStarted:
+	case <-time.After(time.Second):
+		t.Fatal("goal did not start")
+	}
+	if err := server.submitClientMessage(t.Context(), "/goal pause", "request-pause"); err != nil {
+		t.Fatalf("submitClientMessage() error = %v", err)
+	}
+	started := <-provider.goalCommands
+	paused := <-provider.goalCommands
+	if started.action != goalCommandCreate || paused.action != goalCommandPause {
+		t.Fatalf("goal commands = %#v, %#v", started, paused)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		events := journal.Snapshot()
+		if len(events) > 0 && events[len(events)-1].Type == EventTurnCompleted {
+			var recordedControl bool
+			var recordedFeedback bool
+			for _, event := range events {
+				if event.Type == EventUserMessage && event.RequestID == "request-pause" && event.TurnID == "" {
+					recordedControl = true
+				}
+				if event.Type == EventGoalUpdated && event.TurnID == "" {
+					recordedFeedback = true
+				}
+			}
+			if !recordedControl {
+				t.Fatalf("active goal control was not recorded: %#v", events)
+			}
+			if !recordedFeedback {
+				t.Fatalf("active goal control feedback was not recorded: %#v", events)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("goal turn did not stop after pause")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	cancel()
+	<-runDone
+}
+
+func TestSubmitClientMessageQueuesGoalCommandDuringOrdinaryTurn(t *testing.T) {
+	journal := NewJournal()
+	t.Cleanup(journal.Close)
+	resume := make(chan struct{})
+	provider := &fakeGoalProvider{
+		fakeProvider: fakeProvider{resume: resume},
+		goalCommands: make(chan goalCommand, 1),
+	}
+	server := NewServer(Config{}, journal, provider)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	runDone := make(chan struct{})
+	go func() {
+		server.runTurns(ctx)
+		close(runDone)
+	}()
+
+	if err := server.submitMessage("review this", "request-message"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		provider.mu.Lock()
+		started := len(provider.prompts) == 1
+		provider.mu.Unlock()
+		if started {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("ordinary turn did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := server.submitClientMessage(t.Context(), "/goal improve coverage", "request-goal"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case command := <-provider.goalCommands:
+		t.Fatalf("goal command ran during ordinary turn: %#v", command)
+	default:
+	}
+	server.submitMu.Lock()
+	pending := server.pendingTurn
+	server.submitMu.Unlock()
+	if pending == nil || pending.command.kind != sessionCommandGoal {
+		t.Fatalf("pending turn = %#v, want goal command", pending)
+	}
+
+	close(resume)
+	select {
+	case command := <-provider.goalCommands:
+		if command.action != goalCommandCreate || command.objective != "improve coverage" {
+			t.Fatalf("goal command = %#v", command)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued goal command did not run")
+	}
+	cancel()
+	<-runDone
+}
+
+func TestSubmitMessageRejectsGoalForOtherProviders(t *testing.T) {
+	journal := NewJournal()
+	t.Cleanup(journal.Close)
+	server := NewServer(Config{}, journal, &fakeProvider{})
+
+	err := server.submitClientMessage(t.Context(), "/goal improve coverage", "request-goal")
+	if err == nil || !strings.Contains(err.Error(), "only in Codex Sessions") {
+		t.Fatalf("submitMessage() error = %v", err)
+	}
+	if len(journal.Snapshot()) != 0 {
+		t.Fatalf("rejected goal was recorded: %#v", journal.Snapshot())
+	}
+}
+
+func TestSubmitMessageDoesNotMergeCommandsWithPendingMessages(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		first  string
+		second string
+	}{
+		{name: "command after message", first: "review this", second: "!pwd"},
+		{name: "message after command", first: "!pwd", second: "review this"},
+		{name: "command after command", first: "!pwd", second: "!git status"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			journal := NewJournal()
+			t.Cleanup(journal.Close)
+			server := NewServer(Config{}, journal, &fakeProvider{})
+			if err := server.submitClientMessage(t.Context(), test.first, "request-first"); err != nil {
+				t.Fatal(err)
+			}
+			if err := server.submitClientMessage(t.Context(), test.second, "request-second"); err == nil || !strings.Contains(err.Error(), "pending") {
+				t.Fatalf("second submit error = %v", err)
+			}
+			if events := journal.Snapshot(); len(events) != 1 || events[0].Text != test.first {
+				t.Fatalf("journal events = %#v", events)
+			}
+		})
+	}
+}
+
 func TestServerQueuesStatusPublicationAfterWorkspaceRefresh(t *testing.T) {
 	journal := NewJournal()
 	defer journal.Close()
 	server := NewServer(Config{}, journal, &fakeProvider{})
 	refreshed := make(chan struct{})
-	server.refreshWorkspaceStatus = func(context.Context) error {
+	server.refreshWorkspaceStatus = func(context.Context, bool) (WorkspaceStatus, error) {
 		close(refreshed)
-		return nil
+		return WorkspaceStatus{}, nil
 	}
-	server.publishSessionStatus = func(context.Context, bool) error { return nil }
+	server.publishSessionStatus = func(context.Context, bool, bool) error { return nil }
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go server.runWorkspaceStatusRefreshes(ctx)
@@ -200,7 +929,7 @@ func TestServerQueuesStatusPublicationAfterWorkspaceRefresh(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("initial Session status publication was not requested")
 	}
-	server.requestWorkspaceStatusRefresh()
+	server.requestWorkspaceStatusRefresh(true)
 	select {
 	case <-refreshed:
 	case <-time.After(time.Second):
@@ -222,6 +951,10 @@ func TestServerQueuesStatusPublicationAfterWorkspaceRefresh(t *testing.T) {
 func TestPublishObservedSessionStatusPublishesActivityWhenWorkspaceReadFails(t *testing.T) {
 	readErr := errors.New("workspace unavailable")
 	var got ObservedSessionStatus
+	// A failing workspace inspection must not surface as an error: doing so would
+	// retain the status-publish queue entry and wedge the idle-drain handshake even
+	// though the Active condition was durably published. Only the publisher's own
+	// error should gate retries.
 	err := publishObservedSessionStatus(
 		context.Background(),
 		func(_ context.Context, status ObservedSessionStatus) error {
@@ -229,15 +962,32 @@ func TestPublishObservedSessionStatusPublishesActivityWhenWorkspaceReadFails(t *
 			return nil
 		},
 		true,
+		true,
+		"gpt-5.6-sol",
 		func(context.Context) (WorkspaceStatus, error) {
 			return WorkspaceStatus{}, readErr
 		},
 	)
-	if !errors.Is(err, readErr) {
-		t.Fatalf("publishObservedSessionStatus() error = %v, want %v", err, readErr)
+	if err != nil {
+		t.Fatalf("publishObservedSessionStatus() error = %v, want nil so the drain can advance", err)
 	}
-	if !got.Active || got.WorkspaceStatus != nil {
-		t.Fatalf("published Session status = %#v, want active with unobserved workspace", got)
+	if !got.Active || !got.WaitingForInput || got.Model != "gpt-5.6-sol" || got.WorkspaceStatus != nil {
+		t.Fatalf("published Session status = %#v, want active model with unobserved workspace", got)
+	}
+}
+
+func TestPublishObservedSessionStatusReturnsPublisherError(t *testing.T) {
+	publishErr := errors.New("api unavailable")
+	err := publishObservedSessionStatus(
+		context.Background(),
+		func(context.Context, ObservedSessionStatus) error { return publishErr },
+		true,
+		false,
+		"gpt-5.6-sol",
+		func(context.Context) (WorkspaceStatus, error) { return WorkspaceStatus{}, nil },
+	)
+	if !errors.Is(err, publishErr) {
+		t.Fatalf("publishObservedSessionStatus() error = %v, want %v", err, publishErr)
 	}
 }
 
@@ -249,7 +999,7 @@ func TestServerRetriesSessionStatusPublicationInOrder(t *testing.T) {
 	server.sessionStatusPublishInterval = time.Hour
 	attempts := 0
 	activity := make(chan bool, 3)
-	server.publishSessionStatus = func(_ context.Context, active bool) error {
+	server.publishSessionStatus = func(_ context.Context, active, _ bool) error {
 		attempts++
 		activity <- active
 		if attempts == 1 {
@@ -267,22 +1017,105 @@ func TestServerRetriesSessionStatusPublicationInOrder(t *testing.T) {
 	assertActivity(t, activity, false)
 }
 
-func TestServerRefreshesWorkspaceStatusAfterPeriodicPublication(t *testing.T) {
+func TestServerRefreshesWorkspaceStatusPeriodically(t *testing.T) {
 	journal := NewJournal()
 	defer journal.Close()
 	server := NewServer(Config{}, journal, &fakeProvider{})
-	server.sessionStatusRetryInterval = time.Hour
+	server.workspaceStatusRefreshInterval = 10 * time.Millisecond
+	refreshed := make(chan bool, 1)
+	server.refreshWorkspaceStatus = func(_ context.Context, forceDiscovery bool) (WorkspaceStatus, error) {
+		select {
+		case refreshed <- forceDiscovery:
+		default:
+		}
+		return WorkspaceStatus{}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go server.runWorkspaceStatusRefreshes(ctx)
+
+	select {
+	case forceDiscovery := <-refreshed:
+		if forceDiscovery {
+			t.Fatal("periodic workspace status refresh forced pull request discovery")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("workspace status was not refreshed periodically")
+	}
+}
+
+func TestPeriodicSessionStatusPublicationDoesNotRefreshWorkspace(t *testing.T) {
+	journal := NewJournal()
+	defer journal.Close()
+	server := NewServer(Config{}, journal, &fakeProvider{})
 	server.sessionStatusPublishInterval = 10 * time.Millisecond
-	server.publishSessionStatus = func(context.Context, bool) error { return nil }
-	server.refreshWorkspaceStatus = func(context.Context) error { return nil }
+	published := make(chan struct{}, 1)
+	server.publishSessionStatus = func(context.Context, bool, bool) error {
+		published <- struct{}{}
+		return nil
+	}
+	server.refreshWorkspaceStatus = func(context.Context, bool) (WorkspaceStatus, error) {
+		t.Fatal("periodic Session status publication refreshed workspace status")
+		return WorkspaceStatus{}, nil
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go server.runSessionStatusPublishes(ctx)
 
 	select {
-	case <-server.workspaceStatusRefreshes:
+	case <-published:
 	case <-time.After(time.Second):
-		t.Fatal("periodic workspace status publication did not request a refresh")
+		t.Fatal("Session status was not published periodically")
+	}
+	select {
+	case <-server.workspaceStatusRefreshes:
+		t.Fatal("periodic Session status publication queued a workspace refresh")
+	default:
+	}
+}
+
+func TestWorkspaceStatusRefreshDelay(t *testing.T) {
+	server := NewServer(Config{}, NewJournal(), &fakeProvider{})
+	t.Cleanup(server.journal.Close)
+	server.workspaceStatusRefreshInterval = 5 * time.Minute
+	server.activeWorkspaceStatusRefreshInterval = 30 * time.Second
+
+	tests := []struct {
+		name   string
+		status WorkspaceStatus
+		want   time.Duration
+	}{
+		{name: "no pull request", want: 5 * time.Minute},
+		{
+			name: "queued pull request",
+			status: WorkspaceStatus{PullRequest: &kelos.SessionPullRequest{
+				State: kelos.SessionPullRequestStateQueued,
+			}},
+			want: 30 * time.Second,
+		},
+		{
+			name: "pending checks",
+			status: WorkspaceStatus{PullRequest: &kelos.SessionPullRequest{
+				State:  kelos.SessionPullRequestStateOpen,
+				Checks: &kelos.SessionPullRequestChecks{State: kelos.SessionPullRequestChecksStatePending, Total: 1},
+			}},
+			want: 30 * time.Second,
+		},
+		{
+			name: "successful checks",
+			status: WorkspaceStatus{PullRequest: &kelos.SessionPullRequest{
+				State:  kelos.SessionPullRequestStateOpen,
+				Checks: &kelos.SessionPullRequestChecks{State: kelos.SessionPullRequestChecksStateSuccess, Completed: 1, Total: 1},
+			}},
+			want: 5 * time.Minute,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := server.workspaceStatusRefreshDelay(tt.status); got != tt.want {
+				t.Fatalf("workspaceStatusRefreshDelay() = %s, want %s", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -293,7 +1126,7 @@ func TestRunTurnPublishesActivityTransitions(t *testing.T) {
 	server := NewServer(Config{}, journal, provider)
 	server.sessionStatusPublishInterval = time.Hour
 	activity := make(chan bool, 2)
-	server.publishSessionStatus = func(_ context.Context, active bool) error {
+	server.publishSessionStatus = func(_ context.Context, active, _ bool) error {
 		activity <- active
 		return nil
 	}
@@ -322,7 +1155,7 @@ func TestRunTurnPreservesShortActivityTransitions(t *testing.T) {
 	server := NewServer(Config{}, journal, &fakeProvider{})
 	server.sessionStatusPublishInterval = time.Hour
 	activity := make(chan bool, 2)
-	server.publishSessionStatus = func(_ context.Context, active bool) error {
+	server.publishSessionStatus = func(_ context.Context, active, _ bool) error {
 		activity <- active
 		return nil
 	}
@@ -334,6 +1167,71 @@ func TestRunTurnPreservesShortActivityTransitions(t *testing.T) {
 
 	assertActivity(t, activity, true)
 	assertActivity(t, activity, false)
+}
+
+func TestRequestInputPublishesWaitingForInputTransitions(t *testing.T) {
+	journal := NewJournal()
+	defer journal.Close()
+	server := NewServer(Config{}, journal, &fakeProvider{})
+	server.sessionStatusPublishInterval = time.Hour
+	type publishedStatus struct {
+		active          bool
+		waitingForInput bool
+	}
+	statuses := make(chan publishedStatus, 2)
+	server.publishSessionStatus = func(_ context.Context, active, waitingForInput bool) error {
+		statuses <- publishedStatus{active: active, waitingForInput: waitingForInput}
+		return nil
+	}
+	server.activeMu.Lock()
+	server.activeTurn = "turn-1"
+	server.activeMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go server.runSessionStatusPublishes(ctx)
+
+	type inputResult struct {
+		answers map[string][]string
+		err     error
+	}
+	result := make(chan inputResult, 1)
+	go func() {
+		answers, err := (&turnSink{server: server, turnID: "turn-1"}).RequestInput(ctx, InputRequest{
+			ID: "claude-request-1",
+			Questions: []InputQuestion{{
+				ID:       "question-1",
+				Question: "Which database?",
+			}},
+		})
+		result <- inputResult{answers: answers, err: err}
+	}()
+
+	assertStatus := func(want publishedStatus) {
+		t.Helper()
+		select {
+		case got := <-statuses:
+			if got != want {
+				t.Fatalf("published Session status = %#v, want %#v", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("Session status %#v was not published", want)
+		}
+	}
+	assertStatus(publishedStatus{active: true, waitingForInput: true})
+
+	if err := server.resolveInput("claude-request-1", map[string][]string{"question-1": {"PostgreSQL"}}, false, "response-1"); err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(publishedStatus{active: true, waitingForInput: false})
+	select {
+	case got := <-result:
+		if got.err != nil || !reflect.DeepEqual(got.answers, map[string][]string{"question-1": {"PostgreSQL"}}) {
+			t.Fatalf("input result = %#v, want PostgreSQL answer", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("input request did not finish")
+	}
 }
 
 func assertActivity(t *testing.T, activity <-chan bool, want bool) {
@@ -435,6 +1333,39 @@ func TestServerSubmitsInitialPromptOnlyWithoutHistory(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+}
+
+func TestServerTreatsCommandLikeInitialPromptsAsMessages(t *testing.T) {
+	for _, prompt := range []string{"![diagram](image.png)", "!", "/goal edit"} {
+		t.Run(prompt, func(t *testing.T) {
+			journal := NewJournal()
+			t.Cleanup(journal.Close)
+			provider := &fakeProvider{}
+			server := NewServer(Config{InitialPrompt: prompt}, journal, provider)
+
+			if err := server.deliverInitialPrompt(); err != nil {
+				t.Fatalf("deliverInitialPrompt() error = %v", err)
+			}
+			turn := <-server.turns
+			<-turn.accepted
+			turn, ok := server.takePendingTurn(turn)
+			if !ok {
+				t.Fatal("initial prompt was not pending")
+			}
+			server.runTurn(t.Context(), turn)
+
+			provider.mu.Lock()
+			prompts := append([]string(nil), provider.prompts...)
+			provider.mu.Unlock()
+			if !reflect.DeepEqual(prompts, []string{prompt}) {
+				t.Fatalf("provider prompts = %#v, want %#v", prompts, []string{prompt})
+			}
+			events := journal.Snapshot()
+			if len(events) == 0 || events[0].Type != EventUserMessage || events[0].SessionCommand {
+				t.Fatalf("initial prompt event = %#v", events)
+			}
+		})
+	}
 }
 
 func TestServerHealthWaitsForInitialPromptSubmission(t *testing.T) {
@@ -772,6 +1703,348 @@ func TestServerInterruptsActiveTurn(t *testing.T) {
 	}
 }
 
+func TestServerGracefullyInterruptsDrainingTurn(t *testing.T) {
+	journal := NewJournal()
+	defer journal.Close()
+	provider := &interruptProvider{
+		started:     make(chan struct{}),
+		interrupted: make(chan struct{}),
+		done:        make(chan struct{}),
+	}
+	defer provider.Close()
+	server := NewServer(Config{PodUID: types.UID("pod-uid")}, journal, provider)
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() {
+		server.runTurns(ctx)
+		close(runDone)
+	}()
+	if err := server.submitMessage("work", "request-work"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-provider.started:
+	case <-time.After(time.Second):
+		t.Fatal("provider turn did not start")
+	}
+	podUID := server.config.PodUID
+	request := sessionupdate.NewRequest(podUID, "desired-revision")
+	encoded, err := sessionupdate.Encode(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.observeSessionUpdate(&kelos.Session{ObjectMeta: metav1.ObjectMeta{
+		Annotations: map[string]string{sessionupdate.RequestAnnotation: encoded},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.interruptTurn(t.Context(), "request-interrupt"); err != nil {
+		t.Fatalf("interruptTurn() error = %v", err)
+	}
+	select {
+	case <-provider.interrupted:
+	default:
+		t.Fatal("draining interruption did not call the provider")
+	}
+	select {
+	case <-provider.done:
+		t.Fatal("graceful draining interruption recycled the provider")
+	default:
+	}
+	report, _ := server.sessionDrainReports()
+	if report == nil || report.Phase != sessionupdate.PhaseDrained {
+		t.Fatalf("runtime update report = %#v, want Drained", report)
+	}
+	cancel()
+	<-runDone
+}
+
+func TestServerForcesStuckInterruptAfterTimeout(t *testing.T) {
+	for _, test := range []struct {
+		name                   string
+		acknowledge            bool
+		ignoreInterruptContext bool
+		interruptErr           error
+	}{
+		{name: "interrupt request does not return"},
+		{name: "interrupt request ignores cancellation", ignoreInterruptContext: true},
+		{name: "interrupt request fails", interruptErr: errors.New("interrupt failed")},
+		{name: "turn does not finish after interrupt", acknowledge: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server, provider, turnDone := startStuckInterruptServer(t, test.acknowledge)
+			provider.ignoreInterruptContext = test.ignoreInterruptContext
+			provider.interruptErr = test.interruptErr
+			server.interruptTimeout = 20 * time.Millisecond
+			if err := server.interruptTurn(t.Context(), "request-interrupt"); err != nil {
+				t.Fatalf("interruptTurn() error = %v", err)
+			}
+			assertStuckTurnInterrupted(t, server, provider, turnDone)
+			select {
+			case <-provider.interruptCalled:
+			default:
+				t.Fatal("provider interrupt was not attempted before timeout recovery")
+			}
+		})
+	}
+}
+
+func TestServerCompletesAcceptedInterruptAfterClientDisconnect(t *testing.T) {
+	server, provider, turnDone := startStuckInterruptServer(t, false)
+	server.interruptTimeout = 20 * time.Millisecond
+	serverConnection, clientConnection := net.Pipe()
+	connectionDone := make(chan struct{})
+	go func() {
+		server.handleConnection(t.Context(), serverConnection)
+		close(connectionDone)
+	}()
+	if err := json.NewEncoder(clientConnection).Encode(ClientRequest{Type: "interrupt", RequestID: "request-interrupt"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-provider.interruptCalled:
+	case <-time.After(time.Second):
+		t.Fatal("provider interrupt was not attempted")
+	}
+	if err := clientConnection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertStuckTurnInterrupted(t, server, provider, turnDone)
+	select {
+	case <-connectionDone:
+	case <-time.After(time.Second):
+		t.Fatal("disconnected client handler did not finish")
+	}
+}
+
+func TestServerCancelsInterruptWhenRuntimeStops(t *testing.T) {
+	server, provider, _ := startStuckInterruptServer(t, false)
+	defer provider.Close()
+	server.interruptTimeout = time.Second
+	runtimeCtx, cancelRuntime := context.WithCancel(context.Background())
+	interruptDone := make(chan error, 1)
+	go func() {
+		interruptDone <- server.interruptTurn(runtimeCtx, "request-interrupt")
+	}()
+	select {
+	case <-provider.interruptCalled:
+	case <-time.After(time.Second):
+		t.Fatal("provider interrupt was not attempted")
+	}
+	cancelRuntime()
+	select {
+	case err := <-interruptDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("interruptTurn() error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runtime shutdown did not cancel provider interruption")
+	}
+	select {
+	case <-provider.done:
+		t.Fatal("runtime cancellation forced provider recovery")
+	default:
+	}
+}
+
+func TestServerDoesNotInterruptNextTurnWhenCompletionRacesWithInterrupt(t *testing.T) {
+	journal := NewJournal()
+	defer journal.Close()
+	provider := &turnCompletionRaceProvider{
+		firstStarted:    make(chan struct{}),
+		secondStarted:   make(chan struct{}),
+		finishFirst:     make(chan struct{}),
+		interruptCalled: make(chan struct{}),
+		finishInterrupt: make(chan struct{}),
+		done:            make(chan struct{}),
+	}
+	defer provider.Close()
+	server := NewServer(Config{}, journal, provider)
+	if err := server.submitMessage("first", "request-first"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() {
+		server.runTurns(ctx)
+		close(runDone)
+	}()
+	select {
+	case <-provider.firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first provider turn did not start")
+	}
+	if err := server.submitMessage("second", "request-second"); err != nil {
+		t.Fatal(err)
+	}
+	interruptDone := make(chan error, 1)
+	go func() {
+		interruptDone <- server.interruptTurn(t.Context(), "request-interrupt")
+	}()
+	select {
+	case <-provider.interruptCalled:
+	case <-time.After(time.Second):
+		t.Fatal("provider interrupt was not attempted")
+	}
+	close(provider.finishFirst)
+	select {
+	case <-provider.secondStarted:
+		t.Fatal("second turn started while the first turn interruption was still pending")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(provider.finishInterrupt)
+	if err := <-interruptDone; err != nil {
+		t.Fatalf("interruptTurn() error = %v", err)
+	}
+	select {
+	case <-provider.secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("second provider turn did not start after interruption settled")
+	}
+	cancel()
+	<-runDone
+}
+
+func TestServerPreservesPendingTurnAcrossForcedProviderRestart(t *testing.T) {
+	server, provider, turnDone := startStuckInterruptServer(t, false)
+	server.interruptTimeout = 20 * time.Millisecond
+	if err := server.submitMessage("pending work", "request-pending"); err != nil {
+		t.Fatal(err)
+	}
+	podUID := server.config.PodUID
+	request := sessionupdate.NewRequest(podUID, "desired-revision")
+	encoded, err := sessionupdate.Encode(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.observeSessionUpdate(&kelos.Session{ObjectMeta: metav1.ObjectMeta{
+		Annotations: map[string]string{sessionupdate.RequestAnnotation: encoded},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.interruptTurn(t.Context(), "request-interrupt"); err != nil {
+		t.Fatalf("interruptTurn() error = %v", err)
+	}
+	assertStuckTurnInterrupted(t, server, provider, turnDone)
+	if report, _ := server.sessionDrainReports(); report == nil || report.Phase != sessionupdate.PhaseDraining {
+		t.Fatalf("runtime update report = %#v, want Draining while pending work remains", report)
+	}
+
+	recovery, err := recoverJournal(server.journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovery.pendingTurn == nil || recovery.pendingTurn.id != "turn-2" || recovery.pendingTurn.text != "pending work" {
+		t.Fatalf("recovered pending turn = %#v", recovery.pendingTurn)
+	}
+	restartedProvider := &fakeProvider{}
+	restarted := NewServer(Config{}, server.journal, restartedProvider)
+	if err := restarted.restoreTurn(recovery.pendingTurn); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() {
+		restarted.runTurns(ctx)
+		close(runDone)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		restartedProvider.mu.Lock()
+		prompts := append([]string(nil), restartedProvider.prompts...)
+		restartedProvider.mu.Unlock()
+		if reflect.DeepEqual(prompts, []string{"pending work"}) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("provider prompts = %v, want pending work", prompts)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	<-runDone
+}
+
+func TestServerStopsAcceptingAndDispatchingTurnsWhileProviderRestarts(t *testing.T) {
+	journal := NewJournal()
+	defer journal.Close()
+	provider := &fakeProvider{}
+	server := NewServer(Config{}, journal, provider)
+	accepted := make(chan struct{})
+	close(accepted)
+	server.turns <- turnRequest{id: "turn-1", text: "pending work", accepted: accepted}
+	server.providerStopping.Store(true)
+
+	runDone := make(chan struct{})
+	go func() {
+		server.runTurns(t.Context())
+		close(runDone)
+	}()
+	select {
+	case <-runDone:
+	case <-time.After(time.Second):
+		t.Fatal("turn dispatcher did not stop")
+	}
+	if len(server.turns) != 1 {
+		t.Fatalf("pending turns = %d, want 1", len(server.turns))
+	}
+	if err := server.submitMessage("late work", "request-late"); err == nil || !strings.Contains(err.Error(), "restarting") {
+		t.Fatalf("submitMessage() error = %v, want provider restart rejection", err)
+	}
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	if len(provider.prompts) != 0 {
+		t.Fatalf("provider prompts = %v, want none", provider.prompts)
+	}
+}
+
+func startStuckInterruptServer(t *testing.T, acknowledge bool) (*Server, *stuckInterruptProvider, <-chan struct{}) {
+	t.Helper()
+	journal := NewJournal()
+	t.Cleanup(journal.Close)
+	provider := &stuckInterruptProvider{
+		started:         make(chan struct{}),
+		interruptCalled: make(chan struct{}),
+		runStopped:      make(chan struct{}),
+		done:            make(chan struct{}),
+		acknowledge:     acknowledge,
+	}
+	server := NewServer(Config{PodUID: types.UID("pod-uid")}, journal, provider)
+	if err := server.submitMessage("work", "request-work"); err != nil {
+		t.Fatal(err)
+	}
+	turnDone := make(chan struct{})
+	go func() {
+		server.runTurns(t.Context())
+		close(turnDone)
+	}()
+	select {
+	case <-provider.started:
+	case <-time.After(time.Second):
+		t.Fatal("provider turn did not start")
+	}
+	return server, provider, turnDone
+}
+
+func assertStuckTurnInterrupted(t *testing.T, server *Server, provider *stuckInterruptProvider, turnDone <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-turnDone:
+	case <-time.After(time.Second):
+		t.Fatal("forced interruption did not finish the turn")
+	}
+	select {
+	case <-provider.done:
+	default:
+		t.Fatal("stuck provider was not closed")
+	}
+	events := server.journal.Snapshot()
+	assertEventTypes(t, events, EventTurnInterrupting, EventTurnCompleted)
+	if completion := events[len(events)-1]; completion.Type != EventTurnCompleted || completion.Status != "interrupted" {
+		t.Fatalf("turn completion = %#v, want interrupted", completion)
+	}
+}
+
 func TestServerRecoversActiveTurnAfterShutdown(t *testing.T) {
 	journal := NewJournal()
 	defer journal.Close()
@@ -865,7 +2138,7 @@ func TestSubmitMessageDoesNotStartProviderWhenJournalWriteFails(t *testing.T) {
 	}
 }
 
-func TestServerSerializesConcurrentMessageAcceptance(t *testing.T) {
+func TestServerSerializesConcurrentPendingMessageUpdates(t *testing.T) {
 	journal := NewJournal()
 	defer journal.Close()
 	server := NewServer(Config{}, journal, &fakeProvider{})
@@ -874,11 +2147,11 @@ func TestServerSerializesConcurrentMessageAcceptance(t *testing.T) {
 	secondAppending := make(chan struct{})
 	appendMessage := server.appendMessage
 	server.appendMessage = func(event Event) error {
-		switch event.Text {
-		case "first":
+		switch event.RequestID {
+		case "request-first":
 			close(firstAppending)
 			<-releaseFirst
-		case "second":
+		case "request-second":
 			close(secondAppending)
 		}
 		return appendMessage(event)
@@ -916,14 +2189,16 @@ func TestServerSerializesConcurrentMessageAcceptance(t *testing.T) {
 	}
 
 	events := journal.Snapshot()
-	assertEventTypes(t, events, EventUserMessage, EventUserMessage)
-	if events[0].Text != "first" || events[1].Text != "second" {
+	assertEventTypes(t, events, EventUserMessage, EventUserMessageUpdated)
+	if events[0].Text != "first" || events[1].Text != "first\n\nsecond" {
 		t.Fatalf("message order = %q, %q", events[0].Text, events[1].Text)
 	}
-	firstTurn := <-server.turns
-	secondTurn := <-server.turns
-	if firstTurn.text != "first" || secondTurn.text != "second" {
-		t.Fatalf("turn order = %q, %q", firstTurn.text, secondTurn.text)
+	pending, exists := server.takePendingTurn(<-server.turns)
+	if !exists {
+		t.Fatal("pending turn was not available")
+	}
+	if pending.text != "first\n\nsecond" || len(server.turns) != 0 {
+		t.Fatalf("pending turn = %#v, remaining turns %d", pending, len(server.turns))
 	}
 }
 
@@ -948,13 +2223,13 @@ func TestServerDrainsAcceptedTurnsBeforeRuntimeUpdate(t *testing.T) {
 	if err := server.submitMessage("second", "request-second"); err == nil || !strings.Contains(err.Error(), "draining") {
 		t.Fatalf("submitMessage() error = %v, want draining rejection", err)
 	}
-	report := server.sessionRuntimeUpdateReport()
+	report, _ := server.sessionDrainReports()
 	if report == nil || report.RequestID != request.ID || report.PodUID != podUID || report.Phase != sessionupdate.PhaseDraining {
 		t.Fatalf("runtime update report = %#v", report)
 	}
 
 	server.finishTurn()
-	report = server.sessionRuntimeUpdateReport()
+	report, _ = server.sessionDrainReports()
 	if report == nil || report.Phase != sessionupdate.PhaseDrained {
 		t.Fatalf("runtime update report after finishing turn = %#v", report)
 	}
@@ -963,6 +2238,311 @@ func TestServerDrainsAcceptedTurnsBeforeRuntimeUpdate(t *testing.T) {
 	}
 	if err := server.submitMessage("after update cancelled", "request-after"); err != nil {
 		t.Fatalf("submitMessage() after cancelling drain error = %v", err)
+	}
+}
+
+func TestServerDrainsAcceptedTurnsBeforeIdleReap(t *testing.T) {
+	journal := NewJournal()
+	defer journal.Close()
+	podUID := types.UID("pod-uid")
+	server := NewServer(Config{PodUID: podUID}, journal, &fakeProvider{})
+	if err := server.submitMessage("first", "request-first"); err != nil {
+		t.Fatal(err)
+	}
+	request := sessionupdate.NewRequest(podUID, "idle")
+	encoded, err := sessionupdate.Encode(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.observeSessionUpdate(&kelos.Session{ObjectMeta: metav1.ObjectMeta{
+		Annotations: map[string]string{sessionupdate.IdleDrainRequestAnnotation: encoded},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.submitMessage("second", "request-second"); err == nil || !strings.Contains(err.Error(), "reclaimed") {
+		t.Fatalf("submitMessage() error = %v, want idle reclamation rejection", err)
+	}
+	_, report := server.sessionDrainReports()
+	if report == nil || report.RequestID != request.ID || report.PodUID != podUID || report.Phase != sessionupdate.PhaseDraining {
+		t.Fatalf("idle drain report = %#v", report)
+	}
+
+	server.finishTurn()
+	if _, report = server.sessionDrainReports(); report == nil || report.Phase != sessionupdate.PhaseDrained {
+		t.Fatalf("idle drain report after finishing turn = %#v", report)
+	}
+}
+
+// TestServerWithholdsIdleDrainUntilActivityPublished verifies that the runtime
+// does not report Drained while a turn's activity status update is still queued
+// for publication, so the controller cannot delete the Session against a stale
+// Active=False state.
+func TestServerWithholdsIdleDrainUntilActivityPublished(t *testing.T) {
+	journal := NewJournal()
+	defer journal.Close()
+	podUID := types.UID("pod-uid")
+	server := NewServer(Config{PodUID: podUID}, journal, &fakeProvider{})
+	// A configured status publisher means activity transitions must be durably
+	// published before the runtime reports Drained.
+	server.publishSessionStatus = func(context.Context, bool, bool) error { return nil }
+
+	if err := server.submitMessage("first", "request-first"); err != nil {
+		t.Fatal(err)
+	}
+	request := sessionupdate.NewRequest(podUID, "idle-period")
+	encoded, err := sessionupdate.Encode(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.observeSessionUpdate(&kelos.Session{ObjectMeta: metav1.ObjectMeta{
+		Annotations: map[string]string{sessionupdate.IdleDrainRequestAnnotation: encoded},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The turn finished, but its Active=False status update is still queued, so
+	// the runtime must report Draining rather than Drained.
+	server.finishTurn()
+	server.sessionStatusPublishQueue = []sessionStatusPublishRequest{{active: false}}
+	if _, report := server.sessionDrainReports(); report == nil || report.Phase != sessionupdate.PhaseDraining {
+		t.Fatalf("idle drain report with a pending status publish = %#v, want Draining", report)
+	}
+
+	// Once the queued activity has been durably published, the runtime reports Drained.
+	server.sessionStatusPublishQueue = nil
+	if _, report := server.sessionDrainReports(); report == nil || report.Phase != sessionupdate.PhaseDrained {
+		t.Fatalf("idle drain report after publish = %#v, want Drained", report)
+	}
+}
+
+// TestServerWithholdsIdleDrainAfterRecoveringInterruptedWork verifies that a
+// runtime which recovered interrupted in-flight work from its journal seeds an
+// activity publish and withholds an idle-drain Drained report until that
+// recovered activity is durably published. A container restart preserves the Pod
+// UID and any pending idle-drain request while resetting the in-memory
+// outstanding-turn count and publish queue, so without this seed the restarted
+// runtime could report Drained against a stale Active=False status and let the
+// controller delete the Session despite the recovered activity.
+func TestServerWithholdsIdleDrainAfterRecoveringInterruptedWork(t *testing.T) {
+	journal := NewJournal()
+	defer journal.Close()
+	// An in-flight turn that never completed represents work interrupted by a restart.
+	if err := journal.Append(Event{Type: EventUserMessage, RequestID: "request-first", TurnID: "turn-1", Text: "work"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.Append(Event{Type: EventTurnStarted, TurnID: "turn-1", Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	recovery, err := recoverJournal(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The interrupted turn is unsettled activity relative to a zero high-water mark.
+	if !recovery.hasUnsettledActivity(0) {
+		t.Fatal("recoverJournal() did not report unsettled activity for an in-flight turn")
+	}
+
+	podUID := types.UID("pod-uid")
+	server := NewServer(Config{PodUID: podUID}, journal, &fakeProvider{})
+	// A configured status publisher means recovered activity must be durably
+	// published before the runtime reports Drained.
+	server.publishSessionStatus = func(context.Context, bool, bool) error { return nil }
+	server.seedRecoveredActivityPublish()
+
+	request := sessionupdate.NewRequest(podUID, "idle-period")
+	encoded, err := sessionupdate.Encode(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.observeSessionUpdate(&kelos.Session{ObjectMeta: metav1.ObjectMeta{
+		Annotations: map[string]string{sessionupdate.IdleDrainRequestAnnotation: encoded},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The recovered activity publish is still queued, so the runtime reports Draining
+	// even though no turn is in flight (outstanding is zero after the restart).
+	if _, report := server.sessionDrainReports(); report == nil || report.Phase != sessionupdate.PhaseDraining {
+		t.Fatalf("idle drain report before publishing recovered activity = %#v, want Draining", report)
+	}
+
+	// Once the recovered activity has been durably published, the runtime reports Drained.
+	server.completeSessionStatusPublish()
+	if _, report := server.sessionDrainReports(); report == nil || report.Phase != sessionupdate.PhaseDrained {
+		t.Fatalf("idle drain report after publishing recovered activity = %#v, want Drained", report)
+	}
+}
+
+// TestServerWithholdsIdleDrainForUnpublishedCompletedTurn verifies the
+// completed-turn restart case: a turn can finish and be recorded in the journal
+// while its ordered Active status publications are still retrying. If the
+// container restarts then, recovery finds no interrupted work, but the completed
+// turn's ID still exceeds the durably-settled high-water mark, so the runtime must
+// republish activity and withhold Drained until it is published rather than
+// acknowledging a drain against the stale Active=False status.
+func TestServerWithholdsIdleDrainForUnpublishedCompletedTurn(t *testing.T) {
+	journal := NewJournal()
+	defer journal.Close()
+	for _, event := range []Event{
+		{Type: EventUserMessage, RequestID: "request-first", TurnID: "turn-1", Text: "work"},
+		{Type: EventTurnStarted, TurnID: "turn-1", Status: "running"},
+		{Type: EventTurnCompleted, TurnID: "turn-1", Status: "completed"},
+	} {
+		if err := journal.Append(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recovery, err := recoverJournal(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovery.nextTurnID != 1 {
+		t.Fatalf("recovery.nextTurnID = %d, want 1", recovery.nextTurnID)
+	}
+	// The completed turn was never durably settled (marker is zero), so it counts
+	// as unsettled activity even though no work was interrupted.
+	if !recovery.hasUnsettledActivity(0) {
+		t.Fatal("expected unsettled activity for an unpublished completed turn")
+	}
+	// Had its idle status been durably published (marker advanced to the turn ID),
+	// a restart would not re-seed and reset the idle clock.
+	if recovery.hasUnsettledActivity(1) {
+		t.Fatal("a settled completed turn must not count as unsettled activity")
+	}
+
+	podUID := types.UID("pod-uid")
+	server := NewServer(Config{PodUID: podUID}, journal, &fakeProvider{})
+	server.publishSessionStatus = func(context.Context, bool, bool) error { return nil }
+	server.nextTurnID.Store(recovery.nextTurnID)
+	server.seedRecoveredActivityPublish()
+
+	request := sessionupdate.NewRequest(podUID, "idle-period")
+	encoded, err := sessionupdate.Encode(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.observeSessionUpdate(&kelos.Session{ObjectMeta: metav1.ObjectMeta{
+		Annotations: map[string]string{sessionupdate.IdleDrainRequestAnnotation: encoded},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, report := server.sessionDrainReports(); report == nil || report.Phase != sessionupdate.PhaseDraining {
+		t.Fatalf("idle drain report before publishing recovered activity = %#v, want Draining", report)
+	}
+	server.completeSessionStatusPublish()
+	if _, report := server.sessionDrainReports(); report == nil || report.Phase != sessionupdate.PhaseDrained {
+		t.Fatalf("idle drain report after publishing recovered activity = %#v, want Drained", report)
+	}
+}
+
+// TestServerRecordsSettledActivityFromRequestSnapshot verifies that the activity
+// publication high-water mark advances (and is persisted) only from an idle
+// (Active=False) request's own captured snapshot, never from an active request.
+func TestServerRecordsSettledActivityFromRequestSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	journal := NewJournal()
+	defer journal.Close()
+	server := NewServer(Config{StateDir: dir}, journal, &fakeProvider{})
+
+	// An Active=True publication never settles activity, whatever its snapshot.
+	server.recordSettledActivity(sessionStatusPublishRequest{active: true, settledTurnID: 3})
+	if got := server.settledTurnID.Load(); got != 0 {
+		t.Fatalf("settledTurnID after active publish = %d, want 0", got)
+	}
+
+	// An idle publication records the high-water mark carried by that request.
+	server.recordSettledActivity(sessionStatusPublishRequest{active: false, settledTurnID: 3})
+	if got := server.settledTurnID.Load(); got != 3 {
+		t.Fatalf("settledTurnID after idle publish = %d, want 3", got)
+	}
+	persisted, err := loadSettledTurnID(server.activityMarkerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted != 3 {
+		t.Fatalf("persisted settledTurnID = %d, want 3", persisted)
+	}
+
+	// A later idle publication carrying a lower snapshot never regresses the mark.
+	server.recordSettledActivity(sessionStatusPublishRequest{active: false, settledTurnID: 2})
+	if got := server.settledTurnID.Load(); got != 3 {
+		t.Fatalf("settledTurnID after stale idle publish = %d, want 3", got)
+	}
+}
+
+// TestServerDoesNotSettleLaterTurnFromStaleIdlePublication reproduces the race
+// where a stale idle or periodic publication succeeds only after a later turn has
+// started and finished. Because each request carries the completed-turn snapshot
+// from when it was enqueued, completing the stale publication must not settle the
+// later turn whose own Active publications are still queued.
+func TestServerDoesNotSettleLaterTurnFromStaleIdlePublication(t *testing.T) {
+	dir := t.TempDir()
+	journal := NewJournal()
+	defer journal.Close()
+	server := NewServer(Config{StateDir: dir}, journal, &fakeProvider{})
+
+	// Turns 1-5 are complete and a periodic idle publication was enqueued then.
+	server.completedTurnID.Store(5)
+	server.publishSessionStatus = func(context.Context, bool, bool) error { return nil }
+	server.requestPeriodicSessionStatusPublish()
+	stale, ok := server.nextSessionStatusPublish()
+	if !ok || stale.active || stale.settledTurnID != 5 {
+		t.Fatalf("stale idle request = %#v, ok=%v, want idle snapshot 5", stale, ok)
+	}
+
+	// While that publication is in flight, a later turn starts and finishes.
+	server.markTurnCompleted("turn-6")
+
+	// Completing the in-flight stale publication settles only turn 5, not turn 6:
+	// turn 6's own Active publications have not been published yet.
+	server.recordSettledActivity(stale)
+	if got := server.settledTurnID.Load(); got != 5 {
+		t.Fatalf("settledTurnID after stale idle publish = %d, want 5", got)
+	}
+}
+
+func TestSettledTurnIDPersistenceRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), activityPublishedFile)
+	if got, err := loadSettledTurnID(path); err != nil || got != 0 {
+		t.Fatalf("loadSettledTurnID() on a missing marker = %d, %v, want 0, nil", got, err)
+	}
+	if err := writeSettledTurnID(path, 7); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := loadSettledTurnID(path); err != nil || got != 7 {
+		t.Fatalf("loadSettledTurnID() = %d, %v, want 7, nil", got, err)
+	}
+}
+
+// TestServerRuntimeUpdateDrainIgnoresPendingPublishes verifies that a
+// runtime-update drain reports Drained as soon as no turn is in flight, without
+// waiting for queued activity publications: the Pod is replaced and recovers
+// from the journal, so an unpublished transition is not lost, and gating the
+// replacement on a wedged status publisher would needlessly stall the update.
+func TestServerRuntimeUpdateDrainIgnoresPendingPublishes(t *testing.T) {
+	journal := NewJournal()
+	defer journal.Close()
+	podUID := types.UID("pod-uid")
+	server := NewServer(Config{PodUID: podUID}, journal, &fakeProvider{})
+	server.publishSessionStatus = func(context.Context, bool, bool) error { return nil }
+
+	request := sessionupdate.NewRequest(podUID, "desired-revision")
+	encoded, err := sessionupdate.Encode(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.observeSessionUpdate(&kelos.Session{ObjectMeta: metav1.ObjectMeta{
+		Annotations: map[string]string{sessionupdate.RequestAnnotation: encoded},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A status update is still queued, but with no turn in flight the runtime
+	// must report Drained so the update can proceed.
+	server.sessionStatusPublishQueue = []sessionStatusPublishRequest{{active: false}}
+	if report, _ := server.sessionDrainReports(); report == nil || report.Phase != sessionupdate.PhaseDrained {
+		t.Fatalf("runtime update report with a pending status publish = %#v, want Drained", report)
 	}
 }
 
@@ -1085,6 +2665,195 @@ func TestServerResetsHistoryForReplacedJournalWithOverlappingIDs(t *testing.T) {
 	}
 	if end.Type != EventHistoryEnd {
 		t.Fatalf("final event = %#v, want history end", end)
+	}
+}
+
+func TestServerPagesProjectedHistoryItems(t *testing.T) {
+	journal := NewJournal()
+	defer journal.Close()
+	for _, event := range []Event{
+		{Type: EventUserMessage, TurnID: "turn-1", Text: "first"},
+		{Type: EventTurnStarted, TurnID: "turn-1", Status: "running"},
+		{Type: EventAssistantDelta, TurnID: "turn-1", Text: "first "},
+		{Type: EventAssistantDelta, TurnID: "turn-1", Text: "answer"},
+		{Type: EventAssistantMessage, TurnID: "turn-1", Text: "first answer"},
+		{Type: EventTurnCompleted, TurnID: "turn-1", Status: "completed"},
+		{Type: EventUserMessage, TurnID: "turn-2", Text: "second"},
+		{Type: EventTurnStarted, TurnID: "turn-2", Status: "running"},
+		{Type: EventAssistantMessage, TurnID: "turn-2", Text: "second answer"},
+		{Type: EventTurnCompleted, TurnID: "turn-2", Status: "completed"},
+	} {
+		if err := journal.Append(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	server := &Server{journal: journal}
+	serverConnection, clientConnection := net.Pipe()
+	defer clientConnection.Close()
+	go server.handleConnection(t.Context(), serverConnection)
+	if err := json.NewEncoder(clientConnection).Encode(ClientRequest{
+		Type:          "subscribe",
+		HistoryBounds: true,
+		HistoryItems:  2,
+		HistoryBytes:  DefaultHistoryByteLimit,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	decoder := json.NewDecoder(clientConnection)
+	var start Event
+	if err := decoder.Decode(&start); err != nil {
+		t.Fatal(err)
+	}
+	if start.Type != EventHistoryStart || !start.HistoryLimited || start.HistoryCursor == "" {
+		t.Fatalf("history start = %#v, want limited history", start)
+	}
+
+	var retained []Event
+	var end Event
+	for {
+		var event Event
+		if err := decoder.Decode(&event); err != nil {
+			t.Fatal(err)
+		}
+		if event.Type == EventHistoryEnd {
+			end = event
+			break
+		}
+		retained = append(retained, event)
+	}
+	wantIDs := []int64{7, 9}
+	if len(retained) != len(wantIDs) {
+		t.Fatalf("retained events = %#v, want IDs %v", retained, wantIDs)
+	}
+	for index, event := range retained {
+		if event.ID != wantIDs[index] {
+			t.Fatalf("retained event IDs = %#v, want %v", retained, wantIDs)
+		}
+		if event.TurnID != "" {
+			t.Fatalf("projected event retains turn state: %#v", retained)
+		}
+	}
+	assertEventTypes(t, retained, EventUserMessage, EventAssistantMessage)
+	if end.HistoryState == nil {
+		t.Fatalf("history end = %#v, want state snapshot", end)
+	}
+
+	if err := json.NewEncoder(clientConnection).Encode(ClientRequest{
+		Type:          "history",
+		RequestID:     "history-1",
+		HistoryCursor: start.HistoryCursor,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var pageStart Event
+	if err := decoder.Decode(&pageStart); err != nil {
+		t.Fatal(err)
+	}
+	if pageStart.Type != EventHistoryStart || !pageStart.HistoryPage || pageStart.RequestID != "history-1" || pageStart.HistoryCursor != "" {
+		t.Fatalf("older history start = %#v", pageStart)
+	}
+	retained = nil
+	for {
+		var event Event
+		if err := decoder.Decode(&event); err != nil {
+			t.Fatal(err)
+		}
+		if event.Type == EventHistoryEnd {
+			if !event.HistoryPage || event.RequestID != "history-1" {
+				t.Fatalf("older history end = %#v", event)
+			}
+			break
+		}
+		retained = append(retained, event)
+	}
+	wantIDs = []int64{1, 5}
+	if len(retained) != len(wantIDs) {
+		t.Fatalf("older retained events = %#v, want IDs %v", retained, wantIDs)
+	}
+	for index, event := range retained {
+		if event.ID != wantIDs[index] || event.TurnID != "" {
+			t.Fatalf("older retained events = %#v, want projected IDs %v", retained, wantIDs)
+		}
+	}
+	assertEventTypes(t, retained, EventUserMessage, EventAssistantMessage)
+}
+
+func TestServerPreservesStateOutsideProjectedHistoryPage(t *testing.T) {
+	journal := NewJournal()
+	defer journal.Close()
+	startedAt := time.Date(2026, time.August, 8, 12, 0, 0, 0, time.UTC)
+	pendingText := strings.Repeat("pending ", maxHistoryMessageBytes)
+	for _, event := range []Event{
+		{Type: EventFileDiff, Diff: "diff --git a/old.txt b/old.txt\n-old\n+new"},
+		{Type: EventUserMessage, TurnID: "turn-1", Text: "active request"},
+		{Type: EventTurnStarted, TurnID: "turn-1", Timestamp: &startedAt, Status: "running"},
+		{Type: EventAssistantDelta, TurnID: "turn-1", Text: "partial answer"},
+		{Type: EventInputRequested, TurnID: "turn-1", InputID: "input-1", Questions: []InputQuestion{{ID: "confirm", Question: "Continue?"}}, Status: "pending"},
+		{Type: EventUserMessage, TurnID: "turn-2", Text: pendingText},
+	} {
+		if err := journal.Append(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	server := &Server{journal: journal}
+	serverConnection, clientConnection := net.Pipe()
+	defer clientConnection.Close()
+	go server.handleConnection(t.Context(), serverConnection)
+	if err := json.NewEncoder(clientConnection).Encode(ClientRequest{
+		Type:          "subscribe",
+		HistoryBounds: true,
+		HistoryItems:  1,
+		HistoryBytes:  DefaultHistoryByteLimit,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	decoder := json.NewDecoder(clientConnection)
+	var start Event
+	if err := decoder.Decode(&start); err != nil {
+		t.Fatal(err)
+	}
+	if start.Type != EventHistoryStart || !start.HistoryLimited || start.HistoryCursor == "" {
+		t.Fatalf("history start = %#v, want limited history", start)
+	}
+	var retained []Event
+	var end Event
+	for {
+		var event Event
+		if err := decoder.Decode(&event); err != nil {
+			t.Fatal(err)
+		}
+		if event.Type == EventHistoryEnd {
+			end = event
+			break
+		}
+		retained = append(retained, event)
+	}
+	assertEventTypes(t, retained, EventAssistantMessage, EventInputRequested)
+	if retained[0].Text != "partial answer" || retained[0].TurnID != "" {
+		t.Fatalf("projected assistant message = %#v", retained[0])
+	}
+	if retained[1].InputID != "input-1" || retained[1].TurnID != "" || len(retained[1].Questions) != 1 || retained[1].Questions[0].Question != "Continue?" {
+		t.Fatalf("pending input = %#v", retained[1])
+	}
+	if end.HistoryState == nil {
+		t.Fatalf("history end = %#v, want state snapshot", end)
+	}
+	state := end.HistoryState
+	if state.ActiveTurnID != "turn-1" || state.ActiveTurnStarted == nil || !state.ActiveTurnStarted.Equal(startedAt) || !state.WaitingForInput {
+		t.Fatalf("history state = %#v, want active turn waiting for input", state)
+	}
+	if state.PendingTurn == nil || state.PendingTurn.TurnID != "turn-2" {
+		t.Fatalf("pending turn = %#v, want turn-2", state.PendingTurn)
+	}
+	if state.FileDiff != "diff --git a/old.txt b/old.txt\n-old\n+new" {
+		t.Fatalf("file diff = %q, want state outside projected history page", state.FileDiff)
+	}
+	if text := state.PendingTurn.Text; len(text) > maxHistoryMessageBytes || !strings.Contains(text, historyTruncationMarker) {
+		t.Fatalf("pending message preview has %d bytes", len(text))
 	}
 }
 
@@ -1352,7 +3121,7 @@ done
 	if _, err := os.Stat(sessionPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("Claude session ID exists before a completed turn: %v", err)
 	}
-	if err := provider.RunTurn(t.Context(), "hello", &collectingSink{}); err != nil {
+	if err := provider.RunTurn(t.Context(), TurnInput{Text: "hello"}, &collectingSink{}); err != nil {
 		t.Fatalf("RunTurn() error = %v", err)
 	}
 	data, err := os.ReadFile(sessionPath)
@@ -1421,6 +3190,136 @@ func TestCodexEventMapping(t *testing.T) {
 		}
 	default:
 		t.Fatal("Codex turn completion was not delivered")
+	}
+}
+
+func TestCodexOrdinaryInteractionCompletesWhileGoalIsActive(t *testing.T) {
+	done := make(chan codexTurnResult, 1)
+	provider := &CodexProvider{
+		turnDone:        done,
+		activeTurn:      "codex-turn-1",
+		interactionKind: codexInteractionMessage,
+	}
+	provider.setGoal(&Goal{Objective: "improve coverage", Status: "active"})
+
+	provider.handleNotification("turn/completed", json.RawMessage(`{"turn":{"status":"completed"}}`))
+	select {
+	case result := <-done:
+		if result.status != "completed" {
+			t.Fatalf("Codex turn result = %#v", result)
+		}
+	default:
+		t.Fatal("ordinary Codex turn did not complete while a goal was active")
+	}
+}
+
+func TestCodexGoalNotificationDoesNotCompleteOrdinaryInteraction(t *testing.T) {
+	done := make(chan codexTurnResult, 1)
+	provider := &CodexProvider{
+		turnDone:        done,
+		interactionKind: codexInteractionMessage,
+	}
+	provider.setGoal(&Goal{Objective: "improve coverage", Status: "active"})
+
+	provider.handleNotification("thread/goal/updated", json.RawMessage(`{
+		"goal":{"objective":"improve coverage","status":"paused"}
+	}`))
+	select {
+	case result := <-done:
+		t.Fatalf("goal notification completed ordinary interaction: %#v", result)
+	default:
+	}
+}
+
+func TestCodexGoalKeepsInteractionOpenUntilTerminalTurnCompletes(t *testing.T) {
+	sink := &collectingSink{}
+	done := make(chan codexTurnResult, 1)
+	provider := &CodexProvider{activeSink: sink, turnDone: done, activeTurn: "codex-turn-1", interactionKind: codexInteractionGoal}
+
+	provider.handleNotification("thread/goal/updated", json.RawMessage(`{
+		"goal":{"objective":"improve coverage","status":"active","tokensUsed":100}
+	}`))
+	provider.handleNotification("turn/completed", json.RawMessage(`{"turn":{"status":"completed"}}`))
+	select {
+	case result := <-done:
+		t.Fatalf("active goal completed interaction early: %#v", result)
+	default:
+	}
+
+	provider.handleNotification("turn/started", json.RawMessage(`{"turn":{"id":"codex-turn-2"}}`))
+	provider.handleNotification("thread/goal/updated", json.RawMessage(`{
+		"goal":{"objective":"improve coverage","status":"complete","tokensUsed":200}
+	}`))
+	select {
+	case result := <-done:
+		t.Fatalf("goal completed before its terminal turn: %#v", result)
+	default:
+	}
+	provider.handleNotification("turn/completed", json.RawMessage(`{"turn":{"status":"completed"}}`))
+
+	select {
+	case result := <-done:
+		if result.status != "completed" {
+			t.Fatalf("Codex goal result = %#v", result)
+		}
+	default:
+		t.Fatal("completed Codex goal did not finish the interaction")
+	}
+	assertEventTypes(t, sink.events, EventGoalUpdated, EventGoalUpdated)
+	if sink.events[1].Goal == nil || sink.events[1].Goal.Status != "complete" {
+		t.Fatalf("completed goal event = %#v", sink.events[1])
+	}
+}
+
+func TestCodexGoalCommandUsesAppServerProtocol(t *testing.T) {
+	reader, writer := io.Pipe()
+	sink := &collectingSink{}
+	provider := &CodexProvider{
+		stdin:    writer,
+		pending:  map[string]chan codexResponse{},
+		threadID: "thread-1",
+		done:     make(chan struct{}),
+	}
+	commandDone := make(chan error, 1)
+	go func() {
+		commandDone <- provider.applyGoalCommand(t.Context(), goalCommand{action: goalCommandCreate, objective: "improve coverage"}, sink)
+	}()
+
+	decoder := json.NewDecoder(reader)
+	for index, wantMethod := range []string{"thread/goal/get", "thread/goal/set"} {
+		var request struct {
+			ID     int64  `json:"id"`
+			Method string `json:"method"`
+			Params struct {
+				ThreadID  string `json:"threadId"`
+				Objective string `json:"objective"`
+				Status    string `json:"status"`
+			} `json:"params"`
+		}
+		if err := decoder.Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request.Method != wantMethod || request.Params.ThreadID != "thread-1" {
+			t.Fatalf("goal request %d = %#v", index, request)
+		}
+		if wantMethod == "thread/goal/set" && (request.Params.Objective != "improve coverage" || request.Params.Status != "active") {
+			t.Fatalf("goal set params = %#v", request.Params)
+		}
+		provider.pendingMu.Lock()
+		pending := provider.pending[strconv.FormatInt(request.ID, 10)]
+		provider.pendingMu.Unlock()
+		if wantMethod == "thread/goal/get" {
+			pending <- codexResponse{Result: json.RawMessage(`{"goal":null}`)}
+		} else {
+			pending <- codexResponse{Result: json.RawMessage(`{"goal":{"objective":"improve coverage","status":"active","tokensUsed":125,"timeUsedSeconds":10}}`)}
+		}
+	}
+	if err := <-commandDone; err != nil {
+		t.Fatalf("applyGoalCommand() error = %v", err)
+	}
+	assertEventTypes(t, sink.events, EventGoalUpdated)
+	if sink.events[0].Goal == nil || sink.events[0].Goal.Status != "active" || sink.events[0].Goal.TokensUsed != 125 {
+		t.Fatalf("goal event = %#v", sink.events[0])
 	}
 }
 
@@ -1522,6 +3421,60 @@ func TestCodexRequestOmitsNilParams(t *testing.T) {
 	}
 }
 
+func TestCodexRecordsShellCommandInContext(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	provider := &CodexProvider{
+		stdin:    writer,
+		pending:  map[string]chan codexResponse{},
+		threadID: "thread-1",
+		done:     make(chan struct{}),
+	}
+	recordDone := make(chan error, 1)
+	go func() {
+		recordDone <- provider.recordShellCommand(t.Context(), shellCommandRecord{
+			command:  "printf shell-output",
+			exitCode: 0,
+			duration: 1234 * time.Millisecond,
+			output:   "shell-output",
+		})
+	}()
+
+	var request struct {
+		ID     int64  `json:"id"`
+		Method string `json:"method"`
+		Params struct {
+			ThreadID string `json:"threadId"`
+			Items    []struct {
+				Type    string `json:"type"`
+				Role    string `json:"role"`
+				Content []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"items"`
+		} `json:"params"`
+	}
+	if err := json.NewDecoder(reader).Decode(&request); err != nil {
+		t.Fatal(err)
+	}
+	if request.Method != "thread/inject_items" || request.Params.ThreadID != "thread-1" {
+		t.Fatalf("Codex shell context request = %#v", request)
+	}
+	if len(request.Params.Items) != 1 || request.Params.Items[0].Type != "message" || request.Params.Items[0].Role != "user" || len(request.Params.Items[0].Content) != 1 || request.Params.Items[0].Content[0].Type != "input_text" {
+		t.Fatalf("Codex shell context item = %#v", request.Params.Items)
+	}
+	want := "<user_shell_command>\n<command>\nprintf shell-output\n</command>\n<result>\nExit code: 0\nDuration: 1.2340 seconds\nOutput:\nshell-output\n</result>\n</user_shell_command>"
+	if got := request.Params.Items[0].Content[0].Text; got != want {
+		t.Fatalf("Codex shell context text = %q, want %q", got, want)
+	}
+	respondCodexRequest(t, provider, request.ID, `{}`)
+	if err := <-recordDone; err != nil {
+		t.Fatalf("recordShellCommand() error = %v", err)
+	}
+}
+
 func TestCodexToolResultOutputMapping(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -1618,12 +3571,16 @@ func TestCodexInputResponse(t *testing.T) {
 func TestCodexInterruptUsesActiveTurn(t *testing.T) {
 	reader, writer := io.Pipe()
 	interactionCtx, interactionCancel := context.WithCancel(context.Background())
+	ready := make(chan struct{})
+	close(ready)
 	provider := &CodexProvider{
 		ctx:               context.Background(),
 		stdin:             writer,
 		pending:           map[string]chan codexResponse{},
 		threadID:          "thread-1",
 		activeTurn:        "turn-1",
+		activeReady:       ready,
+		interactionKind:   codexInteractionMessage,
 		interactionCtx:    interactionCtx,
 		interactionCancel: interactionCancel,
 		done:              make(chan struct{}),
@@ -1656,6 +3613,153 @@ func TestCodexInterruptUsesActiveTurn(t *testing.T) {
 	default:
 		t.Fatal("Codex interaction context was not cancelled")
 	}
+}
+
+func TestCodexInterruptPausesActiveGoalBeforeInterruptingTurn(t *testing.T) {
+	reader, writer := io.Pipe()
+	interactionCtx, interactionCancel := context.WithCancel(context.Background())
+	ready := make(chan struct{})
+	close(ready)
+	sink := &collectingSink{}
+	provider := &CodexProvider{
+		ctx:               context.Background(),
+		stdin:             writer,
+		pending:           map[string]chan codexResponse{},
+		threadID:          "thread-1",
+		activeSink:        sink,
+		activeTurn:        "turn-1",
+		activeReady:       ready,
+		interactionKind:   codexInteractionGoal,
+		interactionCtx:    interactionCtx,
+		interactionCancel: interactionCancel,
+		done:              make(chan struct{}),
+	}
+	provider.setGoal(&Goal{Objective: "improve coverage", Status: "active"})
+
+	interruptDone := make(chan error, 1)
+	go func() { interruptDone <- provider.Interrupt(t.Context()) }()
+	decoder := json.NewDecoder(reader)
+	for index, wantMethod := range []string{"thread/goal/get", "thread/goal/set", "turn/interrupt"} {
+		var request struct {
+			ID     int64  `json:"id"`
+			Method string `json:"method"`
+			Params struct {
+				Status string `json:"status"`
+				TurnID string `json:"turnId"`
+			} `json:"params"`
+		}
+		if err := decoder.Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request.Method != wantMethod {
+			t.Fatalf("request %d method = %q, want %q", index, request.Method, wantMethod)
+		}
+		switch wantMethod {
+		case "thread/goal/get":
+			respondCodexRequest(t, provider, request.ID, `{"goal":{"objective":"improve coverage","status":"active"}}`)
+		case "thread/goal/set":
+			if request.Params.Status != "paused" {
+				t.Fatalf("goal status = %q, want paused", request.Params.Status)
+			}
+			respondCodexRequest(t, provider, request.ID, `{"goal":{"objective":"improve coverage","status":"paused"}}`)
+		case "turn/interrupt":
+			if request.Params.TurnID != "turn-1" {
+				t.Fatalf("turn ID = %q, want turn-1", request.Params.TurnID)
+			}
+			respondCodexRequest(t, provider, request.ID, `{}`)
+		}
+	}
+	if err := <-interruptDone; err != nil {
+		t.Fatalf("Interrupt() error = %v", err)
+	}
+	select {
+	case <-interactionCtx.Done():
+	default:
+		t.Fatal("Codex interaction context was not cancelled")
+	}
+	assertEventTypes(t, sink.events, EventGoalUpdated)
+	if sink.events[0].Status != "paused" {
+		t.Fatalf("goal event = %#v", sink.events[0])
+	}
+}
+
+func TestCodexInterruptPausesActiveGoalBetweenTurns(t *testing.T) {
+	reader, writer := io.Pipe()
+	ready := make(chan struct{})
+	close(ready)
+	sink := &collectingSink{}
+	provider := &CodexProvider{
+		ctx:             context.Background(),
+		stdin:           writer,
+		pending:         map[string]chan codexResponse{},
+		threadID:        "thread-1",
+		activeSink:      sink,
+		activeReady:     ready,
+		interactionKind: codexInteractionGoal,
+		turnDone:        make(chan codexTurnResult, 1),
+		done:            make(chan struct{}),
+	}
+	provider.setGoal(&Goal{Objective: "improve coverage", Status: "active"})
+
+	interruptDone := make(chan error, 1)
+	go func() { interruptDone <- provider.Interrupt(t.Context()) }()
+	decoder := json.NewDecoder(reader)
+	for _, wantMethod := range []string{"thread/goal/get", "thread/goal/set"} {
+		var request struct {
+			ID     int64  `json:"id"`
+			Method string `json:"method"`
+			Params struct {
+				Status string `json:"status"`
+			} `json:"params"`
+		}
+		if err := decoder.Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request.Method != wantMethod {
+			t.Fatalf("request method = %q, want %q", request.Method, wantMethod)
+		}
+		if wantMethod == "thread/goal/get" {
+			respondCodexRequest(t, provider, request.ID, `{"goal":{"objective":"improve coverage","status":"active"}}`)
+		} else {
+			if request.Params.Status != "paused" {
+				t.Fatalf("goal status = %q, want paused", request.Params.Status)
+			}
+			respondCodexRequest(t, provider, request.ID, `{"goal":{"objective":"improve coverage","status":"paused"}}`)
+		}
+	}
+	if err := <-interruptDone; err != nil {
+		t.Fatalf("Interrupt() error = %v", err)
+	}
+	select {
+	case result := <-provider.turnDone:
+		if result.status != "completed" {
+			t.Fatalf("Codex goal result = %#v", result)
+		}
+	default:
+		t.Fatal("paused Codex goal did not finish its interaction")
+	}
+}
+
+func TestCodexInterruptDoesNotPauseGoalWithoutInteraction(t *testing.T) {
+	provider := &CodexProvider{}
+	provider.setGoal(&Goal{Objective: "improve coverage", Status: "active"})
+	if err := provider.Interrupt(t.Context()); !errors.Is(err, ErrNoActiveTurn) {
+		t.Fatalf("Interrupt() error = %v, want ErrNoActiveTurn", err)
+	}
+	if !provider.goalIsActive() {
+		t.Fatal("Interrupt() paused a goal without an active interaction")
+	}
+}
+
+func respondCodexRequest(t *testing.T, provider *CodexProvider, requestID int64, result string) {
+	t.Helper()
+	provider.pendingMu.Lock()
+	pending := provider.pending[strconv.FormatInt(requestID, 10)]
+	provider.pendingMu.Unlock()
+	if pending == nil {
+		t.Fatalf("Codex request %d is not pending", requestID)
+	}
+	pending <- codexResponse{Result: json.RawMessage(result)}
 }
 
 func TestCodexOpenThreadReplacesUnmaterializedThread(t *testing.T) {

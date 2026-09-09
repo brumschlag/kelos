@@ -19,6 +19,7 @@ import (
 
 	kelos "github.com/kelos-dev/kelos/api/v1alpha2"
 	"github.com/kelos-dev/kelos/internal/reporting"
+	"github.com/kelos-dev/kelos/internal/spawnercredentials"
 	"github.com/kelos-dev/kelos/internal/taskbuilder"
 )
 
@@ -262,6 +263,57 @@ func TestCreateTaskLongSpawnerName(t *testing.T) {
 	for _, task := range tasks.Items {
 		if len(task.Name) > 63 {
 			t.Errorf("Task name exceeds 63 chars: %q (len=%d)", task.Name, len(task.Name))
+		}
+	}
+}
+
+func TestCreateTaskAssignsTaskSpawnerCredentials(t *testing.T) {
+	scheme := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(kelos.AddToScheme(scheme))
+	spawner := &kelos.TaskSpawner{
+		ObjectMeta: metav1.ObjectMeta{Name: "multi-account", Namespace: "default", UID: "spawner-uid"},
+		Spec: kelos.TaskSpawnerSpec{
+			TaskTemplate: kelos.TaskTemplate{Type: "claude-code", PromptTemplate: "{{.Body}}"},
+			Credentials: []kelos.SpawnerCredential{
+				{Name: "account-b", Type: kelos.CredentialTypeOAuth, SecretRef: kelos.SecretReference{Name: "secret-b"}},
+				{Name: "account-a", Type: kelos.CredentialTypeOAuth, SecretRef: kelos.SecretReference{Name: "secret-a"}},
+			},
+		},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+	tb, err := taskbuilder.NewTaskBuilder(cl)
+	if err != nil {
+		t.Fatalf("NewTaskBuilder: %v", err)
+	}
+	h := &SlackHandler{client: cl, log: logr.Discard(), taskBuilder: tb}
+
+	for _, msg := range []*SlackMessageData{
+		{UserID: "U123", ChannelID: "C456", Body: "first", Timestamp: "1111111111.111111"},
+		{UserID: "U123", ChannelID: "C456", Body: "second", Timestamp: "2222222222.222222"},
+	} {
+		if err := h.createTask(context.Background(), spawner, msg); err != nil {
+			t.Fatalf("createTask() error = %v", err)
+		}
+	}
+
+	var tasks kelos.TaskList
+	if err := cl.List(context.Background(), &tasks); err != nil {
+		t.Fatalf("List tasks: %v", err)
+	}
+	wantSecrets := map[string]string{"account-a": "secret-a", "account-b": "secret-b"}
+	for i := range tasks.Items {
+		task := &tasks.Items[i]
+		if task.Spec.Credentials == nil || task.Spec.Credentials.SecretRef == nil {
+			t.Fatalf("Task %s has no assigned credentials", task.Name)
+		}
+		credentialName := task.Labels[spawnercredentials.AssignmentLabel]
+		wantSecret, ok := wantSecrets[credentialName]
+		if !ok {
+			t.Fatalf("Task %s credential label = %q, want a configured credential", task.Name, credentialName)
+		}
+		if got := task.Spec.Credentials.SecretRef.Name; got != wantSecret {
+			t.Errorf("Task %s Secret = %q, want %q for %s", task.Name, got, wantSecret, credentialName)
 		}
 	}
 }

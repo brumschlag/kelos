@@ -25,9 +25,11 @@ const (
 	SessionConditionReady = "Ready"
 	// SessionConditionActive indicates whether the Session runtime has an unfinished turn.
 	SessionConditionActive = "Active"
+	// SessionReasonIdlePolicyTriggered identifies a Session suspended by its idle policy.
+	SessionReasonIdlePolicyTriggered = "IdlePolicyTriggered"
 )
 
-// SessionPullRequestState represents the lifecycle state of a Session pull request.
+// SessionPullRequestState represents the observed state of a Session pull request.
 type SessionPullRequestState string
 
 const (
@@ -35,26 +37,58 @@ const (
 	SessionPullRequestStateDraft SessionPullRequestState = "Draft"
 	// SessionPullRequestStateOpen means the pull request is open for review.
 	SessionPullRequestStateOpen SessionPullRequestState = "Open"
+	// SessionPullRequestStateQueued means the pull request is in a merge queue.
+	SessionPullRequestStateQueued SessionPullRequestState = "Queued"
 	// SessionPullRequestStateMerged means the pull request has been merged.
 	SessionPullRequestStateMerged SessionPullRequestState = "Merged"
 	// SessionPullRequestStateClosed means the pull request was closed without merging.
 	SessionPullRequestStateClosed SessionPullRequestState = "Closed"
 )
 
+// SessionPullRequestChecksState summarizes the GitHub checks for a Session pull request.
+type SessionPullRequestChecksState string
+
+const (
+	// SessionPullRequestChecksStatePending means at least one check has not completed.
+	SessionPullRequestChecksStatePending SessionPullRequestChecksState = "Pending"
+	// SessionPullRequestChecksStateSuccess means all checks completed without a failure.
+	SessionPullRequestChecksStateSuccess SessionPullRequestChecksState = "Success"
+	// SessionPullRequestChecksStateFailure means at least one check failed or was cancelled.
+	SessionPullRequestChecksStateFailure SessionPullRequestChecksState = "Failure"
+)
+
+// SessionPullRequestChecks summarizes the GitHub checks for a pull request.
+type SessionPullRequestChecks struct {
+	// State is the aggregate state of the checks.
+	// +kubebuilder:validation:Enum=Pending;Success;Failure
+	State SessionPullRequestChecksState `json:"state"`
+
+	// Completed is the number of checks that have completed.
+	// +kubebuilder:validation:Minimum=0
+	Completed int32 `json:"completed"`
+
+	// Total is the total number of checks.
+	// +kubebuilder:validation:Minimum=1
+	Total int32 `json:"total"`
+}
+
 // SessionPullRequest describes the pull request associated with a Session branch.
 type SessionPullRequest struct {
 	// URL is the pull request web URL.
 	URL string `json:"url"`
 
-	// State is the pull request lifecycle state.
-	// +kubebuilder:validation:Enum=Draft;Open;Merged;Closed
+	// State is the observed pull request state.
+	// +kubebuilder:validation:Enum=Draft;Open;Queued;Merged;Closed
 	State SessionPullRequestState `json:"state"`
+
+	// Checks summarizes the GitHub checks for the pull request or its merge queue entry.
+	// +optional
+	Checks *SessionPullRequestChecks `json:"checks,omitempty"`
 }
 
 // SessionSpec defines the desired state of a Session.
 //
 // +kubebuilder:validation:XValidation:rule="has(self.worker.type) && self.worker.type in ['claude-code', 'codex', 'opencode']",message="worker.type must be claude-code, codex, or opencode"
-// +kubebuilder:validation:XValidation:rule="has(self.worker.credentials)",message="worker.credentials is required"
 // +kubebuilder:validation:XValidation:rule="!has(self.initialBranch) || size(self.initialBranch) == 0 || has(self.worker.workspaceRef)",message="worker.workspaceRef is required when initialBranch is set"
 type SessionSpec struct {
 	// Worker defines the agent and execution environment for this Session.
@@ -86,6 +120,38 @@ type SessionSpec struct {
 	// this field to use an ephemeral emptyDir workspace, primarily for development.
 	// +optional
 	VolumeClaimTemplate *corev1.PersistentVolumeClaimSpec `json:"volumeClaimTemplate,omitempty"`
+
+	// IdlePolicy configures automatic lifecycle actions taken after a Session has
+	// been continuously idle. A Session is idle when it has no active turn and
+	// reports no activity; idleness is measured from the later of the last
+	// reported activity time and the Session creation time, and renewed activity
+	// resets the idle period.
+	// +optional
+	IdlePolicy *SessionIdlePolicy `json:"idlePolicy,omitempty"`
+}
+
+// SessionIdlePolicy configures automatic lifecycle actions for an idle Session.
+// +kubebuilder:validation:XValidation:rule="!has(self.suspendAfterSeconds) || !has(self.deleteAfterSeconds) || self.suspendAfterSeconds < self.deleteAfterSeconds",message="suspendAfterSeconds must be less than deleteAfterSeconds when both are set"
+type SessionIdlePolicy struct {
+	// SuspendAfterSeconds stops the Session runtime once it has been continuously
+	// idle for the given number of seconds without changing Session.spec.suspend.
+	// Selecting the Session in the web interface or starting a terminal connection
+	// resumes it. If this field is unset, the Session is never suspended for
+	// idleness. If it is set to zero, the Session is eligible for suspension as
+	// soon as it goes idle. When DeleteAfterSeconds is also set,
+	// SuspendAfterSeconds must be less than DeleteAfterSeconds.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	SuspendAfterSeconds *int32 `json:"suspendAfterSeconds,omitempty"`
+
+	// DeleteAfterSeconds deletes the Session once it has been continuously idle
+	// for the given number of seconds. Deleting the Session removes its workspace
+	// storage, so any uncommitted workspace changes are lost. If this field is
+	// unset, the Session is never deleted for idleness. If it is set to zero, the
+	// Session is eligible for deletion as soon as it goes idle.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	DeleteAfterSeconds *int32 `json:"deleteAfterSeconds,omitempty"`
 }
 
 // SessionStatus defines the observed state of a Session.
@@ -114,6 +180,10 @@ type SessionStatus struct {
 	// Pod replacement does not change this timestamp.
 	// +optional
 	LastActivityTime *metav1.Time `json:"lastActivityTime,omitempty"`
+
+	// Model is the model reported by the Session runtime.
+	// +optional
+	Model string `json:"model,omitempty"`
 
 	// Branch is the currently checked-out git branch in the Session workspace.
 	// +optional
@@ -148,9 +218,15 @@ type Session struct {
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
 	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:XValidation:rule="self.worker == oldSelf.worker",message="worker is immutable"
-	// +kubebuilder:validation:XValidation:rule="has(self.initialBranch) == has(oldSelf.initialBranch) && (!has(self.initialBranch) || self.initialBranch == oldSelf.initialBranch)",message="initialBranch is immutable"
-	// +kubebuilder:validation:XValidation:rule="has(self.initialPrompt) == has(oldSelf.initialPrompt) && (!has(self.initialPrompt) || self.initialPrompt == oldSelf.initialPrompt)",message="initialPrompt is immutable"
+	// +kubebuilder:validation:XValidation:rule="has(self.worker.credentials)",message="worker.credentials is required"
+	// +kubebuilder:validation:XValidation:rule="has(self.worker.type) == has(oldSelf.worker.type) && (!has(self.worker.type) || self.worker.type == oldSelf.worker.type)",message="worker.type is immutable"
+	// +kubebuilder:validation:XValidation:rule="(!has(self.worker.effort) ? '' : self.worker.effort) == (!has(oldSelf.worker.effort) ? '' : oldSelf.worker.effort)",message="worker.effort is immutable"
+	// +kubebuilder:validation:XValidation:rule="(!has(self.worker.image) ? '' : self.worker.image) == (!has(oldSelf.worker.image) ? '' : oldSelf.worker.image)",message="worker.image is immutable"
+	// +kubebuilder:validation:XValidation:rule="has(self.worker.workspaceRef) == has(oldSelf.worker.workspaceRef) && (!has(self.worker.workspaceRef) || self.worker.workspaceRef == oldSelf.worker.workspaceRef)",message="worker.workspaceRef is immutable"
+	// +kubebuilder:validation:XValidation:rule="has(self.worker.agentConfigRefs) == has(oldSelf.worker.agentConfigRefs) && (!has(self.worker.agentConfigRefs) || self.worker.agentConfigRefs == oldSelf.worker.agentConfigRefs)",message="worker.agentConfigRefs is immutable"
+	// +kubebuilder:validation:XValidation:rule="(has(self.worker.podOverrides) && has(self.worker.podOverrides.serviceAccountName) ? self.worker.podOverrides.serviceAccountName : '') == (has(oldSelf.worker.podOverrides) && has(oldSelf.worker.podOverrides.serviceAccountName) ? oldSelf.worker.podOverrides.serviceAccountName : '')",message="worker.podOverrides.serviceAccountName is immutable"
+	// +kubebuilder:validation:XValidation:rule="(!has(self.initialBranch) ? '' : self.initialBranch) == (!has(oldSelf.initialBranch) ? '' : oldSelf.initialBranch)",message="initialBranch is immutable"
+	// +kubebuilder:validation:XValidation:rule="(!has(self.initialPrompt) ? '' : self.initialPrompt) == (!has(oldSelf.initialPrompt) ? '' : oldSelf.initialPrompt)",message="initialPrompt is immutable"
 	// +kubebuilder:validation:XValidation:rule="has(self.volumeClaimTemplate) == has(oldSelf.volumeClaimTemplate) && (!has(self.volumeClaimTemplate) || self.volumeClaimTemplate == oldSelf.volumeClaimTemplate)",message="volumeClaimTemplate is immutable"
 	Spec   SessionSpec   `json:"spec"`
 	Status SessionStatus `json:"status,omitempty"`

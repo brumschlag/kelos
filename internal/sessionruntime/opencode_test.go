@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -41,11 +42,24 @@ func TestOpenCodeProviderStreamsOrderedEvents(t *testing.T) {
 
 	sink := newOpenCodeTestSink(nil)
 	turnDone := make(chan error, 1)
-	go func() { turnDone <- provider.RunTurn(t.Context(), "hello", sink) }()
+	attachmentPath := filepath.Join(t.TempDir(), "screen.png")
+	go func() {
+		turnDone <- provider.RunTurn(t.Context(), TurnInput{
+			Text: "hello",
+			Attachments: []ResolvedAttachment{{
+				Attachment: Attachment{Name: "screen.png", MediaType: "image/png"},
+				Path:       attachmentPath,
+			}},
+		}, sink)
+	}()
 	request := receiveOpenCodePrompt(t, fake.prompts)
 	parts, ok := request["parts"].([]any)
-	if !ok || len(parts) != 1 || parts[0].(map[string]any)["text"] != "hello" {
+	if !ok || len(parts) != 2 || !strings.Contains(parts[0].(map[string]any)["text"].(string), attachmentPath) {
 		t.Fatalf("OpenCode prompt request = %#v", request)
+	}
+	filePart := parts[1].(map[string]any)
+	if filePart["type"] != "file" || filePart["mime"] != "image/png" || filePart["filename"] != "screen.png" || filePart["url"] != (&url.URL{Scheme: "file", Path: attachmentPath}).String() {
+		t.Fatalf("OpenCode file part = %#v", filePart)
 	}
 
 	fake.emit("session.status", map[string]any{"sessionID": fake.sessionID, "status": map[string]string{"type": "busy"}})
@@ -73,6 +87,7 @@ func TestOpenCodeProviderStreamsOrderedEvents(t *testing.T) {
 		t.Fatal("OpenCode permission was not approved")
 	}
 	want := []Event{
+		{Type: EventRuntimeStatus, Runtime: &RuntimeStatus{Effort: "high"}},
 		{Type: EventAssistantDelta, Text: "hello"},
 		{Type: EventToolStarted, ToolID: "tool-1", ToolName: "bash", Status: "running"},
 		{Type: EventToolCompleted, ToolID: "tool-1", ToolName: "bash", Output: "ok\n", Status: "completed"},
@@ -83,12 +98,45 @@ func TestOpenCodeProviderStreamsOrderedEvents(t *testing.T) {
 	}
 }
 
+func TestOpenCodeProviderRecordsShellCommandWithoutReply(t *testing.T) {
+	fake := newFakeOpenCodeServer(t)
+	provider := newTestOpenCodeProvider(t, fake, ProviderConfig{WorkingDir: t.TempDir(), StateDir: t.TempDir()})
+	record := shellCommandRecord{
+		command:  "printf shell-output",
+		exitCode: 0,
+		duration: 1234 * time.Millisecond,
+		output:   "shell-output",
+	}
+	if err := provider.recordShellCommand(t.Context(), record); err != nil {
+		t.Fatalf("recordShellCommand() error = %v", err)
+	}
+
+	select {
+	case request := <-fake.contexts:
+		if request["noReply"] != true {
+			t.Fatalf("OpenCode shell context request = %#v", request)
+		}
+		parts, ok := request["parts"].([]any)
+		want := "<user_shell_command>\n<command>\nprintf shell-output\n</command>\n<result>\nExit code: 0\nDuration: 1.2340 seconds\nOutput:\nshell-output\n</result>\n</user_shell_command>"
+		if !ok || len(parts) != 1 || parts[0].(map[string]any)["type"] != "text" || parts[0].(map[string]any)["text"] != want {
+			t.Fatalf("OpenCode shell context parts = %#v", request["parts"])
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("OpenCode shell context was not submitted")
+	}
+	select {
+	case prompt := <-fake.prompts:
+		t.Fatalf("shell context started an OpenCode turn: %#v", prompt)
+	default:
+	}
+}
+
 func TestOpenCodeProviderAnswersQuestion(t *testing.T) {
 	fake := newFakeOpenCodeServer(t)
 	provider := newTestOpenCodeProvider(t, fake, ProviderConfig{WorkingDir: t.TempDir(), StateDir: t.TempDir()})
 	sink := newOpenCodeTestSink(map[string][]string{"question-1": {"PostgreSQL"}})
 	turnDone := make(chan error, 1)
-	go func() { turnDone <- provider.RunTurn(t.Context(), "choose a database", sink) }()
+	go func() { turnDone <- provider.RunTurn(t.Context(), TurnInput{Text: "choose a database"}, sink) }()
 	receiveOpenCodePrompt(t, fake.prompts)
 
 	fake.emit("session.status", map[string]any{"sessionID": fake.sessionID, "status": map[string]string{"type": "busy"}})
@@ -124,11 +172,76 @@ func TestOpenCodeProviderAnswersQuestion(t *testing.T) {
 	}
 }
 
+// TestOpenCodeProviderRuntimeStatusMapping verifies that the model reported on
+// assistant messages and the per-step token usage become runtime status
+// updates, that a republished step-finish part is counted once, that reasoning
+// tokens count toward output, and that the context window comes from the
+// server's provider configuration.
+func TestOpenCodeProviderRuntimeStatusMapping(t *testing.T) {
+	fake := newFakeOpenCodeServer(t)
+	provider := newTestOpenCodeProvider(t, fake, ProviderConfig{
+		WorkingDir: t.TempDir(),
+		StateDir:   t.TempDir(),
+		Effort:     "high",
+	})
+	sink := newOpenCodeTestSink(nil)
+	turnDone := make(chan error, 1)
+	go func() { turnDone <- provider.RunTurn(t.Context(), TurnInput{Text: "hello"}, sink) }()
+	receiveOpenCodePrompt(t, fake.prompts)
+
+	fake.emit("session.status", map[string]any{"sessionID": fake.sessionID, "status": map[string]string{"type": "busy"}})
+	fake.emit("message.updated", map[string]any{"info": map[string]string{
+		"id": "message-1", "sessionID": fake.sessionID, "role": "assistant",
+		"providerID": "anthropic", "modelID": "claude-opus-4-6",
+	}})
+	step1 := map[string]any{
+		"id": "step-1", "messageID": "message-1", "sessionID": fake.sessionID, "type": "step-finish",
+		"tokens": map[string]any{"input": 100, "output": 20, "cache": map[string]any{"read": 1000, "write": 50}},
+	}
+	fake.emit("message.part.updated", map[string]any{"part": step1})
+	fake.emit("message.part.updated", map[string]any{"part": step1})
+	fake.emit("message.part.updated", map[string]any{"part": map[string]any{
+		"id": "step-2", "messageID": "message-1", "sessionID": fake.sessionID, "type": "step-finish",
+		"tokens": map[string]any{"input": 200, "output": 30, "reasoning": 70, "cache": map[string]any{"read": 1100, "write": 0}},
+	}})
+	fake.emit("session.idle", map[string]string{"sessionID": fake.sessionID})
+	if err := receiveOpenCodeResult(t, turnDone); err != nil {
+		t.Fatalf("RunTurn() error = %v", err)
+	}
+
+	var statuses []Event
+	for _, event := range sink.snapshot() {
+		if event.Type == EventRuntimeStatus {
+			statuses = append(statuses, event)
+		}
+	}
+	if len(statuses) != 4 || statuses[3].Runtime == nil {
+		t.Fatalf("runtime status events = %#v", statuses)
+	}
+	status := statuses[3].Runtime
+	if status.Model != "anthropic/claude-opus-4-6" ||
+		status.Effort != "high" ||
+		status.Usage == nil ||
+		status.Usage.InputTokens != 2450 ||
+		status.Usage.OutputTokens != 120 ||
+		status.Usage.TotalTokens != 2570 ||
+		status.Usage.ContextTokens != 1400 ||
+		status.Usage.ContextWindow != 200000 {
+		t.Fatalf("OpenCode runtime status = %#v", status)
+	}
+	snapshot := provider.runtimeStatusSnapshot()
+	if snapshot.Model != "anthropic/claude-opus-4-6" || snapshot.Usage == nil || snapshot.Usage.ContextWindow != 200000 {
+		t.Fatalf("OpenCode runtime status snapshot = %#v", snapshot)
+	}
+}
+
 func TestOpenCodeProviderInterruptsActiveTurn(t *testing.T) {
 	fake := newFakeOpenCodeServer(t)
 	provider := newTestOpenCodeProvider(t, fake, ProviderConfig{WorkingDir: t.TempDir(), StateDir: t.TempDir()})
 	turnDone := make(chan error, 1)
-	go func() { turnDone <- provider.RunTurn(t.Context(), "keep working", newOpenCodeTestSink(nil)) }()
+	go func() {
+		turnDone <- provider.RunTurn(t.Context(), TurnInput{Text: "keep working"}, newOpenCodeTestSink(nil))
+	}()
 	receiveOpenCodePrompt(t, fake.prompts)
 
 	if err := provider.Interrupt(t.Context()); err != nil {
@@ -231,6 +344,7 @@ type fakeOpenCodeServer struct {
 	resumeFound       bool
 	events            chan string
 	prompts           chan map[string]any
+	contexts          chan map[string]any
 	questionReplies   chan [][]string
 	permissionReplies chan string
 	aborts            chan struct{}
@@ -248,6 +362,7 @@ func newFakeOpenCodeServer(t *testing.T) *fakeOpenCodeServer {
 		resumeFound:       true,
 		events:            make(chan string, 64),
 		prompts:           make(chan map[string]any, 4),
+		contexts:          make(chan map[string]any, 4),
 		questionReplies:   make(chan [][]string, 4),
 		permissionReplies: make(chan string, 4),
 		aborts:            make(chan struct{}, 4),
@@ -260,6 +375,14 @@ func (f *fakeOpenCodeServer) serveHTTP(response http.ResponseWriter, request *ht
 	switch {
 	case request.Method == http.MethodGet && request.URL.Path == "/event":
 		f.serveEvents(response, request)
+	case request.Method == http.MethodGet && request.URL.Path == "/config/providers":
+		f.requireDirectory(request)
+		writeOpenCodeJSON(response, map[string]any{"providers": []map[string]any{{
+			"id": "anthropic",
+			"models": map[string]any{
+				"claude-opus-4-6": map[string]any{"limit": map[string]any{"context": 200000}},
+			},
+		}}})
 	case request.Method == http.MethodPost && request.URL.Path == "/session":
 		f.requireDirectory(request)
 		var body map[string]any
@@ -290,6 +413,16 @@ func (f *fakeOpenCodeServer) serveHTTP(response http.ResponseWriter, request *ht
 		}
 		f.prompts <- body
 		response.WriteHeader(http.StatusNoContent)
+	case request.Method == http.MethodPost && request.URL.Path == "/session/"+f.sessionID+"/message":
+		f.requireDirectory(request)
+		var body map[string]any
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			f.t.Errorf("decoding OpenCode context message: %v", err)
+			response.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		f.contexts <- body
+		writeOpenCodeJSON(response, map[string]any{"info": map[string]string{"role": "user"}, "parts": body["parts"]})
 	case request.Method == http.MethodPost && request.URL.Path == "/session/"+f.sessionID+"/abort":
 		f.requireDirectory(request)
 		f.aborts <- struct{}{}

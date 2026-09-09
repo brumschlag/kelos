@@ -36,6 +36,8 @@ metadata:
 spec:
   when:
     githubWebhook:
+      gatewayRef:
+        name: kelos
       repository: kelos-dev/kelos
       events:
         - issue_comment
@@ -47,8 +49,7 @@ spec:
           commentOn: PullRequest
           state: open
           author: gjkim42
-        # Allow the Kelos bot to request a review on the PRs it opens, e.g.
-        # when a worker posts `/kelos review` after pushing its changes.
+        # Allow Kelos bot comments to request a review.
         - event: issue_comment
           action: created
           bodyPattern: '(?m)^/kelos review[ \t]*\r?$'
@@ -61,14 +62,15 @@ spec:
           state: open
           author: gjkim42
       reporting:
-        enabled: true
+        comments:
+          mode: Sticky
         checks: {}
   maxConcurrency: 3
   taskTemplate:
     worker:
       workspaceRef:
         name: kelos-agent
-      model: gpt-5.6-sol
+      model: gpt-6-astra
       effort: xhigh
       type: codex
       credentials:
@@ -80,9 +82,9 @@ spec:
           requests:
             cpu: "250m"
             memory: "512Mi"
-            ephemeral-storage: "4Gi"
+            ephemeral-storage: "20Gi"
           limits:
-            ephemeral-storage: "4Gi"
+            ephemeral-storage: "20Gi"
       agentConfigRefs:
         - name: base-agent
         - name: kelos-reviewer-agent

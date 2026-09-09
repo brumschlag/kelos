@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/go-logr/logr"
+	"github.com/go-logr/logr/funcr"
 	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -25,6 +26,7 @@ import (
 	kelos "github.com/kelos-dev/kelos/api/v1alpha2"
 	"github.com/kelos-dev/kelos/internal/reporting"
 	"github.com/kelos-dev/kelos/internal/sessionbuilder"
+	"github.com/kelos-dev/kelos/internal/spawnercredentials"
 	"github.com/kelos-dev/kelos/internal/taskbuilder"
 )
 
@@ -362,6 +364,42 @@ func TestServeHTTP_SessionSpawnerCreatesSessionPerDistinctDelivery(t *testing.T)
 	}
 }
 
+func TestServeHTTP_AssignsSessionSpawnerCredentials(t *testing.T) {
+	spawner := newSessionSpawner("workers")
+	spawner.Spec.SessionTemplate.Worker.Credentials = nil
+	spawner.Spec.Credentials = []kelos.SpawnerCredential{
+		{Name: "account-b", Type: kelos.CredentialTypeOAuth, SecretRef: kelos.SecretReference{Name: "secret-b"}},
+		{Name: "account-a", Type: kelos.CredentialTypeOAuth, SecretRef: kelos.SecretReference{Name: "secret-a"}},
+	}
+	handler := newTestHandler(t, spawner)
+
+	serveGitHubWebhook(t, handler, "issue_comment", "session-account-1", issueCommentPayload, http.StatusOK)
+	serveGitHubWebhook(t, handler, "issue_comment", "session-account-2", issueCommentPayload, http.StatusOK)
+
+	var sessions kelos.SessionList
+	if err := handler.client.List(context.Background(), &sessions); err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions.Items) != 2 {
+		t.Fatalf("Sessions = %d, want 2", len(sessions.Items))
+	}
+	wantSecrets := map[string]string{"account-a": "secret-a", "account-b": "secret-b"}
+	for i := range sessions.Items {
+		session := &sessions.Items[i]
+		if session.Spec.Worker.Credentials == nil || session.Spec.Worker.Credentials.SecretRef == nil {
+			t.Fatalf("Session %s has no assigned credentials", session.Name)
+		}
+		credentialName := session.Labels[spawnercredentials.AssignmentLabel]
+		wantSecret, ok := wantSecrets[credentialName]
+		if !ok {
+			t.Fatalf("Session %s credential label = %q, want a configured credential", session.Name, credentialName)
+		}
+		if got := session.Spec.Worker.Credentials.SecretRef.Name; got != wantSecret {
+			t.Errorf("Session %s Secret = %q, want %q for %s", session.Name, got, wantSecret, credentialName)
+		}
+	}
+}
+
 func TestServeHTTP_SessionSpawnerTreatsExistingNameAsProcessed(t *testing.T) {
 	spawner := newSessionSpawner("workers")
 	sessionName := webhookSpawnName(spawner.Name, "issue_comment", "session-delivery-1")
@@ -602,7 +640,7 @@ func TestServeHTTP_CreatesTaskForMatchingSpawner(t *testing.T) {
 	}
 }
 
-func TestServeHTTP_StampsReportingAnnotationsWhenEnabled(t *testing.T) {
+func TestServeHTTP_StampsStickyCommentReportingAnnotations(t *testing.T) {
 	spawner := &kelos.TaskSpawner{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "reporting-spawner",
@@ -614,7 +652,7 @@ func TestServeHTTP_StampsReportingAnnotationsWhenEnabled(t *testing.T) {
 				GitHubWebhook: &kelos.GitHubWebhook{
 					Events: []string{"issues"},
 					Reporting: &kelos.GitHubReporting{
-						Enabled: true,
+						Comments: &kelos.GitHubCommentsReporting{Mode: kelos.GitHubCommentModeSticky},
 					},
 				},
 			},
@@ -659,6 +697,9 @@ func TestServeHTTP_StampsReportingAnnotationsWhenEnabled(t *testing.T) {
 	task := taskList.Items[0]
 	if task.Annotations[reporting.AnnotationGitHubReporting] != "enabled" {
 		t.Errorf("Expected github-reporting 'enabled', got %q", task.Annotations[reporting.AnnotationGitHubReporting])
+	}
+	if task.Annotations[reporting.AnnotationGitHubCommentMode] != string(kelos.GitHubCommentModeSticky) {
+		t.Errorf("Expected Sticky comment mode, got %q", task.Annotations[reporting.AnnotationGitHubCommentMode])
 	}
 	if task.Annotations[reporting.AnnotationSourceKind] != "issue" {
 		t.Errorf("Expected source-kind 'issue', got %q", task.Annotations[reporting.AnnotationSourceKind])
@@ -1106,7 +1147,7 @@ func TestServeHTTP_IssueCommentOnPR_EnrichesBranch(t *testing.T) {
 	// Swap the fetcher to return a known branch
 	orig := githubPRBranchFetcher
 	defer func() { githubPRBranchFetcher = orig }()
-	githubPRBranchFetcher = func(ctx context.Context, prAPIURL string) (githubPRHeadInfo, error) {
+	githubPRBranchFetcher = func(ctx context.Context, prAPIURL, token string) (githubPRHeadInfo, error) {
 		return githubPRHeadInfo{Branch: "feature-branch", SHA: "enriched-sha-456"}, nil
 	}
 
@@ -1120,6 +1161,13 @@ func TestServeHTTP_IssueCommentOnPR_EnrichesBranch(t *testing.T) {
 			When: kelos.When{
 				GitHubWebhook: &kelos.GitHubWebhook{
 					Events: []string{"issue_comment"},
+					Filters: []kelos.GitHubWebhookFilter{{
+						Event:     "issue_comment",
+						CommentOn: kelos.CommentOnPullRequest,
+					}},
+					Reporting: &kelos.GitHubReporting{
+						Checks: &kelos.GitHubChecksReporting{},
+					},
 				},
 			},
 			TaskTemplate: kelos.TaskTemplate{
@@ -1179,6 +1227,12 @@ func TestServeHTTP_IssueCommentOnPR_EnrichesBranch(t *testing.T) {
 	task := taskList.Items[0]
 	if task.Spec.Prompt != "Review PR on branch feature-branch" {
 		t.Errorf("Expected prompt with enriched branch, got %q", task.Spec.Prompt)
+	}
+	if task.Annotations[reporting.AnnotationGitHubChecks] != "enabled" {
+		t.Errorf("Expected github-checks 'enabled', got %q", task.Annotations[reporting.AnnotationGitHubChecks])
+	}
+	if task.Annotations[reporting.AnnotationSourceSHA] != "enriched-sha-456" {
+		t.Errorf("Expected source-sha 'enriched-sha-456', got %q", task.Annotations[reporting.AnnotationSourceSHA])
 	}
 }
 
@@ -1642,6 +1696,122 @@ func TestGenericServeHTTP_SkipsNonMatchingFilters(t *testing.T) {
 	}
 }
 
+func TestGenericServeHTTP_ExcludeFilters(t *testing.T) {
+	tests := []struct {
+		name           string
+		excludeFilters []kelos.GenericWebhookFilter
+		wantTasks      int
+		// wantLogContains asserts the delivery was skipped for the stated
+		// reason. Without it, a malformed expression treated as a plain match
+		// would be indistinguishable from a successful exclusion.
+		wantLogContains string
+	}{
+		{
+			name: "matching exclude filter skips the delivery",
+			excludeFilters: []kelos.GenericWebhookFilter{
+				{Field: "$.data.properties.Status.select.name", Value: strPtr("Ready for AI")},
+			},
+			wantTasks: 0,
+		},
+		{
+			name: "matching exclude pattern skips the delivery",
+			excludeFilters: []kelos.GenericWebhookFilter{
+				{Field: "$.type", Pattern: `^page\.`},
+			},
+			wantTasks: 0,
+		},
+		{
+			name: "non-matching exclude filter still creates a task",
+			excludeFilters: []kelos.GenericWebhookFilter{
+				{Field: "$.data.properties.Status.select.name", Value: strPtr("Done")},
+			},
+			wantTasks: 1,
+		},
+		{
+			name: "exclude filter on missing field still creates a task",
+			excludeFilters: []kelos.GenericWebhookFilter{
+				{Field: "$.data.properties.Author.select.name", Value: strPtr("bot")},
+			},
+			wantTasks: 1,
+		},
+		{
+			// A malformed exclude expression must fail closed: the spawner is
+			// skipped rather than spawning a Task the exclusion was meant to stop.
+			name: "malformed exclude JSONPath skips the spawner",
+			excludeFilters: []kelos.GenericWebhookFilter{
+				{Field: "$.[", Value: strPtr("Ready for AI")},
+			},
+			wantTasks:       0,
+			wantLogContains: "invalid JSONPath expression",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spawner := &kelos.TaskSpawner{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "notion-handler",
+					Namespace: "default",
+					UID:       "notion-uid-exclude",
+				},
+				Spec: kelos.TaskSpawnerSpec{
+					When: kelos.When{
+						GenericWebhook: &kelos.GenericWebhook{
+							Source: "notion",
+							FieldMapping: map[string]string{
+								"id":    "$.data.id",
+								"title": "$.data.properties.Name.title[0].plain_text",
+							},
+							Filters: []kelos.GenericWebhookFilter{
+								{Field: "$.type", Value: strPtr("page.updated")},
+							},
+							ExcludeFilters: tt.excludeFilters,
+						},
+					},
+					TaskTemplate: kelos.TaskTemplate{
+						Type: "claude-code",
+						Credentials: &kelos.Credentials{
+							Type: "api-key",
+						},
+						PromptTemplate: "{{.title}}",
+					},
+				},
+			}
+
+			handler := newGenericTestHandler(t, spawner)
+			var logs bytes.Buffer
+			handler.log = funcr.New(func(prefix, args string) {
+				logs.WriteString(prefix + args + "\n")
+			}, funcr.Options{})
+
+			req := httptest.NewRequest(http.MethodPost, "/webhook/notion", bytes.NewReader([]byte(genericNotionPayload)))
+			rr := httptest.NewRecorder()
+			handler.ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusOK {
+				t.Fatalf("Expected %d, got %d", http.StatusOK, rr.Code)
+			}
+
+			var taskList kelos.TaskList
+			if err := handler.client.List(context.Background(), &taskList); err != nil {
+				t.Fatal(err)
+			}
+			if len(taskList.Items) != tt.wantTasks {
+				t.Fatalf("Expected %d tasks, got %d", tt.wantTasks, len(taskList.Items))
+			}
+
+			switch {
+			case tt.wantLogContains != "":
+				if !strings.Contains(logs.String(), tt.wantLogContains) {
+					t.Errorf("Expected logs to contain %q, got: %s", tt.wantLogContains, logs.String())
+				}
+			case strings.Contains(logs.String(), "invalid JSONPath expression"):
+				t.Errorf("Unexpected JSONPath error logged for a well-formed filter: %s", logs.String())
+			}
+		})
+	}
+}
+
 func TestGenericServeHTTP_SkipsWrongSourceName(t *testing.T) {
 	// Spawner listens for "notion" but webhook comes to /webhook/sentry
 	spawner := &kelos.TaskSpawner{
@@ -2052,7 +2222,7 @@ func TestServeHTTP_ChecksAnnotationsForPRWebhook(t *testing.T) {
 	}
 }
 
-func TestServeHTTP_ChecksAnnotationsSkippedForNonPRWebhook(t *testing.T) {
+func TestServeHTTP_ChecksAnnotationsSkippedForIssueComment(t *testing.T) {
 	spawner := &kelos.TaskSpawner{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "checks-issue-spawner",
@@ -2062,7 +2232,11 @@ func TestServeHTTP_ChecksAnnotationsSkippedForNonPRWebhook(t *testing.T) {
 		Spec: kelos.TaskSpawnerSpec{
 			When: kelos.When{
 				GitHubWebhook: &kelos.GitHubWebhook{
-					Events: []string{"issues", "pull_request"},
+					Events: []string{"issue_comment", "pull_request"},
+					Filters: []kelos.GitHubWebhookFilter{{
+						Event:     "issue_comment",
+						CommentOn: kelos.CommentOnIssue,
+					}},
 					Reporting: &kelos.GitHubReporting{
 						Enabled: true,
 						Checks:  &kelos.GitHubChecksReporting{},
@@ -2084,11 +2258,11 @@ func TestServeHTTP_ChecksAnnotationsSkippedForNonPRWebhook(t *testing.T) {
 
 	handler := newTestHandler(t, spawner)
 
-	payload := []byte(issuesPayload)
+	payload := []byte(issueCommentPayload)
 	sig := signPayload(payload, []byte(testSecret))
 
 	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(payload))
-	req.Header.Set(GitHubEventHeader, "issues")
+	req.Header.Set(GitHubEventHeader, "issue_comment")
 	req.Header.Set(GitHubSignatureHeader, sig)
 	req.Header.Set(GitHubDeliveryHeader, "checks-issue-delivery")
 	rr := httptest.NewRecorder()
@@ -2107,16 +2281,14 @@ func TestServeHTTP_ChecksAnnotationsSkippedForNonPRWebhook(t *testing.T) {
 	}
 
 	task := taskList.Items[0]
-	// Comment reporting should be enabled
 	if task.Annotations[reporting.AnnotationGitHubReporting] != "enabled" {
 		t.Errorf("Expected github-reporting 'enabled', got %q", task.Annotations[reporting.AnnotationGitHubReporting])
 	}
-	// Checks should NOT be stamped for issue events even when checks is configured
 	if _, ok := task.Annotations[reporting.AnnotationGitHubChecks]; ok {
-		t.Error("Expected no github-checks annotation for issue event")
+		t.Error("Expected no github-checks annotation for issue comment")
 	}
 	if _, ok := task.Annotations[reporting.AnnotationSourceSHA]; ok {
-		t.Error("Expected no source-sha annotation for issue event")
+		t.Error("Expected no source-sha annotation for issue comment")
 	}
 }
 
@@ -2285,6 +2457,42 @@ func TestServeHTTP_DuplicateTasksDedupedByNameTemplate(t *testing.T) {
 	}
 	if got := taskList.Items[0].Name; got != "responder-pr-123" {
 		t.Errorf("task name = %q, want %q", got, "responder-pr-123")
+	}
+}
+
+func TestServeHTTP_AssignsTaskSpawnerCredentials(t *testing.T) {
+	spawner := nameTemplateSpawner()
+	spawner.Spec.TaskTemplate.Credentials = nil
+	spawner.Spec.Credentials = []kelos.SpawnerCredential{
+		{Name: "account-b", Type: kelos.CredentialTypeOAuth, SecretRef: kelos.SecretReference{Name: "secret-b"}},
+		{Name: "account-a", Type: kelos.CredentialTypeOAuth, SecretRef: kelos.SecretReference{Name: "secret-a"}},
+	}
+	handler := newTestHandler(t, spawner)
+
+	sendPRWebhook(t, handler, prWebhookPayload(123), "d-account-1")
+	sendPRWebhook(t, handler, prWebhookPayload(124), "d-account-2")
+
+	var taskList kelos.TaskList
+	if err := handler.client.List(context.Background(), &taskList); err != nil {
+		t.Fatal(err)
+	}
+	if len(taskList.Items) != 2 {
+		t.Fatalf("Task count = %d, want 2", len(taskList.Items))
+	}
+	wantSecrets := map[string]string{"account-a": "secret-a", "account-b": "secret-b"}
+	for i := range taskList.Items {
+		task := &taskList.Items[i]
+		if task.Spec.Credentials == nil || task.Spec.Credentials.SecretRef == nil {
+			t.Fatalf("Task %s has no assigned credentials", task.Name)
+		}
+		credentialName := task.Labels[spawnercredentials.AssignmentLabel]
+		wantSecret, ok := wantSecrets[credentialName]
+		if !ok {
+			t.Fatalf("Task %s credential label = %q, want a configured credential", task.Name, credentialName)
+		}
+		if got := task.Spec.Credentials.SecretRef.Name; got != wantSecret {
+			t.Errorf("Task %s Secret = %q, want %q for %s", task.Name, got, wantSecret, credentialName)
+		}
 	}
 }
 

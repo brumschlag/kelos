@@ -32,6 +32,8 @@ type TaskRecordExpansion interface{}
 
 type TaskSpawnerExpansion interface{}
 
+type WebhookGatewayExpansion interface{}
+
 type WorkerPoolExpansion interface{}
 
 type WorkspaceExpansion interface{}

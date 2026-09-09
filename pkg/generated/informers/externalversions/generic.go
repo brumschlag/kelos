@@ -78,6 +78,8 @@ func (f *sharedInformerFactory) ForResource(resource schema.GroupVersionResource
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Api().V1alpha2().TaskRecords().Informer()}, nil
 	case v1alpha2.SchemeGroupVersion.WithResource("taskspawners"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Api().V1alpha2().TaskSpawners().Informer()}, nil
+	case v1alpha2.SchemeGroupVersion.WithResource("webhookgateways"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Api().V1alpha2().WebhookGateways().Informer()}, nil
 	case v1alpha2.SchemeGroupVersion.WithResource("workerpools"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Api().V1alpha2().WorkerPools().Informer()}, nil
 	case v1alpha2.SchemeGroupVersion.WithResource("workspaces"):

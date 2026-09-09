@@ -461,6 +461,157 @@ func TestMatchesGenericFilters_BooleanValues(t *testing.T) {
 	assert.True(t, matched)
 }
 
+func TestMatchesGenericExcludeFilters(t *testing.T) {
+	payload := `{"action": "created", "level": "error", "actor": {"login": "dependabot[bot]"}}`
+	eventData, err := ParseGenericWebhook([]byte(payload))
+	require.NoError(t, err)
+
+	tests := []struct {
+		name    string
+		filters []kelos.GenericWebhookFilter
+		want    bool
+		wantErr bool
+	}{
+		{
+			name: "no exclude filters excludes nothing",
+			want: false,
+		},
+		{
+			name: "exact value match excludes",
+			filters: []kelos.GenericWebhookFilter{
+				{Field: "$.actor.login", Value: strPtr("dependabot[bot]")},
+			},
+			want: true,
+		},
+		{
+			name: "exact value mismatch does not exclude",
+			filters: []kelos.GenericWebhookFilter{
+				{Field: "$.actor.login", Value: strPtr("octocat")},
+			},
+			want: false,
+		},
+		{
+			name: "regex pattern match excludes",
+			filters: []kelos.GenericWebhookFilter{
+				{Field: "$.actor.login", Pattern: `\[bot\]$`},
+			},
+			want: true,
+		},
+		{
+			name: "OR semantics - any match excludes",
+			filters: []kelos.GenericWebhookFilter{
+				{Field: "$.actor.login", Value: strPtr("octocat")},
+				{Field: "$.level", Value: strPtr("error")},
+			},
+			want: true,
+		},
+		{
+			name: "OR semantics - none match",
+			filters: []kelos.GenericWebhookFilter{
+				{Field: "$.actor.login", Value: strPtr("octocat")},
+				{Field: "$.level", Value: strPtr("warning")},
+			},
+			want: false,
+		},
+		{
+			name: "missing field does not exclude",
+			filters: []kelos.GenericWebhookFilter{
+				{Field: "$.nonexistent", Value: strPtr("anything")},
+			},
+			want: false,
+		},
+		{
+			name: "invalid regex returns error",
+			filters: []kelos.GenericWebhookFilter{
+				{Field: "$.actor.login", Pattern: "[invalid"},
+			},
+			want:    false,
+			wantErr: true,
+		},
+		{
+			name: "malformed JSONPath returns error instead of failing open",
+			filters: []kelos.GenericWebhookFilter{
+				{Field: "$.[", Value: strPtr("dependabot[bot]")},
+			},
+			want:    false,
+			wantErr: true,
+		},
+		{
+			name: "empty field returns error instead of failing open",
+			filters: []kelos.GenericWebhookFilter{
+				{Field: "", Value: strPtr("dependabot[bot]")},
+			},
+			want:    false,
+			wantErr: true,
+		},
+		{
+			name: "malformed JSONPath errors even when a later filter would match",
+			filters: []kelos.GenericWebhookFilter{
+				{Field: "not-a-path", Value: strPtr("anything")},
+				{Field: "$.level", Value: strPtr("error")},
+			},
+			want:    false,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			excluded, err := MatchesGenericExcludeFilters(tt.filters, eventData.Payload)
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, tt.want, excluded)
+		})
+	}
+}
+
+func TestMatchesGenericFilters_MalformedJSONPath(t *testing.T) {
+	payload := `{"level": "error"}`
+	eventData, err := ParseGenericWebhook([]byte(payload))
+	require.NoError(t, err)
+
+	for _, field := range []string{"$.[", "", "not-a-path"} {
+		t.Run("filters "+field, func(t *testing.T) {
+			filters := []kelos.GenericWebhookFilter{{Field: field, Value: strPtr("error")}}
+
+			matched, err := MatchesGenericFilters(filters, eventData.Payload)
+			assert.Error(t, err)
+			assert.Contains(t, err.Error(), "invalid JSONPath expression")
+			assert.False(t, matched)
+		})
+
+		t.Run("excludeFilters "+field, func(t *testing.T) {
+			filters := []kelos.GenericWebhookFilter{{Field: field, Value: strPtr("error")}}
+
+			excluded, err := MatchesGenericExcludeFilters(filters, eventData.Payload)
+			assert.Error(t, err)
+			assert.Contains(t, err.Error(), "invalid JSONPath expression")
+			assert.False(t, excluded)
+		})
+	}
+}
+
+// A field that is simply absent from the payload is not a configuration error —
+// it must stay a plain non-match so optional filters keep working.
+func TestMatchesGenericFilters_MissingFieldIsNotAnError(t *testing.T) {
+	payload := `{"level": "error"}`
+	eventData, err := ParseGenericWebhook([]byte(payload))
+	require.NoError(t, err)
+
+	filters := []kelos.GenericWebhookFilter{{Field: "$.nonexistent", Value: strPtr("error")}}
+
+	matched, err := MatchesGenericFilters(filters, eventData.Payload)
+	assert.NoError(t, err)
+	assert.False(t, matched)
+
+	excluded, err := MatchesGenericExcludeFilters(filters, eventData.Payload)
+	assert.NoError(t, err)
+	assert.False(t, excluded)
+}
+
 func TestExtractGenericWorkItem(t *testing.T) {
 	eventData := &GenericEventData{
 		Fields: map[string]string{

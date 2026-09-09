@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/base64"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"os"
@@ -715,14 +717,67 @@ func crdConversionCABundleMatches(crd *unstructured.Unstructured, expectedCABund
 	if err != nil || !ok {
 		return false
 	}
-	switch v := caBundle.(type) {
-	case string:
-		return v == expectedCABundle
-	case []byte:
-		return string(v) == expectedCABundle || base64.StdEncoding.EncodeToString(v) == expectedCABundle
-	default:
+	injectedCertificates, ok := certificateBundle(caBundle)
+	if !ok {
 		return false
 	}
+	requiredCertificates, ok := certificateBundle(expectedCABundle)
+	if !ok {
+		return false
+	}
+
+	// CA injection can retain a retiring certificate during rotation.
+	injectedCertificateSet := make(map[string]struct{}, len(injectedCertificates))
+	for _, certificate := range injectedCertificates {
+		injectedCertificateSet[string(certificate.Raw)] = struct{}{}
+	}
+	for _, certificate := range requiredCertificates {
+		if _, ok := injectedCertificateSet[string(certificate.Raw)]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func certificateBundle(value interface{}) ([]*x509.Certificate, bool) {
+	var data []byte
+	switch v := value.(type) {
+	case string:
+		data = []byte(v)
+	case []byte:
+		data = v
+	default:
+		return nil, false
+	}
+
+	if certificates, ok := parsePEMCertificates(data); ok {
+		return certificates, true
+	}
+	decoded, err := base64.StdEncoding.DecodeString(string(data))
+	if err != nil {
+		return nil, false
+	}
+	return parsePEMCertificates(decoded)
+}
+
+func parsePEMCertificates(data []byte) ([]*x509.Certificate, bool) {
+	var certificates []*x509.Certificate
+	for len(bytes.TrimSpace(data)) > 0 {
+		block, rest := pem.Decode(data)
+		if block == nil {
+			return nil, false
+		}
+		data = rest
+		if block.Type != "CERTIFICATE" {
+			return nil, false
+		}
+		certificate, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, false
+		}
+		certificates = append(certificates, certificate)
+	}
+	return certificates, len(certificates) > 0
 }
 
 func secretDataValue(secret *unstructured.Unstructured, key string) (string, bool) {
@@ -859,8 +914,8 @@ func newUninstallCommand(cfg *ClientConfig) *cobra.Command {
 			}
 
 			fmt.Fprintf(os.Stdout, "Removing kelos controller\n")
-			if err := deleteSessionServerRBAC(ctx, dyn); err != nil {
-				return fmt.Errorf("removing Session server RBAC: %w", err)
+			if err := deleteConsoleServerRBAC(ctx, dyn); err != nil {
+				return fmt.Errorf("removing Console server RBAC: %w", err)
 			}
 			if err := deleteManifests(ctx, dc, dyn, controllerManifest); err != nil {
 				return fmt.Errorf("removing controller: %w", err)
@@ -879,16 +934,20 @@ func newUninstallCommand(cfg *ClientConfig) *cobra.Command {
 	return cmd
 }
 
-func deleteSessionServerRBAC(ctx context.Context, dyn dynamic.Interface) error {
+func deleteConsoleServerRBAC(ctx context.Context, dyn dynamic.Interface) error {
 	resources := []struct {
 		gvr        schema.GroupVersionResource
 		name       string
 		kind       string
 		namespaced bool
 	}{
+		{gvr: clusterRoleBindingGVR, name: "kelos-console-server-rolebinding", kind: "ClusterRoleBinding"},
 		{gvr: clusterRoleBindingGVR, name: "kelos-session-server-rolebinding", kind: "ClusterRoleBinding"},
+		{gvr: clusterRoleGVR, name: "kelos-console-server-role", kind: "ClusterRole"},
 		{gvr: clusterRoleGVR, name: "kelos-session-server-role", kind: "ClusterRole"},
+		{gvr: roleBindingGVR, name: "kelos-console-server-rolebinding", kind: "RoleBinding", namespaced: true},
 		{gvr: roleBindingGVR, name: "kelos-session-server-rolebinding", kind: "RoleBinding", namespaced: true},
+		{gvr: roleGVR, name: "kelos-console-server-role", kind: "Role", namespaced: true},
 		{gvr: roleGVR, name: "kelos-session-server-role", kind: "Role", namespaced: true},
 	}
 	for _, resource := range resources {
@@ -897,7 +956,7 @@ func deleteSessionServerRBAC(ctx context.Context, dyn dynamic.Interface) error {
 			if errors.IsNotFound(err) {
 				continue
 			}
-			return fmt.Errorf("listing Session server %s resources: %w", resource.kind, err)
+			return fmt.Errorf("listing Console server %s resources: %w", resource.kind, err)
 		}
 		for i := range list.Items {
 			item := &list.Items[i]
@@ -911,7 +970,7 @@ func deleteSessionServerRBAC(ctx context.Context, dyn dynamic.Interface) error {
 				err = dyn.Resource(resource.gvr).Delete(ctx, item.GetName(), metav1.DeleteOptions{})
 			}
 			if err != nil && !errors.IsNotFound(err) {
-				return fmt.Errorf("deleting Session server %s %s: %w", resource.kind, item.GetName(), err)
+				return fmt.Errorf("deleting Console server %s %s: %w", resource.kind, item.GetName(), err)
 			}
 		}
 	}

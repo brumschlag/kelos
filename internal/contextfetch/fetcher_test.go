@@ -2,10 +2,15 @@ package contextfetch
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -655,5 +660,244 @@ func TestApplyJSONPathFilter(t *testing.T) {
 				t.Errorf("got %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// gitHubAppSecret returns a Secret populated with valid GitHub App credentials
+// backed by a freshly generated RSA key.
+func gitHubAppSecret(t *testing.T, name string) *corev1.Secret {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(key),
+	})
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		Data: map[string][]byte{
+			"appID":          []byte("12345"),
+			"installationID": []byte("67890"),
+			"privateKey":     keyPEM,
+		},
+	}
+}
+
+// tokenServer returns an HTTPS httptest server that mints installation tokens,
+// counting how many times it is called. Callers must point the Fetcher's
+// GitHubTokenHTTPClient at server.Client() so the self-signed cert is trusted.
+func tokenServer(t *testing.T, token string, count *int) *httptest.Server {
+	t.Helper()
+	var mu sync.Mutex
+	return httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/app/installations/67890/access_tokens" {
+			t.Errorf("unexpected token path: %s", r.URL.Path)
+		}
+		mu.Lock()
+		*count++
+		mu.Unlock()
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"token":      token,
+			"expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		})
+	}))
+}
+
+func TestFetchAll_GitHubAppAuth(t *testing.T) {
+	var gotAuth string
+	target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Write([]byte("ok"))
+	}))
+	defer target.Close()
+
+	var mintCount int
+	tokens := tokenServer(t, "ghs_app_token", &mintCount)
+	defer tokens.Close()
+
+	cl := fake.NewClientBuilder().WithScheme(newTestScheme()).
+		WithObjects(gitHubAppSecret(t, "gh-app")).Build()
+
+	f := newFetcher(func(f *Fetcher) {
+		f.HTTPClient = target.Client()
+		f.Client = cl
+		f.GitHubTokenHTTPClient = tokens.Client()
+	})
+	sources := []kelos.ContextSource{{
+		Name: "app",
+		HTTP: &kelos.HTTPContextSource{
+			URL: target.URL,
+			GitHubAppAuth: &kelos.GitHubAppContextAuth{
+				SecretRef:  kelos.SecretReference{Name: "gh-app"},
+				APIBaseURL: tokens.URL,
+			},
+			AllowInsecure: true,
+		},
+	}}
+
+	result, err := f.FetchAll(context.Background(), sources, map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := result["app"]; got != "ok" {
+		t.Errorf("expected body 'ok', got %v", got)
+	}
+	if gotAuth != "token ghs_app_token" {
+		t.Errorf("expected 'token ghs_app_token', got %q", gotAuth)
+	}
+	if mintCount != 1 {
+		t.Errorf("expected 1 token mint, got %d", mintCount)
+	}
+}
+
+func TestFetchAll_GitHubAppAuth_CachesAcrossItems(t *testing.T) {
+	target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer target.Close()
+
+	var mintCount int
+	tokens := tokenServer(t, "ghs_app_token", &mintCount)
+	defer tokens.Close()
+
+	cl := fake.NewClientBuilder().WithScheme(newTestScheme()).
+		WithObjects(gitHubAppSecret(t, "gh-app")).Build()
+
+	f := newFetcher(func(f *Fetcher) {
+		f.HTTPClient = target.Client()
+		f.Client = cl
+		f.GitHubTokenHTTPClient = tokens.Client()
+	})
+	sources := []kelos.ContextSource{{
+		Name: "app",
+		HTTP: &kelos.HTTPContextSource{
+			URL: target.URL,
+			GitHubAppAuth: &kelos.GitHubAppContextAuth{
+				SecretRef:  kelos.SecretReference{Name: "gh-app"},
+				APIBaseURL: tokens.URL,
+			},
+			AllowInsecure: true,
+		},
+	}}
+
+	// Two work items share the same Fetcher; the token should be minted once.
+	for i := 0; i < 2; i++ {
+		if _, err := f.FetchAll(context.Background(), sources, map[string]interface{}{}); err != nil {
+			t.Fatalf("item %d: unexpected error: %v", i, err)
+		}
+	}
+	if mintCount != 1 {
+		t.Errorf("expected token minted once across items, got %d", mintCount)
+	}
+}
+
+func TestFetchAll_GitHubAppAuth_ExplicitAuthWins(t *testing.T) {
+	var gotAuth string
+	target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Write([]byte("ok"))
+	}))
+	defer target.Close()
+
+	var mintCount int
+	tokens := tokenServer(t, "ghs_app_token", &mintCount)
+	defer tokens.Close()
+
+	cl := fake.NewClientBuilder().WithScheme(newTestScheme()).
+		WithObjects(gitHubAppSecret(t, "gh-app")).Build()
+
+	f := newFetcher(func(f *Fetcher) {
+		f.HTTPClient = target.Client()
+		f.Client = cl
+		f.GitHubTokenHTTPClient = tokens.Client()
+	})
+	sources := []kelos.ContextSource{{
+		Name: "app",
+		HTTP: &kelos.HTTPContextSource{
+			URL:     target.URL,
+			Headers: map[string]string{"Authorization": "Bearer explicit"},
+			GitHubAppAuth: &kelos.GitHubAppContextAuth{
+				SecretRef:  kelos.SecretReference{Name: "gh-app"},
+				APIBaseURL: tokens.URL,
+			},
+			AllowInsecure: true,
+		},
+	}}
+
+	if _, err := f.FetchAll(context.Background(), sources, map[string]interface{}{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotAuth != "Bearer explicit" {
+		t.Errorf("expected explicit Authorization to win, got %q", gotAuth)
+	}
+	if mintCount != 0 {
+		t.Errorf("expected no token minting when Authorization is explicit, got %d", mintCount)
+	}
+}
+
+func TestFetchAll_GitHubAppAuth_MissingSecret(t *testing.T) {
+	target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer target.Close()
+
+	cl := fake.NewClientBuilder().WithScheme(newTestScheme()).Build()
+
+	f := newFetcher(func(f *Fetcher) {
+		f.HTTPClient = target.Client()
+		f.Client = cl
+	})
+	sources := []kelos.ContextSource{{
+		Name: "app",
+		HTTP: &kelos.HTTPContextSource{
+			URL:           target.URL,
+			GitHubAppAuth: &kelos.GitHubAppContextAuth{SecretRef: kelos.SecretReference{Name: "missing"}},
+			AllowInsecure: true,
+		},
+	}}
+
+	_, err := f.FetchAll(context.Background(), sources, map[string]interface{}{})
+	if err == nil {
+		t.Fatal("expected error for missing GitHub App secret, got nil")
+	}
+	if !strings.Contains(err.Error(), "missing") {
+		t.Errorf("expected error to name the secret, got %v", err)
+	}
+}
+
+func TestFetchAll_GitHubAppAuth_RejectsInsecureAPIBaseURL(t *testing.T) {
+	target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer target.Close()
+
+	cl := fake.NewClientBuilder().WithScheme(newTestScheme()).
+		WithObjects(gitHubAppSecret(t, "gh-app")).Build()
+
+	f := newFetcher(func(f *Fetcher) {
+		f.HTTPClient = target.Client()
+		f.Client = cl
+	})
+	sources := []kelos.ContextSource{{
+		Name: "app",
+		HTTP: &kelos.HTTPContextSource{
+			URL: target.URL,
+			GitHubAppAuth: &kelos.GitHubAppContextAuth{
+				SecretRef:  kelos.SecretReference{Name: "gh-app"},
+				APIBaseURL: "http://insecure.example.com/api/v3",
+			},
+			AllowInsecure: true,
+		},
+	}}
+
+	_, err := f.FetchAll(context.Background(), sources, map[string]interface{}{})
+	if err == nil {
+		t.Fatal("expected error for non-https apiBaseURL, got nil")
+	}
+	if !strings.Contains(err.Error(), "https") {
+		t.Errorf("expected error to mention https requirement, got %v", err)
 	}
 }

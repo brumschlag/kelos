@@ -46,7 +46,11 @@ In addition to the standard webhook variables, `check_run` events expose:
 
 1. Enable the **Check runs** event on your GitHub repository webhook (Settings →
    Webhooks → your webhook → "Let me select individual events").
-2. Apply the manifests:
+2. Edit `taskspawner.yaml` and replace both `myorg/myrepo` placeholders with
+   your repository. Set `spec.when.githubWebhook.repository` to the repository
+   name in `owner/repo` format and set the Workspace's `spec.repo` to its clone
+   URL. Both values must identify the repository configured in step 1.
+3. Apply the manifests:
 
    ```bash
    kubectl apply -f taskspawner.yaml

@@ -1,0 +1,76 @@
+:root {
+  color-scheme: light;
+  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #0d0d0d;
+  background: #fff;
+}
+
+* { box-sizing: border-box; }
+
+body { margin: 0; min-height: 100vh; min-height: 100dvh; }
+
+.login-shell {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: calc(32px + env(safe-area-inset-top)) calc(20px + env(safe-area-inset-right)) calc(32px + env(safe-area-inset-bottom)) calc(20px + env(safe-area-inset-left));
+  overflow-y: auto;
+  background: #fff;
+}
+
+.login-card {
+  width: min(100%, 400px);
+  padding: 32px;
+}
+
+.brand-mark {
+  width: 40px;
+  height: 40px;
+  display: grid;
+  place-items: center;
+  margin: 0 auto;
+  border-radius: 50%;
+  color: white;
+  font: 700 17px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: #0d0d0d;
+}
+
+.eyebrow { margin: 24px 0 8px; color: #6b6b6b; font-size: 12px; font-weight: 600; text-align: center; }
+h1 { margin: 0; font-size: clamp(28px, 7vw, 34px); font-weight: 600; line-height: 1.15; letter-spacing: -.035em; text-align: center; }
+.intro { margin: 14px 0 30px; color: #6b6b6b; font-size: 14px; line-height: 1.55; text-align: center; }
+label { display: block; margin-bottom: 9px; color: #333; font-size: 13px; font-weight: 600; }
+.token-field { display: flex; border: 1px solid #c7c7c7; border-radius: 10px; background: #fff; transition: border-color .2s, box-shadow .2s; }
+.token-field:focus-within { border-color: #0d0d0d; box-shadow: 0 0 0 1px #0d0d0d; }
+input { min-width: 0; flex: 1; padding: 14px 15px; border: 0; outline: 0; border-radius: inherit; background: transparent; color: #0d0d0d; font: inherit; }
+.token-field button { border: 0; padding: 0 14px; background: transparent; color: #6b6b6b; font: 600 12px/1 inherit; cursor: pointer; }
+.error { min-height: 22px; padding-top: 7px; color: #c2413a; font-size: 12px; }
+.sign-in { width: 100%; margin-top: 8px; padding: 14px 18px; border: 0; border-radius: 999px; background: #0d0d0d; color: white; font: 600 14px/1 inherit; cursor: pointer; transition: background .15s; }
+.sign-in:hover { background: #333; }
+.sign-in:disabled { opacity: .65; transform: none; cursor: wait; }
+.footnote { margin: 25px 0 0; padding-top: 21px; border-top: 1px solid #e5e5e5; color: #8f8f8f; font-size: 12px; line-height: 1.5; text-align: center; }
+@media (max-width: 520px) {
+  .login-shell { place-items: start center; }
+  .login-card { padding: max(40px, 10vh) 20px 28px; }
+}
+
+@media (max-height: 620px) {
+  .login-shell { place-items: start center; overflow-y: auto; }
+  .login-card { padding-top: 28px; padding-bottom: 28px; }
+  .eyebrow { margin-top: 22px; }
+  .intro { margin-bottom: 23px; }
+}
+
+@media (prefers-color-scheme: dark) {
+  :root { color: #ececec; background: #212121; }
+  .login-shell { background: #212121; }
+  .brand-mark, .sign-in { color: #171717; background: #ececec; }
+  .sign-in:hover { background: #d4d4d4; }
+  .eyebrow, .intro, .footnote { color: #a9a9a9; }
+  label { color: #dedede; }
+  .token-field { border-color: #555; background: #2f2f2f; }
+  .token-field button { color: #c5c5c5; }
+  .token-field:focus-within { border-color: #ececec; box-shadow: 0 0 0 1px #ececec; }
+  input { color: #ececec; }
+  .footnote { border-color: #383838; }
+}

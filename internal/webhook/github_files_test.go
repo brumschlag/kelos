@@ -22,10 +22,7 @@ import (
 	kelos "github.com/kelos-dev/kelos/api/v1alpha2"
 )
 
-func TestFetchPRChangedFiles_FallsBackToGlobalResolver(t *testing.T) {
-	origResolver := githubTokenResolver
-	defer func() { githubTokenResolver = origResolver }()
-
+func TestFetchPRChangedFiles_FallsBackToHandlerResolver(t *testing.T) {
 	// Set up a test server that requires auth and returns file list.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
@@ -55,12 +52,11 @@ func TestFetchPRChangedFiles_FallsBackToGlobalResolver(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 	cl := fake.NewClientBuilder().WithScheme(scheme).Build()
 
-	// Set global resolver.
-	githubTokenResolver = func(context.Context) (string, error) {
+	fallbackResolver := func(context.Context) (string, error) {
 		return "global-test-token", nil
 	}
 
-	files, err := fetchPRChangedFiles(context.Background(), cl, spawner, srv.URL, "org", "repo", 1)
+	files, err := fetchPRChangedFiles(context.Background(), cl, spawner, fallbackResolver, srv.URL, "org", "repo", 1)
 	if err != nil {
 		t.Fatalf("fetchPRChangedFiles() error = %v", err)
 	}
@@ -73,9 +69,6 @@ func TestFetchPRChangedFiles_FallsBackToGlobalResolver(t *testing.T) {
 }
 
 func TestFetchPRChangedFiles_PrefersWorkspaceToken(t *testing.T) {
-	origResolver := githubTokenResolver
-	defer func() { githubTokenResolver = origResolver }()
-
 	var receivedAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedAuth = r.Header.Get("Authorization")
@@ -109,12 +102,12 @@ func TestFetchPRChangedFiles_PrefersWorkspaceToken(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret, ws).Build()
 
-	// Set global resolver — should NOT be used since workspace provides a token.
-	githubTokenResolver = func(context.Context) (string, error) {
-		return "global-token-should-not-be-used", nil
+	fallbackResolver := func(context.Context) (string, error) {
+		t.Fatal("fallback resolver should not be called when the workspace provides a token")
+		return "", nil
 	}
 
-	_, err := fetchPRChangedFiles(context.Background(), cl, spawner, srv.URL, "org", "repo", 1)
+	_, err := fetchPRChangedFiles(context.Background(), cl, spawner, fallbackResolver, srv.URL, "org", "repo", 1)
 	if err != nil {
 		t.Fatalf("fetchPRChangedFiles() error = %v", err)
 	}
@@ -124,9 +117,6 @@ func TestFetchPRChangedFiles_PrefersWorkspaceToken(t *testing.T) {
 }
 
 func TestFetchSessionSpawnerPRChangedFiles_PrefersWorkspaceToken(t *testing.T) {
-	origResolver := githubTokenResolver
-	defer func() { githubTokenResolver = origResolver }()
-
 	var receivedAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedAuth = r.Header.Get("Authorization")
@@ -155,11 +145,12 @@ func TestFetchSessionSpawnerPRChangedFiles_PrefersWorkspaceToken(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret, workspace).Build()
 
-	githubTokenResolver = func(context.Context) (string, error) {
-		return "global-token-should-not-be-used", nil
+	fallbackResolver := func(context.Context) (string, error) {
+		t.Fatal("fallback resolver should not be called when the workspace provides a token")
+		return "", nil
 	}
 
-	files, err := fetchSessionSpawnerPRChangedFiles(context.Background(), cl, spawner, srv.URL, "org", "repo", 1)
+	files, err := fetchSessionSpawnerPRChangedFiles(context.Background(), cl, spawner, fallbackResolver, srv.URL, "org", "repo", 1)
 	if err != nil {
 		t.Fatalf("fetchSessionSpawnerPRChangedFiles() error = %v", err)
 	}
@@ -172,9 +163,6 @@ func TestFetchSessionSpawnerPRChangedFiles_PrefersWorkspaceToken(t *testing.T) {
 }
 
 func TestFetchPRChangedFiles_UsesWorkerPoolWorkspaceToken(t *testing.T) {
-	origResolver := githubTokenResolver
-	defer func() { githubTokenResolver = origResolver }()
-
 	var receivedAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedAuth = r.Header.Get("Authorization")
@@ -215,11 +203,12 @@ func TestFetchPRChangedFiles_UsesWorkerPoolWorkspaceToken(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret, ws, pool).Build()
 
-	githubTokenResolver = func(context.Context) (string, error) {
-		return "global-token-should-not-be-used", nil
+	fallbackResolver := func(context.Context) (string, error) {
+		t.Fatal("fallback resolver should not be called when the workspace provides a token")
+		return "", nil
 	}
 
-	files, err := fetchPRChangedFiles(context.Background(), cl, spawner, srv.URL, "org", "repo", 1)
+	files, err := fetchPRChangedFiles(context.Background(), cl, spawner, fallbackResolver, srv.URL, "org", "repo", 1)
 	if err != nil {
 		t.Fatalf("fetchPRChangedFiles() error = %v", err)
 	}
@@ -232,9 +221,6 @@ func TestFetchPRChangedFiles_UsesWorkerPoolWorkspaceToken(t *testing.T) {
 }
 
 func TestFetchPRChangedFiles_ResolvesGitHubAppFromWorkspace(t *testing.T) {
-	origResolver := githubTokenResolver
-	defer func() { githubTokenResolver = origResolver }()
-
 	// Generate a test RSA key for GitHub App auth.
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -294,12 +280,12 @@ func TestFetchPRChangedFiles_ResolvesGitHubAppFromWorkspace(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret, ws).Build()
 
-	// Global resolver should NOT be used since workspace has GitHub App credentials.
-	githubTokenResolver = func(context.Context) (string, error) {
-		return "global-token-should-not-be-used", nil
+	fallbackResolver := func(context.Context) (string, error) {
+		t.Fatal("fallback resolver should not be called when the workspace provides GitHub App credentials")
+		return "", nil
 	}
 
-	files, err := fetchPRChangedFiles(context.Background(), cl, spawner, srv.URL, "org", "repo", 1)
+	files, err := fetchPRChangedFiles(context.Background(), cl, spawner, fallbackResolver, srv.URL, "org", "repo", 1)
 	if err != nil {
 		t.Fatalf("fetchPRChangedFiles() error = %v", err)
 	}
@@ -312,9 +298,6 @@ func TestFetchPRChangedFiles_ResolvesGitHubAppFromWorkspace(t *testing.T) {
 }
 
 func TestFetchPRChangedFiles_ErrorsOnInvalidWorkspaceSecret(t *testing.T) {
-	origResolver := githubTokenResolver
-	defer func() { githubTokenResolver = origResolver }()
-
 	// Workspace secret exists but contains no GITHUB_TOKEN and no GitHub App keys.
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "bad-secret", Namespace: "default"},
@@ -340,13 +323,12 @@ func TestFetchPRChangedFiles_ErrorsOnInvalidWorkspaceSecret(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret, ws).Build()
 
-	// Global resolver should NOT be reached — the invalid secret must cause an error.
-	githubTokenResolver = func(context.Context) (string, error) {
-		t.Fatal("global resolver should not be called when workspace secret is invalid")
+	fallbackResolver := func(context.Context) (string, error) {
+		t.Fatal("fallback resolver should not be called when the workspace secret is invalid")
 		return "", nil
 	}
 
-	_, err := fetchPRChangedFiles(context.Background(), cl, spawner, "http://unused", "org", "repo", 1)
+	_, err := fetchPRChangedFiles(context.Background(), cl, spawner, fallbackResolver, "http://unused", "org", "repo", 1)
 	if err == nil {
 		t.Fatal("expected error for workspace secret with no valid credentials, got nil")
 	}

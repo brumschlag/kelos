@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -55,7 +56,7 @@ func main() {
 		return
 	}
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "Usage: kelos-session-runtime <serve|health|client>")
+		fmt.Fprintln(os.Stderr, "Usage: kelos-session-runtime <serve|health|client|attachment>")
 		os.Exit(2)
 	}
 
@@ -66,8 +67,63 @@ func main() {
 		runHealth()
 	case "client":
 		runClient()
+	case "attachment":
+		runAttachment()
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command %q\n", os.Args[1])
+		os.Exit(2)
+	}
+}
+
+func runAttachment() {
+	if len(os.Args) < 3 {
+		fmt.Fprintln(os.Stderr, "Usage: kelos-session-runtime attachment <put|get>")
+		os.Exit(2)
+	}
+	store, err := sessionruntime.NewAttachmentStore(envOrDefault("KELOS_SESSION_STATE_DIR", sessionruntime.DefaultStateDir))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Creating Session attachment store failed: %v\n", err)
+		os.Exit(1)
+	}
+	switch os.Args[2] {
+	case "put":
+		flags := flag.NewFlagSet("attachment put", flag.ExitOnError)
+		name := flags.String("name", "", "Original attachment file name")
+		_ = flags.Parse(os.Args[3:])
+		if *name == "" {
+			fmt.Fprintln(os.Stderr, "Attachment name must not be empty")
+			os.Exit(2)
+		}
+		attachment, err := store.Put(*name, os.Stdin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Storing Session attachment failed: %v\n", err)
+			os.Exit(1)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(attachment); err != nil {
+			fmt.Fprintf(os.Stderr, "Writing Session attachment metadata failed: %v\n", err)
+			os.Exit(1)
+		}
+	case "get":
+		if len(os.Args) != 4 {
+			fmt.Fprintln(os.Stderr, "Usage: kelos-session-runtime attachment get <id>")
+			os.Exit(2)
+		}
+		attachment, data, err := store.Open(os.Args[3])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Opening Session attachment failed: %v\n", err)
+			os.Exit(1)
+		}
+		defer data.Close()
+		if err := json.NewEncoder(os.Stdout).Encode(attachment); err != nil {
+			fmt.Fprintf(os.Stderr, "Writing Session attachment metadata failed: %v\n", err)
+			os.Exit(1)
+		}
+		if _, err := io.Copy(os.Stdout, data); err != nil {
+			fmt.Fprintf(os.Stderr, "Writing Session attachment data failed: %v\n", err)
+			os.Exit(1)
+		}
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown attachment command %q\n", os.Args[2])
 		os.Exit(2)
 	}
 }

@@ -183,7 +183,7 @@ The controller watches Secrets labeled `kelos.dev/codex-oauth-refresh=true` and 
 
 If `CODEX_AUTH_JSON` does not include `client_id` (top-level or `tokens.client_id`), Kelos uses OpenAI's public Codex OAuth client id `app_EMoamEEZ73f0CkXaXp7hrann` as the fallback for token refresh.
 
-## Session Web Chat
+## Kelos Console
 
 Sessions use `emptyDir` workspaces unless `spec.volumeClaimTemplate` is set.
 Configure persistent storage on each Session that must preserve provider state,
@@ -205,40 +205,55 @@ matching volume. The claim survives Pod, StatefulSet, and scaling changes and
 is deleted with its owning Session; the StorageClass reclaim policy controls
 the underlying PersistentVolume.
 
-The shared Session server serves the web application, bridges each chat to its
-Session Pod through Kubernetes exec, and can request a destructive Session
-workspace reset after user confirmation. It is disabled by default and requires
-a non-empty static token in an existing Secret:
+The Console provides an overview and manifest browser for Kelos resources in
+the active namespace. Its Sessions view creates and organizes Sessions, bridges
+each chat to its Session Pod through Kubernetes exec, and can request a
+destructive Session workspace reset after user confirmation. Long conversations
+open at a bounded recent page and load earlier messages on demand. The Console
+is disabled by default and requires a non-empty static token in an existing
+Secret:
 
 ```bash
-kubectl create secret generic kelos-session-auth \
+kubectl create secret generic kelos-console-auth \
   --from-literal=token='replace-with-a-long-random-token' \
   -n kelos-system
 
 helm upgrade kelos oci://ghcr.io/kelos-dev/charts/kelos \
   -n kelos-system \
-  --set sessionServer.enabled=true \
-  --set sessionServer.secretName=kelos-session-auth
+  --set consoleServer.enabled=true \
+  --set consoleServer.secretName=kelos-console-auth
 ```
 
 The default Service is cluster-internal. For local access:
 
 ```bash
-kubectl port-forward -n kelos-system service/kelos-session-server 8080:80
+kubectl port-forward -n kelos-system service/kelos-console-server 8080:80
 ```
 
 Then open `http://localhost:8080` and enter the token. The token represents one
-shared user that can create, list, delete, and connect to Sessions in any
-namespace. The web application operates on one active namespace at a time and
-can switch it live from the sidebar. `sessionServer.defaultNamespace` (`default`
-unless overridden) sets the initial active namespace. The selected namespace
-must already exist. Session, Workspace, AgentConfig, and previously used
-credential options are loaded only from the active namespace. The creation
-form and selected Session header can assign Sessions to sidebar sections.
+shared user that can inspect Kelos resources and create, reset, delete, and
+connect to Sessions in any namespace. Treat it as a credential. For access
+beyond a local port-forward,
+terminate TLS at a trusted proxy, set `consoleServer.secureCookie=true`, and
+restrict access to the endpoint at the network or proxy layer. The Console does
+not provide separate user identities or per-user authorization.
+
+The Console operates on one active namespace at a time and can switch it live
+from the sidebar. `consoleServer.defaultNamespace` (`default` unless
+overridden) sets the initial active namespace. The selected namespace must
+already exist. All Console inventory and Session form options are loaded only
+from the active namespace. The creation form and selected Session header can
+assign Sessions to sidebar sections.
 Assignments are stored in the `kelos.dev/session-section` annotation, and
 the controls list existing section names in the active namespace or create a
-section once for later reuse. The creation dialog can generate a new Session
-from an existing Session in that namespace,
+section once for later reuse. In the sidebar, Sessions can be dragged between
+sections, and section headings, including **Unsectioned**, can be dragged or
+moved with arrow controls. Each browser stores section order separately for each
+namespace. The selected Session's **Rename** control sets a web-only display
+name without changing the Kubernetes resource name. Display names are stored in
+the `kelos.dev/session-display-name` annotation; clearing the value restores the
+resource name. The creation dialog can generate a new Session from an existing
+Session in that namespace,
 copying its complete `Session.spec` into the form and editable YAML manifest but
 not copying its metadata, conversation, or volume data. The creation form
 accepts provider, credentials, model, Workspace, AgentConfig references, and an

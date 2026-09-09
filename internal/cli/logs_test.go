@@ -206,6 +206,237 @@ func TestOpenTaskLogStreamRetriesWhilePodIsStarting(t *testing.T) {
 	}
 }
 
+func TestOpenTaskLogStreamRetriesEmptyStreamWhileTaskIsPending(t *testing.T) {
+	task := &kelos.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "task-1", Namespace: "default"},
+		Status:     kelos.TaskStatus{Phase: kelos.TaskPhasePending},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "task-pod", Namespace: "default"},
+		Status:     corev1.PodStatus{Phase: corev1.PodPending},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(task, pod).Build()
+
+	attempts := 0
+	stream, err := openTaskLogStream(
+		context.Background(),
+		cl,
+		"default",
+		task.Name,
+		pod.Name,
+		"kelos-agent",
+		true,
+		0,
+		func(context.Context) (io.ReadCloser, error) {
+			attempts++
+			if attempts == 1 {
+				return io.NopCloser(strings.NewReader("")), nil
+			}
+			return io.NopCloser(strings.NewReader("task output")), nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("openTaskLogStream() error = %v", err)
+	}
+	defer stream.Close()
+
+	output, err := io.ReadAll(stream)
+	if err != nil {
+		t.Fatalf("reading stream: %v", err)
+	}
+	if string(output) != "task output" {
+		t.Fatalf("stream output = %q, want %q", output, "task output")
+	}
+	if attempts != 2 {
+		t.Fatalf("stream attempts = %d, want 2", attempts)
+	}
+}
+
+func TestOpenTaskLogStreamRetriesEmptyStreamUntilTaskBecomesTerminal(t *testing.T) {
+	task := &kelos.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "task-1", Namespace: "default"},
+		Status:     kelos.TaskStatus{Phase: kelos.TaskPhaseRunning},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "task-pod", Namespace: "default"},
+		Spec:       corev1.PodSpec{NodeName: "worker-1"},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodSucceeded,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: "kelos-agent",
+					State: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{ExitCode: 0},
+					},
+				},
+			},
+		},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(task, pod).Build()
+
+	attempts := 0
+	stream, err := openTaskLogStream(
+		context.Background(),
+		cl,
+		"default",
+		task.Name,
+		pod.Name,
+		"kelos-agent",
+		true,
+		0,
+		func(ctx context.Context) (io.ReadCloser, error) {
+			attempts++
+			if attempts == 1 {
+				return io.NopCloser(strings.NewReader("")), nil
+			}
+			current := &kelos.Task{}
+			if err := cl.Get(ctx, client.ObjectKeyFromObject(task), current); err != nil {
+				return nil, err
+			}
+			current.Status.Phase = kelos.TaskPhaseSucceeded
+			if err := cl.Update(ctx, current); err != nil {
+				return nil, err
+			}
+			return io.NopCloser(strings.NewReader("")), nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("openTaskLogStream() error = %v", err)
+	}
+	defer stream.Close()
+
+	if attempts != 2 {
+		t.Fatalf("stream attempts = %d, want 2", attempts)
+	}
+}
+
+func TestOpenTaskLogStreamStopsWhenEmptyStreamHasTerminalTask(t *testing.T) {
+	task := &kelos.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "task-1", Namespace: "default"},
+		Status:     kelos.TaskStatus{Phase: kelos.TaskPhaseSucceeded},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "task-pod", Namespace: "default"},
+		Status:     corev1.PodStatus{Phase: corev1.PodSucceeded},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(task, pod).Build()
+
+	attempts := 0
+	stream, err := openTaskLogStream(
+		context.Background(),
+		cl,
+		"default",
+		task.Name,
+		pod.Name,
+		"kelos-agent",
+		true,
+		0,
+		func(context.Context) (io.ReadCloser, error) {
+			attempts++
+			return io.NopCloser(strings.NewReader("")), nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("openTaskLogStream() error = %v", err)
+	}
+	defer stream.Close()
+
+	output, err := io.ReadAll(stream)
+	if err != nil {
+		t.Fatalf("reading stream: %v", err)
+	}
+	if len(output) != 0 {
+		t.Fatalf("stream output = %q, want empty", output)
+	}
+	if attempts != 1 {
+		t.Fatalf("stream attempts = %d, want 1", attempts)
+	}
+}
+
+func TestOpenTaskLogStreamRejectsEmptyStreamForFailedTask(t *testing.T) {
+	task := &kelos.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "task-1", Namespace: "default"},
+		Status: kelos.TaskStatus{
+			Phase:   kelos.TaskPhaseFailed,
+			Message: "pod could not start",
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "task-pod", Namespace: "default"},
+		Status:     corev1.PodStatus{Phase: corev1.PodFailed},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(task, pod).Build()
+
+	attempts := 0
+	_, err := openTaskLogStream(
+		context.Background(),
+		cl,
+		"default",
+		task.Name,
+		pod.Name,
+		"kelos-agent",
+		true,
+		0,
+		func(context.Context) (io.ReadCloser, error) {
+			attempts++
+			return io.NopCloser(strings.NewReader("")), nil
+		},
+	)
+	wantErr := `task "task-1" failed before logs could be streamed: pod could not start`
+	if err == nil || err.Error() != wantErr {
+		t.Fatalf("openTaskLogStream() error = %v, want %q", err, wantErr)
+	}
+	if attempts != 1 {
+		t.Fatalf("stream attempts = %d, want 1", attempts)
+	}
+}
+
+func TestOpenTaskLogStreamRejectsEmptyStreamForContainerFailure(t *testing.T) {
+	task := &kelos.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "task-1", Namespace: "default"},
+		Status:     kelos.TaskStatus{Phase: kelos.TaskPhasePending},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "task-pod", Namespace: "default"},
+		Spec:       corev1.PodSpec{NodeName: "worker-1"},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: "kelos-agent",
+					State: corev1.ContainerState{
+						Waiting: &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff"},
+					},
+				},
+			},
+		},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(task, pod).Build()
+
+	attempts := 0
+	_, err := openTaskLogStream(
+		context.Background(),
+		cl,
+		"default",
+		task.Name,
+		pod.Name,
+		"kelos-agent",
+		true,
+		0,
+		func(context.Context) (io.ReadCloser, error) {
+			attempts++
+			return io.NopCloser(strings.NewReader("")), nil
+		},
+	)
+	wantErr := `container "kelos-agent" in pod "task-pod" cannot start while following task "task-1" logs: ImagePullBackOff`
+	if err == nil || err.Error() != wantErr {
+		t.Fatalf("openTaskLogStream() error = %v, want %q", err, wantErr)
+	}
+	if attempts != 1 {
+		t.Fatalf("stream attempts = %d, want 1", attempts)
+	}
+}
+
 func TestOpenTaskLogStreamStopsForTerminalTask(t *testing.T) {
 	task := &kelos.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: "task-1", Namespace: "default"},

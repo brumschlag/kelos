@@ -9,6 +9,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -19,6 +20,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 func TestParseGitHubOwnerRepo(t *testing.T) {
@@ -102,6 +104,13 @@ func TestParseGitHubRepo(t *testing.T) {
 		{
 			name:      "github.com HTTPS",
 			repoURL:   "https://github.com/kelos-dev/kelos.git",
+			wantHost:  "github.com",
+			wantOwner: "kelos-dev",
+			wantRepo:  "kelos",
+		},
+		{
+			name:      "github.com HTTPS with username",
+			repoURL:   "https://username@github.com/kelos-dev/kelos.git",
 			wantHost:  "github.com",
 			wantOwner: "kelos-dev",
 			wantRepo:  "kelos",
@@ -401,10 +410,10 @@ func TestDeploymentBuilder_GitHubTokenWhenGHProxyDisabled(t *testing.T) {
 
 func enableGitHubReporting(ts *kelos.TaskSpawner) {
 	if ts.Spec.When.GitHubIssues != nil {
-		ts.Spec.When.GitHubIssues.Reporting = &kelos.GitHubReporting{Enabled: true}
+		ts.Spec.When.GitHubIssues.Reporting = &kelos.GitHubReporting{Comments: &kelos.GitHubCommentsReporting{}}
 	}
 	if ts.Spec.When.GitHubPullRequests != nil {
-		ts.Spec.When.GitHubPullRequests.Reporting = &kelos.GitHubReporting{Enabled: true}
+		ts.Spec.When.GitHubPullRequests.Reporting = &kelos.GitHubReporting{Comments: &kelos.GitHubCommentsReporting{}}
 	}
 }
 
@@ -1999,10 +2008,9 @@ func TestUpdateCronJob_ScheduleChange(t *testing.T) {
 		},
 	}
 
-	// Build the original CronJob with old schedule
-	oldTS := ts.DeepCopy()
-	oldTS.Spec.When.Cron.Schedule = "0 9 * * 1"
-	cronJob := builder.BuildCronJob(oldTS, nil, false)
+	currentTS := ts.DeepCopy()
+	currentTS.Spec.When.Cron.Schedule = "0 9 * * 1"
+	cronJob := builder.BuildCronJob(currentTS, nil, false)
 
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
@@ -2084,8 +2092,9 @@ func TestUpdateCronJob_SuspendToggle(t *testing.T) {
 	}
 }
 
-func TestUpdateCronJob_PodSpecChanges(t *testing.T) {
+func TestUpdateCronJob_ReconcilesCompleteSpec(t *testing.T) {
 	builder := NewDeploymentBuilder()
+	builder.SpawnerImagePullPolicy = corev1.PullAlways
 	ts := &kelos.TaskSpawner{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "cron-spawner",
@@ -2104,6 +2113,9 @@ func TestUpdateCronJob_PodSpecChanges(t *testing.T) {
 	}
 
 	cronJob := builder.BuildCronJob(ts, nil, false)
+	want := builder.BuildCronJob(ts, nil, false)
+	notSuspended := false
+	want.Spec.Suspend = &notSuspended
 
 	scheme := newTestScheme()
 	cl := fake.NewClientBuilder().
@@ -2118,9 +2130,15 @@ func TestUpdateCronJob_PodSpecChanges(t *testing.T) {
 		DeploymentBuilder: builder,
 	}
 
-	// Mutate the CronJob to simulate drift: wrong image, extra volume, extra init container
+	// Mutate fields across the CronJob, Job, and Pod specs to simulate drift.
+	cronJob.Spec.ConcurrencyPolicy = batchv1.AllowConcurrent
+	failedJobsHistoryLimit := int32(9)
+	cronJob.Spec.FailedJobsHistoryLimit = &failedJobsHistoryLimit
+	backoffLimit := int32(4)
+	cronJob.Spec.JobTemplate.Spec.BackoffLimit = &backoffLimit
 	podSpec := &cronJob.Spec.JobTemplate.Spec.Template.Spec
-	podSpec.Containers[0].Image = "old-image:v1"
+	podSpec.Containers[0].Image = "drifted-image:v1"
+	podSpec.Containers[0].ImagePullPolicy = corev1.PullNever
 	podSpec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "stale", MountPath: "/stale"}}
 	podSpec.InitContainers = []corev1.Container{{Name: "stale-init", Image: "stale:v1"}}
 	podSpec.Volumes = []corev1.Volume{{Name: "stale", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}}
@@ -2130,24 +2148,92 @@ func TestUpdateCronJob_PodSpecChanges(t *testing.T) {
 		t.Fatalf("updateCronJob error: %v", err)
 	}
 
-	// Verify image was corrected
-	if podSpec.Containers[0].Image != DefaultSpawnerImage {
-		t.Errorf("expected image %q, got %q", DefaultSpawnerImage, podSpec.Containers[0].Image)
+	var updated batchv1.CronJob
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(cronJob), &updated); err != nil {
+		t.Fatalf("getting CronJob: %v", err)
+	}
+	if !apiequality.Semantic.DeepEqual(updated.Spec, want.Spec) {
+		t.Errorf("CronJob spec was not fully reconciled\ngot:  %#v\nwant: %#v", updated.Spec, want.Spec)
+	}
+}
+
+func TestUpdateCronJob_FallsBackWhenDryRunIsUnsupported(t *testing.T) {
+	builder := NewDeploymentBuilder()
+	builder.SpawnerImagePullPolicy = corev1.PullAlways
+	ts := &kelos.TaskSpawner{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cron-spawner",
+			Namespace: "default",
+		},
+		Spec: kelos.TaskSpawnerSpec{
+			When: kelos.When{
+				Cron: &kelos.Cron{Schedule: "0 9 * * 1"},
+			},
+			TaskTemplate: kelos.TaskTemplate{Type: "claude-code"},
+		},
 	}
 
-	// Verify stale volume mounts were removed (cron with no workspace has none)
-	if len(podSpec.Containers[0].VolumeMounts) != 0 {
-		t.Errorf("expected 0 volume mounts, got %d", len(podSpec.Containers[0].VolumeMounts))
+	cronJob := builder.BuildCronJob(ts, nil, false)
+	notSuspended := false
+	cronJob.Spec.Suspend = &notSuspended
+	podSpec := &cronJob.Spec.JobTemplate.Spec.Template.Spec
+	podSpec.DNSPolicy = corev1.DNSClusterFirst
+	podSpec.Containers[0].TerminationMessagePath = corev1.TerminationMessagePathDefault
+	podSpec.Containers = append(podSpec.Containers, corev1.Container{Name: "injected-sidecar", Image: "sidecar:v1"})
+
+	dryRunUpdates := 0
+	normalUpdates := 0
+	scheme := newTestScheme()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(ts, cronJob).
+		WithStatusSubresource(ts).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				updateOptions := (&client.UpdateOptions{}).ApplyOptions(opts)
+				if len(updateOptions.DryRun) > 0 {
+					dryRunUpdates++
+					return apierrors.NewBadRequest(`admission webhook "side-effects.example.com" does not support dry run`)
+				}
+				normalUpdates++
+				return cl.Update(ctx, obj, opts...)
+			},
+		}).
+		Build()
+
+	r := &TaskSpawnerReconciler{
+		Client:            cl,
+		Scheme:            scheme,
+		DeploymentBuilder: builder,
+	}
+	ctx := context.Background()
+
+	if err := r.updateCronJob(ctx, ts, cronJob, nil, false, false); err != nil {
+		t.Fatalf("updateCronJob with normalized spec: %v", err)
+	}
+	if normalUpdates != 0 {
+		t.Fatalf("normal updates = %d, want 0 for server-added fields", normalUpdates)
 	}
 
-	// Verify stale init containers were removed
-	if len(podSpec.InitContainers) != 0 {
-		t.Errorf("expected 0 init containers, got %d", len(podSpec.InitContainers))
+	cronJob.Spec.JobTemplate.Spec.Template.Spec.Containers[0].ImagePullPolicy = corev1.PullNever
+	if err := r.updateCronJob(ctx, ts, cronJob, nil, false, false); err != nil {
+		t.Fatalf("updateCronJob with managed drift: %v", err)
+	}
+	if normalUpdates != 1 {
+		t.Fatalf("normal updates = %d, want 1 after managed drift", normalUpdates)
+	}
+	if got := cronJob.Spec.JobTemplate.Spec.Template.Spec.Containers[0].ImagePullPolicy; got != corev1.PullAlways {
+		t.Fatalf("image pull policy = %q, want %q", got, corev1.PullAlways)
 	}
 
-	// Verify stale volumes were removed
-	if len(podSpec.Volumes) != 0 {
-		t.Errorf("expected 0 volumes, got %d", len(podSpec.Volumes))
+	if err := r.updateCronJob(ctx, ts, cronJob, nil, false, false); err != nil {
+		t.Fatalf("updateCronJob after reconciliation: %v", err)
+	}
+	if normalUpdates != 1 {
+		t.Fatalf("normal updates = %d, want no repeated update", normalUpdates)
+	}
+	if dryRunUpdates != 3 {
+		t.Fatalf("dry-run updates = %d, want 3", dryRunUpdates)
 	}
 }
 

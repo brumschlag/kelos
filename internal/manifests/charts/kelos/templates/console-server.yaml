@@ -1,0 +1,97 @@
+{{- if and .Values.sessionServer .Values.sessionServer.enabled }}
+{{- fail "sessionServer values are not supported; use consoleServer instead" }}
+{{- end }}
+{{- if .Values.consoleServer.enabled }}
+{{- $secretName := required "consoleServer.secretName is required when consoleServer.enabled=true" .Values.consoleServer.secretName }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kelos-console-server
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: kelos
+    app.kubernetes.io/component: console-server
+spec:
+  replicas: {{ .Values.consoleServer.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kelos
+      app.kubernetes.io/component: console-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kelos
+        app.kubernetes.io/component: console-server
+    spec:
+      serviceAccountName: kelos-console-server
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: console-server
+          image: {{ .Values.consoleServer.image }}{{- if .Values.image.tag }}:{{ .Values.image.tag }}{{- end }}
+          {{- if .Values.image.pullPolicy }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- end }}
+          args:
+            - --bind-address=:8080
+            - --token-file=/var/run/secrets/kelos-console/token
+            - --default-namespace={{ .Values.consoleServer.defaultNamespace }}
+            {{- if .Values.consoleServer.secureCookie }}
+            - --secure-cookie
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: auth-token
+              mountPath: /var/run/secrets/kelos-console
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.consoleServer.resources | nindent 12 }}
+      volumes:
+        - name: auth-token
+          secret:
+            secretName: {{ $secretName }}
+            items:
+              - key: {{ .Values.consoleServer.tokenKey }}
+                path: token
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kelos-console-server
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: kelos
+    app.kubernetes.io/component: console-server
+spec:
+  type: {{ .Values.consoleServer.service.type }}
+  selector:
+    app.kubernetes.io/name: kelos
+    app.kubernetes.io/component: console-server
+  ports:
+    - name: http
+      port: {{ .Values.consoleServer.service.port }}
+      targetPort: http
+      protocol: TCP
+{{- end }}

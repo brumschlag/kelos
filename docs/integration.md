@@ -61,7 +61,7 @@ commentPolicy:
   minimumPermission: write   # only repo collaborators can trigger
 ```
 
-**Status reporting:** Set `reporting.enabled: true` to post status updates (started, succeeded, failed) back to the issue as comments.
+**Status reporting:** Set `reporting.comments: {}` to post status updates (started, succeeded, failed) back to the issue. The default `PerTask` mode creates one comment for each Task. Set `reporting.comments.mode: Sticky` to maintain one comment per TaskSpawner and issue across Tasks.
 
 ### GitHub Pull Requests
 
@@ -106,7 +106,7 @@ spec:
 
 **Status reporting:** Two independent options:
 
-- `reporting.enabled: true` posts status comments (started, succeeded, failed) on the PR.
+- `reporting.comments` posts status comments (started, succeeded, failed) on the PR. `mode: PerTask` is the default and creates one comment for each Task. `mode: Sticky` maintains one comment per TaskSpawner and PR across Tasks.
 - `reporting.checks.name` creates a GitHub Check Run for each PR task, so the run can be required by branch protection rules or referenced from a merge queue. The Check Run starts as `in_progress` when the task begins and is updated to `success` or `failure` on completion. The name defaults to `"Kelos: <taskspawner-name>"` and appears in branch protection rule configuration and the PR Checks tab; the token referenced by the workspace must have `checks:write` permission.
 
 ```yaml
@@ -115,14 +115,15 @@ spec:
     githubPullRequests:
       labels: [needs-review]
       reporting:
-        enabled: true            # status comments on the PR
+        comments:
+          mode: Sticky           # one status comment across Tasks
         checks:
           name: kelos/pr-review  # required-status-check name (optional override)
 ```
 
 To require the Check Run before merge, open the GitHub repository's **Settings → Branches → Branch protection rule** for the target branch, enable **Require status checks to pass before merging**, and add the same name (`kelos/pr-review` or the default `Kelos: <taskspawner-name>`) to the required checks list. Renaming the TaskSpawner changes the default name, so pin the name with `reporting.checks.name` if you reference it from branch protection or merge queue config.
 
-> **Note:** `reporting.checks` is supported for `githubPullRequests` and for `githubWebhook` sources that include a pull-request event type. It is rejected at admission for `githubIssues` sources.
+> **Note:** `reporting.checks` is supported for `githubPullRequests` and for `githubWebhook` sources that include a pull-request event type or have at least one `issue_comment` filter with all such filters set to `commentOn: PullRequest`. It is rejected at admission for `githubIssues` sources.
 
 ### GitHub Webhooks
 
@@ -190,7 +191,7 @@ spec:
 
 **Filtering options:** `events` (required), `repository`, `excludeAuthors`, and per-filter fields: `action`, `labels`, `excludeLabels`, `state`, `branch`, `draft`, `author`, `bodyPattern`, `excludeBodyPatterns`, `commentOn` (scopes `issue_comment` events to `"Issue"` or `"PullRequest"`). The legacy `bodyContains` substring filter is **deprecated** — use `bodyPattern` (Go re2 regular expression) instead.
 
-**Status reporting:** Like `githubPullRequests`, the webhook source supports `reporting.enabled` (status comments back to the originating issue or PR) and `reporting.checks.name` (GitHub Check Runs for branch protection). Check Runs require `events` to include at least one pull-request event type (`pull_request`, `pull_request_review`, `pull_request_review_comment`, or `pull_request_target`); the configuration is rejected at admission otherwise.
+**Status reporting:** Like `githubPullRequests`, the webhook source supports `reporting.comments` (status comments back to the originating issue or PR) and `reporting.checks.name` (GitHub Check Runs for branch protection). Comment mode defaults to `PerTask`; `Sticky` maintains one comment per TaskSpawner and originating issue or PR across Tasks. Check Runs require `events` to include at least one pull-request event type (`pull_request`, `pull_request_review`, `pull_request_review_comment`, or `pull_request_target`), or to include `issue_comment` with at least one matching filter and every `issue_comment` filter set to `commentOn: PullRequest`. Other configurations are rejected at admission. An `issue_comment` Check Run is associated with the pull request's current head SHA, which Kelos fetches from GitHub before creating the Task.
 
 **Webhook-specific variables:** `{{.Event}}`, `{{.Action}}`, `{{.Sender}}`, `{{.Ref}}`, `{{.Repository}}`, `{{.Payload}}` (full payload access).
 
@@ -330,6 +331,9 @@ spec:
           value: "error"
         - field: "$.data.event.platform"
           pattern: "^(python|go|node)"
+      excludeFilters:                   # any match skips the delivery
+        - field: "$.data.event.environment"
+          value: "staging"
   taskTemplate:
     type: claude-code
     workspaceRef:
@@ -380,6 +384,9 @@ The webhook URL is `https://your-webhook-domain/webhook/<source>` (e.g., `/webho
   - `pattern` — Go [regexp](https://pkg.go.dev/regexp/syntax) match against the extracted value
   
   When `filters` is empty, every delivery triggers a Task. A filter whose `field` is missing in the payload fails (the delivery is skipped).
+- **`excludeFilters[]`** *(optional)* — list of conditions that reject a delivery when ANY of them matches (OR semantics across exclude filters). Entries have the same shape as `filters` — a `field` (JSONPath) and exactly one of `value` or `pattern`. They are evaluated after `filters`, so a delivery triggers a Task only when it matches every entry in `filters` and no entry in `excludeFilters`. An exclude filter whose `field` is missing in the payload does not match, so it never excludes the delivery.
+
+A malformed JSONPath expression in either list is a configuration error: the spawner is skipped for that delivery and the error is logged.
 
 **Generic-webhook variables:** `{{.Kind}}` is always `"GenericWebhook"`, `{{.Payload}}` is the full parsed JSON body (use it for advanced templating like `{{.Payload.data.event.platform}}`), and every key from `fieldMapping` becomes a top-level variable. Standard fields `{{.ID}}`, `{{.Title}}`, `{{.Body}}`, and `{{.URL}}` always exist (empty if not mapped).
 

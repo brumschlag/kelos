@@ -35,6 +35,7 @@ func TestSessionStatusPublisherPatchesLiveSession(t *testing.T) {
 	}
 	want := ObservedSessionStatus{
 		Active: true,
+		Model:  "gpt-5.6-sol",
 		WorkspaceStatus: &WorkspaceStatus{
 			Branch: "feature/session-status",
 			PullRequest: &kelos.SessionPullRequest{
@@ -52,7 +53,7 @@ func TestSessionStatusPublisherPatchesLiveSession(t *testing.T) {
 	}
 	active := apiMeta.FindStatusCondition(got.Status.Conditions, kelos.SessionConditionActive)
 	ready := apiMeta.FindStatusCondition(got.Status.Conditions, kelos.SessionConditionReady)
-	if active == nil || active.Status != metav1.ConditionTrue || active.Reason != "TurnActive" || ready == nil || ready.Status != metav1.ConditionTrue || got.Status.Branch != want.WorkspaceStatus.Branch || !reflect.DeepEqual(got.Status.PullRequest, want.WorkspaceStatus.PullRequest) {
+	if active == nil || active.Status != metav1.ConditionTrue || active.Reason != "TurnActive" || ready == nil || ready.Status != metav1.ConditionTrue || got.Status.Model != want.Model || got.Status.Branch != want.WorkspaceStatus.Branch || !reflect.DeepEqual(got.Status.PullRequest, want.WorkspaceStatus.PullRequest) {
 		t.Fatalf("Session runtime status = %#v, want %#v", got.Status, want)
 	}
 	if got.Status.Phase != kelos.SessionPhaseReady || got.Status.PodUID != podUID {
@@ -62,7 +63,21 @@ func TestSessionStatusPublisherPatchesLiveSession(t *testing.T) {
 		t.Fatalf("Session lastActivityTime was not initialized: %#v", got.Status)
 	}
 
+	want.WaitingForInput = true
+	if err := publisher(context.Background(), want); err != nil {
+		t.Fatal(err)
+	}
+	got, err = clientset.ApiV1alpha2().Sessions("default").Get(context.Background(), sessionName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	active = apiMeta.FindStatusCondition(got.Status.Conditions, kelos.SessionConditionActive)
+	if active == nil || active.Status != metav1.ConditionTrue || active.Reason != "WaitingForInput" {
+		t.Fatalf("Session Active condition = %#v, want True with reason WaitingForInput", active)
+	}
+
 	want.Active = false
+	want.WaitingForInput = false
 	if err := publisher(context.Background(), want); err != nil {
 		t.Fatal(err)
 	}
@@ -80,37 +95,70 @@ func TestSessionStatusPublisherPatchesLiveSession(t *testing.T) {
 }
 
 func TestSessionStatusPublisherUpdatesActivityTimeOnStateChange(t *testing.T) {
-	const sessionName = "chat"
-	podUID := types.UID("live-pod")
-	lastActivityTime := metav1.NewTime(time.Now().UTC().Truncate(time.Second).Add(-time.Hour))
-	clientset := clientfake.NewSimpleClientset(&kelos.Session{
-		ObjectMeta: metav1.ObjectMeta{Name: sessionName, Namespace: "default"},
-		Status: kelos.SessionStatus{
-			Phase:            kelos.SessionPhaseReady,
-			PodUID:           podUID,
-			LastActivityTime: &lastActivityTime,
-			Conditions: []metav1.Condition{{
-				Type:               kelos.SessionConditionActive,
-				Status:             metav1.ConditionTrue,
-				Reason:             "TurnActive",
-				LastTransitionTime: lastActivityTime,
-			}},
+	tests := []struct {
+		name           string
+		currentStatus  metav1.ConditionStatus
+		currentReason  string
+		observedStatus ObservedSessionStatus
+	}{
+		{
+			name:          "turn finishes",
+			currentStatus: metav1.ConditionTrue,
+			currentReason: "TurnActive",
 		},
-	})
-	publisher, err := NewSessionStatusPublisher(clientset.ApiV1alpha2().Sessions("default"), sessionName, podUID)
-	if err != nil {
-		t.Fatal(err)
+		{
+			name:          "input requested",
+			currentStatus: metav1.ConditionTrue,
+			currentReason: "TurnActive",
+			observedStatus: ObservedSessionStatus{
+				Active:          true,
+				WaitingForInput: true,
+			},
+		},
+		{
+			name:          "input resolved",
+			currentStatus: metav1.ConditionTrue,
+			currentReason: "WaitingForInput",
+			observedStatus: ObservedSessionStatus{
+				Active: true,
+			},
+		},
 	}
-	if err := publisher(context.Background(), ObservedSessionStatus{Active: false}); err != nil {
-		t.Fatal(err)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			const sessionName = "chat"
+			podUID := types.UID("live-pod")
+			lastActivityTime := metav1.NewTime(time.Now().UTC().Truncate(time.Second).Add(-time.Hour))
+			clientset := clientfake.NewSimpleClientset(&kelos.Session{
+				ObjectMeta: metav1.ObjectMeta{Name: sessionName, Namespace: "default"},
+				Status: kelos.SessionStatus{
+					Phase:            kelos.SessionPhaseReady,
+					PodUID:           podUID,
+					LastActivityTime: &lastActivityTime,
+					Conditions: []metav1.Condition{{
+						Type:               kelos.SessionConditionActive,
+						Status:             tt.currentStatus,
+						Reason:             tt.currentReason,
+						LastTransitionTime: lastActivityTime,
+					}},
+				},
+			})
+			publisher, err := NewSessionStatusPublisher(clientset.ApiV1alpha2().Sessions("default"), sessionName, podUID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := publisher(context.Background(), tt.observedStatus); err != nil {
+				t.Fatal(err)
+			}
 
-	got, err := clientset.ApiV1alpha2().Sessions("default").Get(context.Background(), sessionName, metav1.GetOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.Status.LastActivityTime == nil || !got.Status.LastActivityTime.After(lastActivityTime.Time) {
-		t.Fatalf("Session lastActivityTime = %v, want after %v", got.Status.LastActivityTime, lastActivityTime)
+			got, err := clientset.ApiV1alpha2().Sessions("default").Get(context.Background(), sessionName, metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Status.LastActivityTime == nil || !got.Status.LastActivityTime.After(lastActivityTime.Time) {
+				t.Fatalf("Session lastActivityTime = %v, want after %v", got.Status.LastActivityTime, lastActivityTime)
+			}
+		})
 	}
 }
 

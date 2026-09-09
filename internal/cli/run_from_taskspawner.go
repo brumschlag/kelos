@@ -198,6 +198,9 @@ func buildTaskFromTaskSpawner(ctx context.Context, cl client.Client, namespace, 
 	if err != nil {
 		return nil, fmt.Errorf("building task %s from TaskSpawner %s: %w", taskName, spawner.Name, err)
 	}
+	if err := builder.AssignSpawnerCredential(&spawner, task); err != nil {
+		return nil, fmt.Errorf("assigning TaskSpawner credential to task %s from TaskSpawner %s: %w", taskName, spawner.Name, err)
+	}
 	if task.Spec.UpstreamRepo == "" {
 		task.Spec.UpstreamRepo = taskSpawnerUpstreamRepo(&spawner)
 	}

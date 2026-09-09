@@ -44,3 +44,34 @@ spec:
     type: opencode
     credentials:
       type: none
+---
+# SessionSpawner distributing generated Sessions across multiple agent accounts
+apiVersion: kelos.dev/v1alpha2
+kind: SessionSpawner
+metadata:
+  name: multi-account-sessions
+spec:
+  when:
+    githubWebhook:
+      repository: my-org/my-repo
+      events:
+        - issues
+      filters:
+        - event: issues
+          action: opened
+  credentials:
+    - name: account-a
+      type: oauth
+      secretRef:
+        name: claude-account-a
+    - name: account-b
+      type: oauth
+      secretRef:
+        name: claude-account-b
+  sessionTemplate:
+    worker:
+      type: claude-code
+      workspaceRef:
+        name: my-workspace
+    initialBranch: "issue-{{.Number}}"
+    initialPrompt: "Handle issue #{{.Number}}: {{.Title}}"

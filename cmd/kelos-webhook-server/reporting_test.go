@@ -1,14 +1,288 @@
 package main
 
 import (
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	kelos "github.com/kelos-dev/kelos/api/v1alpha2"
 	"github.com/kelos-dev/kelos/internal/reporting"
 )
+
+func newReportingTestScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("adding core API to scheme: %v", err)
+	}
+	if err := kelos.AddToScheme(scheme); err != nil {
+		t.Fatalf("adding Kelos API to scheme: %v", err)
+	}
+	return scheme
+}
+
+func TestReportingReconcilerSkipsTasksOwnedByOtherServerMode(t *testing.T) {
+	tests := []struct {
+		name        string
+		gatewayMode bool
+		gatewayName string
+		resolver    func(context.Context) (string, error)
+	}{
+		{name: "gateway server skips source-specific task", gatewayMode: true},
+		{
+			name:        "source-specific server skips gateway task",
+			gatewayName: "github",
+			resolver:    func(context.Context) (string, error) { return "token", nil },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			task := &kelos.Task{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "task",
+					Namespace: "default",
+					Annotations: map[string]string{
+						reporting.AnnotationGitHubReporting: "enabled",
+						reporting.AnnotationSourceOwner:     "owner",
+						reporting.AnnotationSourceRepo:      "repo",
+						reporting.AnnotationWebhookGateway:  tt.gatewayName,
+					},
+				},
+			}
+			reconciler := &reportingReconciler{
+				Client: fake.NewClientBuilder().WithScheme(newReportingTestScheme(t)).WithObjects(task).Build(),
+				config: reportingConfig{GatewayMode: tt.gatewayMode, TokenResolver: tt.resolver},
+			}
+
+			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+				NamespacedName: types.NamespacedName{Namespace: task.Namespace, Name: task.Name},
+			})
+			if err != nil {
+				t.Fatalf("Reconcile() error = %v", err)
+			}
+			if result != (ctrl.Result{}) {
+				t.Errorf("Reconcile() result = %v, want empty result", result)
+			}
+		})
+	}
+}
+
+func TestResolveReportingCredsFromGateway(t *testing.T) {
+	gateway := &kelos.WebhookGateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "github", Namespace: "default"},
+		Spec: kelos.WebhookGatewaySpec{GitHub: &kelos.GitHubGateway{
+			SecretRef:      kelos.SecretReference{Name: "webhook-secret"},
+			APIBaseURL:     "https://github.example/api/v3",
+			CredentialsRef: &kelos.SecretReference{Name: "github-credentials"},
+		}},
+	}
+	credentials := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "github-credentials", Namespace: "default"},
+		Data:       map[string][]byte{"GITHUB_TOKEN": []byte("token")},
+	}
+	reconciler := &reportingReconciler{Client: fake.NewClientBuilder().
+		WithScheme(newReportingTestScheme(t)).
+		WithObjects(gateway, credentials).
+		Build()}
+	task := &kelos.Task{ObjectMeta: metav1.ObjectMeta{
+		Namespace:   "default",
+		Annotations: map[string]string{reporting.AnnotationWebhookGateway: gateway.Name},
+	}}
+
+	resolver, baseURL, appID, err := reconciler.resolveReportingCreds(context.Background(), task)
+	if err != nil {
+		t.Fatalf("resolveReportingCreds() error = %v", err)
+	}
+	if baseURL != gateway.Spec.GitHub.APIBaseURL {
+		t.Errorf("resolveReportingCreds() base URL = %q, want %q", baseURL, gateway.Spec.GitHub.APIBaseURL)
+	}
+	if appID != "" {
+		t.Errorf("resolveReportingCreds() app ID = %q, want empty for a personal access token", appID)
+	}
+	token, err := resolver(context.Background())
+	if err != nil {
+		t.Fatalf("resolved token error = %v", err)
+	}
+	if token != "token" {
+		t.Errorf("resolved token = %q, want %q", token, "token")
+	}
+}
+
+func TestReportingReconcilerUsesGatewayGitHubAppIdentityForStickyComments(t *testing.T) {
+	var userRequests atomic.Int32
+	var tokenRequests atomic.Int32
+	var listRequests atomic.Int32
+	var createRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/app/installations/456/access_tokens":
+			tokenRequests.Add(1)
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"token":      "installation-token",
+				"expires_at": time.Now().Add(time.Hour),
+			})
+		case r.URL.Path == "/user":
+			userRequests.Add(1)
+			http.Error(w, "installation tokens have no user context", http.StatusForbidden)
+		case r.URL.Path == "/repos/owner/repo/issues/42/comments" && r.Method == http.MethodGet:
+			listRequests.Add(1)
+			if got := r.Header.Get("Authorization"); got != "token installation-token" {
+				t.Errorf("Authorization header = %q, want installation token", got)
+			}
+			_ = json.NewEncoder(w).Encode([]interface{}{})
+		case r.URL.Path == "/repos/owner/repo/issues/42/comments" && r.Method == http.MethodPost:
+			createRequests.Add(1)
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"id": 123})
+		default:
+			http.Error(w, "unexpected request", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	privateKey, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		t.Fatalf("generating test private key: %v", err)
+	}
+	privateKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)})
+	gateway := &kelos.WebhookGateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "github", Namespace: "default"},
+		Spec: kelos.WebhookGatewaySpec{GitHub: &kelos.GitHubGateway{
+			SecretRef:      kelos.SecretReference{Name: "webhook-secret"},
+			APIBaseURL:     server.URL,
+			CredentialsRef: &kelos.SecretReference{Name: "github-credentials"},
+		}},
+	}
+	credentials := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "github-credentials", Namespace: "default"},
+		Data: map[string][]byte{
+			"appID":          []byte("123"),
+			"installationID": []byte("456"),
+			"privateKey":     privateKeyPEM,
+		},
+	}
+	task := &kelos.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "task",
+			Namespace: "default",
+			UID:       types.UID("task-uid"),
+			Labels:    map[string]string{"kelos.dev/taskspawner": "reviewer"},
+			Annotations: map[string]string{
+				reporting.AnnotationGitHubReporting:   "enabled",
+				reporting.AnnotationGitHubCommentMode: string(kelos.GitHubCommentModeSticky),
+				reporting.AnnotationSourceOwner:       "owner",
+				reporting.AnnotationSourceRepo:        "repo",
+				reporting.AnnotationSourceNumber:      "42",
+				reporting.AnnotationWebhookGateway:    gateway.Name,
+			},
+		},
+		Status: kelos.TaskStatus{Phase: kelos.TaskPhasePending},
+	}
+	reconciler := &reportingReconciler{
+		Client: fake.NewClientBuilder().
+			WithScheme(newReportingTestScheme(t)).
+			WithObjects(gateway, credentials, task).
+			Build(),
+		config: reportingConfig{GatewayMode: true},
+	}
+
+	_, err = reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: task.Namespace, Name: task.Name},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if userRequests.Load() != 0 {
+		t.Errorf("authenticated user endpoint called %d times, want 0 for GitHub App reporting", userRequests.Load())
+	}
+	if tokenRequests.Load() != 1 || listRequests.Load() != 1 || createRequests.Load() != 1 {
+		t.Errorf("requests = token:%d list:%d create:%d, want 1 each", tokenRequests.Load(), listRequests.Load(), createRequests.Load())
+	}
+}
+
+func TestResolveReportingCredsErrors(t *testing.T) {
+	tests := []struct {
+		name        string
+		gateway     *kelos.WebhookGateway
+		credentials *corev1.Secret
+		gatewayName string
+		wantError   string
+	}{
+		{
+			name:      "no gateway and no resolver",
+			wantError: "no GitHub token resolver configured",
+		},
+		{
+			name: "gateway without credentials reference",
+			gateway: &kelos.WebhookGateway{
+				ObjectMeta: metav1.ObjectMeta{Name: "missing-ref", Namespace: "default"},
+				Spec: kelos.WebhookGatewaySpec{GitHub: &kelos.GitHubGateway{
+					SecretRef: kelos.SecretReference{Name: "webhook-secret"},
+				}},
+			},
+			gatewayName: "missing-ref",
+			wantError:   "has no github.credentialsRef",
+		},
+		{
+			name: "credentials without usable token",
+			gateway: &kelos.WebhookGateway{
+				ObjectMeta: metav1.ObjectMeta{Name: "empty-credentials", Namespace: "default"},
+				Spec: kelos.WebhookGatewaySpec{GitHub: &kelos.GitHubGateway{
+					SecretRef:      kelos.SecretReference{Name: "webhook-secret"},
+					CredentialsRef: &kelos.SecretReference{Name: "credentials"},
+				}},
+			},
+			credentials: &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "default"}},
+			gatewayName: "empty-credentials",
+			wantError:   "credentials contain no usable token",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			objects := make([]client.Object, 0, 2)
+			if tt.gateway != nil {
+				objects = append(objects, tt.gateway)
+			}
+			if tt.credentials != nil {
+				objects = append(objects, tt.credentials)
+			}
+			reconciler := &reportingReconciler{Client: fake.NewClientBuilder().
+				WithScheme(newReportingTestScheme(t)).
+				WithObjects(objects...).
+				Build()}
+			task := &kelos.Task{ObjectMeta: metav1.ObjectMeta{
+				Namespace:   "default",
+				Annotations: map[string]string{reporting.AnnotationWebhookGateway: tt.gatewayName},
+			}}
+
+			_, _, _, err := reconciler.resolveReportingCreds(context.Background(), task)
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("resolveReportingCreds() error = %v, want error containing %q", err, tt.wantError)
+			}
+		})
+	}
+}
 
 func TestReportingAnnotationPredicate_Create(t *testing.T) {
 	tests := []struct {

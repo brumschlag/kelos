@@ -196,7 +196,9 @@ the refreshed value on their next sync and are not supported.
 
 A Session is one interactive Claude Code, Codex, or OpenCode conversation that
 web and terminal clients can share and reconnect to. The spec is immutable
-except for `spec.suspend`.
+except for `spec.worker.credentials`, `spec.worker.model`,
+`spec.suspend`, `spec.idlePolicy`, and fields under `spec.worker.podOverrides`
+other than `serviceAccountName`.
 Conversation events and history are retained on the Session workspace rather
 than in the Kubernetes API. If configured, `spec.initialPrompt` also remains in
 the Session resource and is visible through the Kubernetes API.
@@ -211,19 +213,34 @@ the Session resource and is visible through the Kubernetes API.
 | `spec.worker.workspaceRef.name` | Workspace cloned into the Session Pod | No |
 | `spec.worker.agentConfigRefs[].name` | Ordered AgentConfig resources | No |
 | `spec.worker.podOverrides` | Pod resources, scheduling, environment, volumes, and sidecars | No |
+| `spec.worker.podOverrides.serviceAccountName` | Service account for the Session Pod; immutable after creation | No |
 | `spec.suspend` | Stop the Session runtime without deleting the Session or its persistent workspace (defaults to `false`) | No |
 | `spec.initialBranch` | Git branch used to initialize the Session workspace. Checks out the branch from `origin` when it exists, or creates it from the Workspace ref. Requires `spec.worker.workspaceRef` | No |
 | `spec.initialPrompt` | Prompt submitted when the Session starts without retained conversation history. An `emptyDir` workspace may submit it again after Pod replacement | No |
 | `spec.volumeClaimTemplate` | PersistentVolumeClaimSpec for the Session workspace. Recommended for durable Sessions; omit to use an ephemeral `emptyDir` workspace | No |
+| `spec.idlePolicy.suspendAfterSeconds` | Automatically stop the Session runtime once it has been continuously idle for this many seconds without changing `spec.suspend`. Persistent workspace storage is retained. Selecting the Session in the web interface or starting a terminal connection resumes it. Omit to never suspend; zero suspends as soon as it goes idle. When deletion is also configured, this value must be less than `deleteAfterSeconds` | No |
+| `spec.idlePolicy.deleteAfterSeconds` | Automatically delete the Session once it has been continuously idle (no active turn, no reported activity) for this many seconds, measured from the later of `status.lastActivityTime` and the creation time. Renewed activity resets the idle period. Before deletion the runtime stops accepting new turns and any in-flight turn completes. Deleting the Session removes its workspace storage. Omit to never delete; zero deletes as soon as it goes idle. When suspension is also configured, this value must be greater than `suspendAfterSeconds` | No |
 | `status.phase` | Infrastructure phase: `Pending`, `Ready`, `Suspended`, or `Failed` | Output |
 | `status.podName` | Session Pod name | Output |
 | `status.podUID` | Identity of the Pod running the live conversation | Output |
 | `status.lastActivityTime` | When runtime activity was first reported or last changed; Pod replacement does not change it | Output |
+| `status.model` | Model reported by the live Session runtime; empty when the runtime does not report a model | Output |
 | `status.conditions[type=Ready]` | Whether the Session infrastructure is ready for clients | Output |
-| `status.conditions[type=Active]` | Whether the runtime has an unfinished turn; `Unknown` means activity has not been reported | Output |
+| `status.conditions[type=Active]` | Whether the runtime has an unfinished turn; `reason: WaitingForInput` means the turn is waiting for a user response, and `Unknown` means activity has not been reported | Output |
 | `status.branch` | Currently checked-out git branch in the Session workspace | Output |
 | `status.pullRequest.url` | Web URL of the pull request associated with the current branch | Output |
-| `status.pullRequest.state` | Pull request lifecycle state: `Draft`, `Open`, `Merged`, or `Closed` | Output |
+| `status.pullRequest.state` | Pull request state: `Draft`, `Open`, `Queued`, `Merged`, or `Closed`. `Queued` means the pull request is in a merge queue | Output |
+| `status.pullRequest.checks.state` | Aggregate GitHub check state: `Pending`, `Success`, or `Failure`. Queued pull requests use the merge queue commit's checks. Cancelled checks are failures | Output |
+| `status.pullRequest.checks.completed` | Number of GitHub checks that have completed | Output |
+| `status.pullRequest.checks.total` | Total number of GitHub checks reported for the pull request | Output |
+
+The Session runtime refreshes pull request and GitHub check status at startup,
+after each turn, every 30 seconds while checks are pending or the pull request
+is queued, and every five minutes otherwise. The Console Sessions view's
+sidebar and selected Session header show the aggregate check state and pending
+progress. `status.pullRequest.checks` is omitted when GitHub reports no checks
+for the pull request. Failed GitHub refreshes use exponential retry delays from
+one minute up to 15 minutes.
 
 The web creation dialog can generate a new Session from an existing Session in
 the active namespace. This copies the complete `Session.spec` into an editable
@@ -233,19 +250,82 @@ metadata, conversation, or persistent-volume data.
 Use `kelos session connect NAME` for terminal chat. In an interactive terminal,
 press Enter to send a message, Ctrl+J to insert a newline, and Ctrl+C or Esc to
 interrupt an active turn. Ctrl+C exits the terminal client when no turn is
-active. The terminal client shows live connecting, reconnecting, working,
-waiting-for-input, and interrupting progress with elapsed time. A separate
-status bar beneath the composer shows the Session name, agent type, model and
-effort when available, working directory, git branch, and associated pull
-request number. Codex Sessions also show reported context use, weekly limit
-remaining, and cumulative input and output tokens. Less important status-bar
-items are omitted as the terminal narrows. Web chat is served by the optional
-shared `kelos-session-server`; it shows connection status separately from
-working, waiting-for-input, and interrupting progress, including elapsed time
-for active work. Both clients use the same event stream and provider
-conversation. Both clients can stream agent and tool activity, answer
+active. `/quit` and `/exit` detach the terminal client without interrupting work
+that is still running. The terminal initially loads a bounded page of recent
+transcript items. Use `/history` or Page Up to load the previous page.
+Attach a local file with `/attach PATH`; the next message includes all staged
+files. In the interactive terminal UI, dragging a file into a terminal that
+supports bracketed paste stages the file directly. Use `/send` in the plain
+terminal to send staged files without message text. The web composer accepts
+files from its attachment button or by drag and drop. Each message supports up
+to eight files of 10 MiB each. A Session retains up to 128 attachments and 100
+MiB of attachment data. Attachments share the Session workspace lifecycle, so
+they survive Pod replacement only when `spec.volumeClaimTemplate` is configured
+and are removed by Session reset or deletion. Retained messages show attachment
+names, and the web client provides authenticated previews or downloads while
+the Session is ready.
+
+Both terminal and web chat recognize `!COMMAND` and `/goal` before ordinary
+messages are submitted. `!COMMAND` runs `/bin/sh -lc COMMAND` directly in the
+Session working directory with the Session environment. It does not ask the
+agent for approval or start a model turn. The command, exit code, duration, and
+retained output are added to the agent conversation context for subsequent
+turns. Claude Code includes pending command results with the next ordinary
+prompt; Codex and OpenCode record them immediately. Live and retained command
+output appears as tool activity, and interrupting the Session turn stops the
+command.
+
+`/goal` is available only in Codex Sessions and uses the persisted goal owned by
+the Codex conversation:
+
+| Command | Behavior |
+|---------|----------|
+| `/goal` | Show the current goal |
+| `/goal OBJECTIVE` | Start an objective when no unfinished goal exists |
+| `/goal edit OBJECTIVE` | Replace the current objective while preserving its status |
+| `/goal pause` | Finish the current Codex turn, then stop automatic continuation |
+| `/goal resume` | Resume automatic continuation |
+| `/goal clear` | Remove the current goal |
+
+An active goal keeps starting Codex turns until Codex marks it complete,
+blocked, usage-limited, or budget-limited, or until it is paused or cleared.
+Interrupting active goal work pauses the goal before interrupting its current
+turn; detaching with `/quit` or `/exit` leaves it running. The goal and its
+accounting survive client reconnection and runtime container restart. They
+survive Pod replacement only when the Session workspace is persistent.
+
+The terminal client shows live connecting, reconnecting, working,
+waiting-for-input, and interrupting progress with elapsed time. After a
+completed turn, both interactive and plain terminal output show a `Worked for
+...` separator when the duration is known. A separate status bar beneath the
+composer shows the Session name, agent type, model and effort when available,
+working directory, git branch, and associated pull request number. Sessions
+also show reported context use and cumulative input and output tokens once the
+agent reports usage; Codex Sessions additionally show weekly limit remaining.
+Less important status-bar items are omitted as the terminal narrows. The
+model is the same runtime-reported value persisted in
+`status.model`. The optional `kelos-console-server` includes a Sessions view
+that shows the same live runtime details beneath its composer. The composer
+accepts prompt drafts while a selected Session is still
+Pending and enables sending after the runtime connects. It shows connection
+status separately from working, waiting-for-input,
+and interrupting progress, including elapsed time for active work, and adds the
+duration to its separator after a completed turn. Duration labels are omitted
+from retained history that does not contain event timestamps and from turns
+interrupted by runtime recovery. Both clients use the same event stream and
+provider conversation. Both clients can stream agent and tool activity, answer
 user-input requests, and interrupt active work without ending the provider
-conversation.
+conversation. While a turn is active, new submissions are combined into one
+pending message that runs next. In the web client, use **Edit** to revise its
+text before it starts or **Remove** to discard it; existing attachments remain
+on the message when it is edited. In the terminal UI, press **Up** on an empty
+composer to edit the pending message. Submitting the edit with no text removes
+the pending message. Kelos first
+asks the provider to interrupt gracefully, including
+while the runtime is draining. If the request fails or the turn does not finish
+within 10 seconds, Kelos marks the turn interrupted and restarts the provider.
+Clients reconnect to the retained conversation after a provider restart, and a
+pending message accepted before the restart resumes automatically.
 
 Completed tool output is retained with Session history up to 512 KiB per tool
 result. Larger results keep their beginning and end around an
@@ -254,35 +334,52 @@ sequences and displays at most five rendered output rows, retaining head and
 tail context. The web client displays a five-line preview and provides a control
 to expand retained results that exceed five lines.
 
-Selecting a Session in the web chat opens it at the latest retained message.
-Reconnecting preserves an intentional upward scroll position and shows the
-history that remains available on the Session workspace.
+Selecting a Session in the web chat opens a bounded page at the latest retained
+message. Use **Load earlier messages** to prepend the previous page without
+moving away from the current scroll position. Reconnecting preserves an
+intentional upward scroll position and the loaded conversation view. When the
+request for the visible response has scrolled out of view, a compact **Current
+request** link follows it while browsing history and scrolls back to the full
+request when clicked. The link stays hidden while viewing file changes.
 
 The Session sidebar shows compact relative activity times, and the selected
 Session header shows whether it is active now, when it was last active, or when
 it was created if runtime activity has not been reported. Hover over the
 timestamp to see the exact time in the browser's locale and time zone; the
-exact value is also available to assistive technology.
+exact value is also available to assistive technology. A Session waiting for a
+user response is labeled **Waiting for input** in the sidebar and header, with a
+distinct red indicator in the sidebar.
+
+Use **Rename** beside the selected Session's title or in a Session row's overflow
+menu to set a display name for the web chat. The display name appears in the
+sidebar, conversation header, and web runtime status without changing the
+Session's Kubernetes resource name. An empty
+display name restores the resource name. Display names are stored in the
+`kelos.dev/session-display-name` annotation, so Session manifests can set the
+same annotation directly. Values are trimmed and limited to 64 characters when
+set through the web chat.
 
 Sessions can be categorized into sections from the creation form or from the
-section control beneath the selected Session's name. Both controls list the
-existing sections in the active namespace and include a **Create new section**
-choice, so a section name is entered only when the section is first created.
-Choosing **Unsectioned (remove assignment)** from the selected Session's control
-removes its section assignment. Named sections are sorted alphabetically in the
-sidebar, Sessions retain their activity order within a section, and Sessions
-without a section appear under **Unsectioned** once at least one section exists.
-Assignments are stored in the `kelos.dev/session-section` annotation, so Session
-manifests can set the same annotation directly. New section names are trimmed
-and limited to 64 characters.
+selector beneath the selected Session's name. The selector applies an existing
+section or **Unsectioned** immediately. Choosing **Create new section** reveals
+an inline name field. Named sections are sorted alphabetically in the sidebar
+until they are reordered. Drag a Session onto a section heading to move it, or
+drag a heading to reorder sections. The arrow controls beside a heading provide
+the same ordering action without drag and drop. **Unsectioned** can be reordered
+like any named section and accepts dropped Sessions. Section order is stored in
+the browser separately for each namespace, while Sessions retain their activity
+order within a section. Assignments are stored in the
+`kelos.dev/session-section` annotation, so Session manifests can set the same
+annotation directly. New section names are trimmed and limited to 64 characters.
 
 Web messages render safe Markdown: paragraphs and headings; emphasis,
 strong text, strikethrough, and inline code; ordered, unordered, and task lists;
 blockquotes and horizontal rules; HTTP(S) links; fenced or indented code blocks;
 and pipe tables with optional column alignment. The renderer does not
 interpret raw HTML or load embedded images. Fenced code may include a language
-label, and wide tables and long code lines scroll horizontally. Tables that
-would render more than 10,000 cells remain plain text.
+label, each code block has a copy control, and wide tables and long code lines
+scroll horizontally. Tables that would render more than 10,000 cells remain
+plain text.
 
 If the Session Pod is deleted or evicted, clients reconnect after its
 replacement is ready. Work active at the time of failure is reported as
@@ -290,23 +387,54 @@ interrupted and is not submitted again automatically. The terminal client also
 does not retry a request whose delivery cannot be confirmed; it reports that
 uncertainty so the user can decide whether to submit it again.
 
-Session Pods that use the default runtime image are replaced when a Kelos
-upgrade changes that image. Before replacement, Kelos stops accepting new turns
-and waits for accepted work to finish. Pending user input delays the update
-until it is answered or interrupted. Rejected turns are not retried
-automatically; submit them again after the Session reconnects. An explicitly
-tagged or digested runtime image remains pinned.
+Existing Session StatefulSets reconcile their controller-managed fields when
+controller defaults or referenced `Workspace` and `AgentConfig` resources
+change. This includes plugin content. Fields that cannot be updated across all
+supported Kubernetes versions—the governing Service name, selector, Pod
+management policy, volume claim templates, and revision history limit—remain as
+originally created.
 
-`Active=True` means the runtime has an unfinished turn, including a turn waiting
-for user input; `Active=False` means it is idle. Activity becomes `Unknown` when
+When reconciliation changes the Pod template of an active Session, Kelos stops
+accepting new turns and waits for accepted work to finish before replacing the
+Pod. Pending user input delays the update until it is answered or interrupted.
+Rejected turns are not retried automatically; submit them again after the
+Session reconnects. Suspended Sessions remain at zero replicas while their
+StatefulSet is updated and use the updated template when resumed. Changes to
+`spec.worker.credentials`, `spec.worker.model`, and mutable fields under
+`spec.worker.podOverrides` follow this process. Session Pods that use the default
+runtime image also follow it when a Kelos upgrade changes that image; an
+explicitly tagged or digested runtime image remains pinned.
+
+`Active=True` means the runtime has an unfinished turn. Its reason is
+`WaitingForInput` when the turn needs a user response and `TurnActive` while the
+agent is working. `Active=False` means it is idle. Activity becomes `Unknown` when
 it cannot be reported, such as while the Session Pod is being replaced. Clients
-should use condition type and status as the contract; condition reasons and
-messages are informational. The shared web client orders Sessions by recent
-activity, newest first, using `status.lastActivityTime`. Creation counts as the
-initial activity until the runtime first reports its activity state. Replacing a
-Session Pod does not change the order. The web client shows activity,
-`status.branch`, and the pull request with a colored, text-labeled state in both
-the Session sidebar and conversation header.
+can use the `WaitingForInput` reason to highlight turns that need a response;
+other condition reasons and messages are informational unless documented as
+machine-readable below. The Console Sessions view orders Sessions by recent activity,
+newest first, using `status.lastActivityTime`. Creation counts as the initial
+activity until the runtime first reports its activity state. Replacing a Session
+Pod does not change the order. The web client shows activity,
+`status.model`, `status.branch`, and the pull request with a colored,
+text-labeled state in both the Session sidebar and conversation header.
+
+Idle suspension and deletion use the same idle period, measured from the later
+of Session creation and `status.lastActivityTime`. Before either action, the
+runtime stops accepting new turns and waits for any in-flight turn to finish.
+When `spec.idlePolicy.suspendAfterSeconds` is reached, Kelos scales the runtime
+to zero and reports `status.phase: Suspended` with the `IdlePolicyTriggered`
+Ready-condition reason. `IdlePolicyTriggered` is stable and machine-readable so
+clients can distinguish idle suspension from `spec.suspend: true`. Selecting the
+Session in the web interface or starting a terminal connection resumes it; an
+existing client's automatic reconnect does not. Kelos keeps the resume request
+active until the client receives the runtime's conversation history. A resume
+acknowledgement starts a fresh idle period and keeps the runtime protected for a
+five-second connection grace. A resume request that is not acknowledged within
+10 minutes expires and safely drains any running work before returning the
+Session to idle suspension, allowing its deletion deadline to proceed. When both
+idle actions are configured, `suspendAfterSeconds` must be less than
+`deleteAfterSeconds`; deletion still occurs at `deleteAfterSeconds`, including
+while the runtime is suspended.
 
 When `spec.initialBranch` is set, workspace initialization fetches and checks
 out that branch from `origin`, or creates it from `Workspace.spec.ref` when the
@@ -329,16 +457,19 @@ container. Persistent storage is recommended for durable Sessions. When the
 field is omitted, the workspace uses `emptyDir`, which is primarily useful for
 development because its history and changes do not survive Pod replacement.
 
-Set `spec.suspend` to `true` to suspend a Session without deleting it, then set
-it back to `false` to resume. A suspended Session rejects web connection
-attempts and the terminal client waits for it to resume. Configured persistent
-workspace and conversation data remain available across suspension. An
-`emptyDir` workspace is deleted with the scaled-down Pod and starts empty after
-resuming.
+Set `spec.suspend` to `true` or use the Suspend action in the shared web client
+to suspend a Session without deleting it. Set the field back to `false` or use
+the Resume action in the shared web client to resume.
+A suspended Session rejects web connection attempts and the terminal client
+waits for it to resume. Configured persistent workspace and conversation data
+remain available across suspension. An `emptyDir` workspace is deleted with the
+scaled-down Pod and starts empty after resuming.
 
 Reset a Session with `kelos session reset NAME` or the reset action in the
-shared web client. Reset preserves the Session resource and its immutable spec
-fields but permanently deletes retained conversation history and workspace changes.
+shared web client's Session-row overflow menu. The same menu can rename or
+delete that Session without selecting it first. Reset preserves the Session
+resource and its immutable spec fields but permanently deletes retained
+conversation history and workspace changes.
 The controller stops the Session Pod before deleting its PersistentVolumeClaim,
 then creates a fresh claim and replacement Pod. An `emptyDir` Session resets by
 replacing only its Pod. Workspace initialization and
@@ -346,11 +477,19 @@ replacing only its Pod. Workspace initialization and
 is submitted to the new conversation. The StorageClass reclaim policy controls
 whether the old underlying PersistentVolume is deleted or retained.
 
-The shared web server can create, list, reset, delete, and connect to Sessions
-across namespaces while the web application operates on one active namespace
+The Console can inspect Kelos resources and create, list, reset, delete, and
+connect to Sessions across namespaces while operating on one active namespace
 at a time. Users can switch the active namespace live from the sidebar.
-`sessionServer.defaultNamespace` sets its initial value, and Session, Workspace,
-AgentConfig, and credential options are loaded only from the active namespace.
+`consoleServer.defaultNamespace` sets its initial value, and resource inventory,
+Session form options, and credential options are loaded only from the active namespace.
+The Resources page shows the incoming and outgoing relationships for one
+selected object, with a searchable inventory for inspecting the full namespace.
+Selecting a Task from either resource view shows its agent container logs and
+manifest. The Logs tab shows up to the latest 2,000 lines with a 2 MiB maximum
+and can be refreshed while the Task is running. WorkerPool-backed Task views
+include only the selected Task's segment from the recent shared worker Pod log.
+The Console reports that the segment is unavailable when its markers are
+outside the bounded log window.
 Selecting an existing Session as a source populates both the form fields and the
 editable YAML manifest. Settings that the form cannot represent remain editable
 in YAML mode.
@@ -372,14 +511,20 @@ webhook-driven TaskSpawner.
 |-------|-------------|----------|
 | `spec.when.githubWebhook.events` | GitHub event types to listen for, using the same values as TaskSpawner | Yes |
 | `spec.when.githubWebhook.repository` | Repository filter in `owner/repo` format; omit to accept any repository | No |
+| `spec.when.githubWebhook.gatewayRef.name` | Bind this source to a [WebhookGateway](#webhookgateway) in the same namespace whose `spec.github` field is set. The per-source webhook server ignores this spawner when the reference is present | No |
 | `spec.when.githubWebhook.excludeAuthors` | GitHub senders ignored before filter evaluation | No |
 | `spec.when.githubWebhook.filters` | GitHub webhook filters using the same fields and OR semantics as TaskSpawner | No |
+| `spec.credentials[].name` | Unique name for a credential distributed by this SessionSpawner. The name is recorded in the `kelos.dev/spawner-credential` label on generated Sessions | Yes when `spec.credentials` is set |
+| `spec.credentials[].type` | Credential type (`api-key` or `oauth`) | Yes when `spec.credentials` is set |
+| `spec.credentials[].secretRef.name` | Secret containing the agent credential | Yes when `spec.credentials` is set |
 | `spec.sessionTemplate.worker` | Worker configuration copied to each Session | Yes |
 | `spec.sessionTemplate.worker.workspaceRef.name` | Workspace cloned into each Session | Yes |
 | `spec.sessionTemplate.initialBranch` | Go text/template rendered for the Session's initial branch | No |
 | `spec.sessionTemplate.initialPrompt` | Go text/template submitted when the created Session starts | Yes |
 | `spec.sessionTemplate.suspend` | Whether each created Session starts suspended (defaults to `false`) | No |
 | `spec.sessionTemplate.volumeClaimTemplate` | Persistent workspace for each Session; recommended so conversation history survives Pod replacement | No |
+| `spec.sessionTemplate.idlePolicy.suspendAfterSeconds` | Applied to each created Session as `Session.spec.idlePolicy.suspendAfterSeconds`: automatically stop its runtime after this much continuous idleness without changing `Session.spec.suspend`. When deletion is also configured, this value must be less than `deleteAfterSeconds` | No |
+| `spec.sessionTemplate.idlePolicy.deleteAfterSeconds` | Applied to each created Session as `Session.spec.idlePolicy.deleteAfterSeconds`: automatically delete the Session once it has been continuously idle for this many seconds, which removes its workspace storage. Omit to never delete; zero deletes as soon as it goes idle. When suspension is also configured, this value must be greater than `suspendAfterSeconds` | No |
 | `status.observedGeneration` | Most recent generation observed by the controller | Output |
 | `status.totalSessions` | Current number of Sessions associated with this spawner | Output |
 | `status.lastSessionName` | Session most recently created or confirmed to exist | Output |
@@ -404,6 +549,36 @@ Created Sessions have a `kelos.dev/sessionspawner` label whose value is the
 SessionSpawner UID, a `kelos.dev/sessionspawner-name` annotation for the
 human-readable name, and a controller owner reference to the SessionSpawner.
 
+When `spec.credentials` is configured, omit
+`spec.sessionTemplate.worker.credentials`. Before creating each Session, the
+SessionSpawner selects a credential uniformly at random. It copies the selected
+credential into the generated Session and records the selection in the
+`kelos.dev/spawner-credential` label. The Session keeps that credential for its
+lifetime, including after suspension and resume. Assignments are independent,
+so a small number of Sessions may not be distributed evenly.
+
+```yaml
+spec:
+  credentials:
+    - name: account-a
+      type: oauth
+      secretRef:
+        name: claude-account-a
+    - name: account-b
+      type: oauth
+      secretRef:
+        name: claude-account-b
+  sessionTemplate:
+    worker:
+      type: claude-code
+      workspaceRef:
+        name: my-workspace
+    initialPrompt: "Handle issue #{{.Number}}: {{.Title}}"
+```
+
+`spec.credentials` is mutually exclusive with
+`spec.sessionTemplate.worker.credentials`.
+
 Before the first matching delivery, the SessionSpawner
 `LastDeliverySucceeded` condition is absent. A creation failure returns an
 error to the webhook sender so it can retry and sets the condition to `False`
@@ -418,6 +593,13 @@ must retain a conversation across Pod recovery.
 ## WorkerPool
 
 A WorkerPool manages a fleet of persistent worker pods backed by a StatefulSet. Tasks reference a WorkerPool via `spec.workerPoolRef` to execute on pre-warmed infrastructure instead of creating per-task Jobs.
+
+When a pooled Task is cancelled, the worker kills the Task's agent process
+tree and repeatedly sweeps for survivors before accepting another Task, so a
+cancelled Task's processes do not keep consuming the worker's resources. The
+sweep is bounded: if processes still remain after 10 seconds, the worker logs
+the remaining count and accepts the next Task anyway, so cleanup is
+best-effort rather than guaranteed.
 
 A WorkerPool's Workspace may use either a PAT-style or a GitHub App secret.
 GitHub App credentials are refreshed before they expire, so long-lived workers
@@ -484,12 +666,26 @@ The secret contains a single key:
 
 | Key | Description |
 |-----|-------------|
-| `GITHUB_TOKEN` | GitHub Personal Access Token for git auth and `gh` CLI |
+| `GITHUB_TOKEN` | Personal access token for HTTPS git authentication and the GitHub `gh` CLI |
 
 ```bash
 kubectl create secret generic github-token \
   --from-literal=GITHUB_TOKEN=<your-pat>
 ```
+
+For repositories that require a username with PAT authentication, include the
+username in `spec.repo` and store the PAT in the Secret's `GITHUB_TOKEN` key:
+
+```yaml
+spec:
+  repo: https://username@bitbucket.example/scm/team/repo.git
+  secretRef:
+    name: github-token
+```
+
+Kelos preserves a username included in the repository URL. When the URL omits
+the username, Kelos uses `x-access-token`, which is compatible with GitHub PATs
+and GitHub App installation tokens.
 
 **GitHub App (recommended for production/org use):**
 
@@ -561,7 +757,8 @@ to receive refreshed credentials during long-running work.
 | `spec.when.githubIssues.author` | Filter by issue author username | No |
 | `spec.when.githubIssues.excludeAuthors` | Exclude issues created by any of these usernames (client-side) | No |
 | `spec.when.githubIssues.priorityLabels` | Priority-order labels for task selection when `maxConcurrency` is set; index 0 is highest priority | No |
-| `spec.when.githubIssues.reporting.enabled` | Post status comments (started, succeeded, failed) back to the GitHub issue | No |
+| `spec.when.githubIssues.reporting.enabled` | **Deprecated:** use `reporting.comments`. Posts status comments back to the GitHub issue using `PerTask` mode | No |
+| `spec.when.githubIssues.reporting.comments.mode` | Enables status comments back to the GitHub issue. `PerTask` (default) creates one comment for each Task; `Sticky` maintains one comment per TaskSpawner and issue across Tasks | No |
 | `spec.when.githubIssues.pollInterval` | Per-source poll interval (e.g., `"30s"`, `"5m"`). Defaults to `5m` when omitted | No |
 | `spec.when.githubPullRequests.repo` | Override repository to poll for PRs (in `owner/repo` format or full URL); defaults to workspace repo URL | No |
 | `spec.when.githubPullRequests.labels` | Filter pull requests by labels | No |
@@ -577,7 +774,8 @@ to receive refreshed credentials during long-running work.
 | `spec.when.githubPullRequests.excludeAuthors` | Exclude PRs opened by any of these usernames (client-side) | No |
 | `spec.when.githubPullRequests.draft` | Filter by draft state | No |
 | `spec.when.githubPullRequests.priorityLabels` | Priority-order labels for task selection when `maxConcurrency` is set; index 0 is highest priority | No |
-| `spec.when.githubPullRequests.reporting.enabled` | Post status comments (started, succeeded, failed) back to the GitHub pull request | No |
+| `spec.when.githubPullRequests.reporting.enabled` | **Deprecated:** use `reporting.comments`. Posts status comments back to the GitHub pull request using `PerTask` mode | No |
+| `spec.when.githubPullRequests.reporting.comments.mode` | Enables status comments back to the GitHub pull request. `PerTask` (default) creates one comment for each Task; `Sticky` maintains one comment per TaskSpawner and pull request across Tasks | No |
 | `spec.when.githubPullRequests.reporting.checks.name` | Creates a GitHub Check Run for each PR task, enabling branch protection and merge queue integration. Sets the Check Run name (defaults to `"Kelos: <taskspawner-name>"`, max 100 chars). The token used by the workspace must have `checks:write` permission. Not supported on `githubIssues` (rejected by CEL validation). | No |
 | `spec.when.githubPullRequests.filePatterns.include` | Doublestar globs for changed files to include after `exclude` patterns are removed. When omitted, any remaining changed file passes | No |
 | `spec.when.githubPullRequests.filePatterns.exclude` | Doublestar globs for changed files to remove before include matching. A PR with no remaining changed files is skipped | No |
@@ -603,30 +801,40 @@ to receive refreshed credentials during long-running work.
 | `spec.when.githubWebhook.filters[].bodyPattern` | Require the comment/review body to match a Go re2 regular expression. When combined with `excludeBodyPatterns`, the body must match this pattern AND not match any exclude entry | No |
 | `spec.when.githubWebhook.filters[].excludeBodyPatterns` | Exclude events whose comment/review body matches any of these Go re2 regular expressions (OR semantics) | No |
 | `spec.when.githubWebhook.filters[].commentOn` | Scope `issue_comment` events to comments posted on a specific subject: `"Issue"` matches plain issues, `"PullRequest"` matches pull requests. Empty matches both. Ignored for other events | No |
-| `spec.when.githubWebhook.reporting.enabled` | Post status comments (started, succeeded, failed) back to the originating issue or PR | No |
-| `spec.when.githubWebhook.reporting.checks.name` | Creates a GitHub Check Run for tasks spawned by PR-related webhook events, enabling branch protection and merge queue integration. Sets the Check Run name (defaults to `"Kelos: <taskspawner-name>"`, max 100 chars). The token used by the workspace must have `checks:write` permission. Requires `events` to include at least one of `pull_request`, `pull_request_review`, `pull_request_review_comment`, or `pull_request_target` (enforced by CEL validation). | No |
+| `spec.when.githubWebhook.reporting.enabled` | **Deprecated:** use `reporting.comments`. Posts status comments back to the originating issue or PR using `PerTask` mode | No |
+| `spec.when.githubWebhook.reporting.comments.mode` | Enables status comments back to the originating issue or PR. `PerTask` (default) creates one comment for each Task; `Sticky` maintains one comment per TaskSpawner and originating issue or PR across Tasks | No |
+| `spec.when.githubWebhook.reporting.checks.name` | Creates a GitHub Check Run for tasks spawned by PR-related webhook events, enabling branch protection and merge queue integration. Sets the Check Run name (defaults to `"Kelos: <taskspawner-name>"`, max 100 chars). The token used by the workspace must have `checks:write` permission. Requires `events` to include at least one of `pull_request`, `pull_request_review`, `pull_request_review_comment`, or `pull_request_target`; alternatively, `events` may include `issue_comment` when at least one filter applies to that event and every `issue_comment` filter sets `commentOn: PullRequest` (enforced by CEL validation). | No |
+| `spec.when.githubWebhook.gatewayRef.name` | Bind this source to a [WebhookGateway](#webhookgateway) in the same namespace whose `spec.github` field is set. The per-source webhook server ignores this spawner when the reference is present | No |
 | `spec.when.linearWebhook.types` | Linear resource types to listen for (e.g., `"Issue"`, `"Comment"`) | Yes (when using linearWebhook) |
 | `spec.when.linearWebhook.filters[].type` | Scope filter to a specific resource type | No |
 | `spec.when.linearWebhook.filters[].action` | Filter by webhook action: `create`, `update`, or `remove` | No |
 | `spec.when.linearWebhook.filters[].states` | Filter by workflow state names (e.g., `"Todo"`, `"In Progress"`) | No |
 | `spec.when.linearWebhook.filters[].labels` | Require the issue to have all of these labels | No |
 | `spec.when.linearWebhook.filters[].excludeLabels` | Exclude issues with any of these labels | No |
+| `spec.when.linearWebhook.gatewayRef.name` | Bind this source to a [WebhookGateway](#webhookgateway) in the same namespace whose `spec.linear` field is set. The per-source webhook server ignores this spawner when the reference is present | No |
 | `spec.when.slack.channels` | Restrict which Slack channels the bot listens in (channel IDs like `"C0123456789"`); when empty, listens in all invited channels | No |
 | `spec.when.slack.botMessagePolicy` | Controls whether bot-originated messages can trigger this spawner: `None` (default) rejects all bot messages, `All` allows all including self, `OthersOnly` allows other bots but rejects the bot's own output to prevent self-trigger loops | No |
 | `spec.when.slack.triggers[].pattern` | RE2 regex matched against message text (unanchored); leading `<@USER_ID>` mentions are stripped before matching; bot mention required unless `mentionOptional` is set; multiple triggers use OR semantics; when empty, every bot mention fires | No |
 | `spec.when.slack.triggers[].mentionOptional` | When `true`, fire on pattern match alone without requiring a bot @-mention | No |
 | `spec.when.slack.excludePatterns` | RE2 regex patterns that reject messages when any pattern matches (OR semantics); leading `<@USER_ID>` mentions are stripped before matching; does not apply to slash commands | No |
-| `spec.when.webhook.source` | Short identifier for the generic webhook source (lowercase alphanumeric with optional hyphens). Determines the URL path (`/webhook/<source>`). The endpoint is currently unauthenticated — see [#1040](https://github.com/kelos-dev/kelos/issues/1040) | Yes (when using webhook) |
+| `spec.when.webhook.source` | Short identifier for the generic webhook source (lowercase alphanumeric with optional hyphens). On the per-source server it determines the URL path (`/webhook/<source>`); that endpoint is unauthenticated (see [#1040](https://github.com/kelos-dev/kelos/issues/1040)). Set `gatewayRef` to route through a [WebhookGateway](#webhookgateway) | Yes (when using webhook) |
 | `spec.when.webhook.fieldMapping` | Map of template variable name → JSONPath expression evaluated against the request body. Each key becomes a top-level template variable. Lowercase `id`, `title`, `body`, `url` are also exposed as `{{.ID}}`, `{{.Title}}`, `{{.Body}}`, `{{.URL}}`. The `id` key is required (used for delivery deduplication and Task naming) | Yes (when using webhook) |
-| `spec.when.webhook.filters[].field` | JSONPath expression selecting the payload field to match | Yes (per filter) |
+| `spec.when.webhook.filters[].field` | JSONPath expression selecting the payload field to match. A field missing from the payload fails the filter (the delivery is skipped); a malformed JSONPath expression skips the spawner for that delivery and logs an error | Yes (per filter) |
 | `spec.when.webhook.filters[].value` | Require an exact string match against the extracted field value (mutually exclusive with `pattern`) | Conditional |
 | `spec.when.webhook.filters[].pattern` | Require a regex match against the extracted field value (mutually exclusive with `value`) | Conditional |
+| `spec.when.webhook.excludeFilters[].field` | JSONPath expression selecting the payload field to match. A delivery matching any exclude filter is skipped (OR semantics), even when every entry in `filters` matched. Unlike `filters[].field`, a field missing from the payload does not match and so does not exclude the delivery; a malformed JSONPath expression skips the spawner for that delivery and logs an error | Yes (per exclude filter) |
+| `spec.when.webhook.excludeFilters[].value` | Exclude the delivery on an exact string match against the extracted field value (mutually exclusive with `pattern`) | Conditional |
+| `spec.when.webhook.excludeFilters[].pattern` | Exclude the delivery on a regex match against the extracted field value (mutually exclusive with `value`) | Conditional |
+| `spec.when.webhook.gatewayRef.name` | Bind this source to a [WebhookGateway](#webhookgateway) in the same namespace whose `spec.generic` field is set. Generic gateway deliveries remain unauthenticated, and the per-source server ignores this spawner when the reference is present | No |
 | `spec.when.jira.pollInterval` | Per-source poll interval (e.g., `"30s"`, `"5m"`). Defaults to `5m` when omitted | No |
 | `spec.when.cron.schedule` | Cron schedule expression (e.g., `"0 * * * *"`) | Yes (when using cron) |
-| `spec.taskTemplate.worker` | Execution environment for spawned Tasks (see [WorkerSpec](#workerspec)). When used alone, spawned Tasks create Jobs. Mutually exclusive with `workerPoolRef` | One of worker, workerPoolRef, or type+credentials |
-| `spec.taskTemplate.workerPoolRef.name` | WorkerPool for persistent execution | One of worker, workerPoolRef, or type+credentials |
-| `spec.taskTemplate.type` | **(Deprecated)** Agent type — use `taskTemplate.worker.type` instead | Legacy |
-| `spec.taskTemplate.credentials` | **(Deprecated)** Credentials — use `taskTemplate.worker.credentials` instead | Legacy |
+| `spec.credentials[].name` | Unique name for a credential distributed by this TaskSpawner. The name is recorded in the `kelos.dev/spawner-credential` label on generated Tasks | Yes when `spec.credentials` is set |
+| `spec.credentials[].type` | Credential type (`api-key` or `oauth`) | Yes when `spec.credentials` is set |
+| `spec.credentials[].secretRef.name` | Secret containing the agent credential. The required Secret key depends on the agent and credential type (see [Task Credential Secret Format](#task-credential-secret-format)) | Yes when `spec.credentials` is set |
+| `spec.taskTemplate.worker` | Execution environment for spawned Tasks (see [WorkerSpec](#workerspec)). When used alone, spawned Tasks create Jobs. Mutually exclusive with `workerPoolRef` | One of worker, workerPoolRef, or type |
+| `spec.taskTemplate.workerPoolRef.name` | WorkerPool for persistent execution | One of worker, workerPoolRef, or type |
+| `spec.taskTemplate.type` | **(Deprecated)** Agent type — use `taskTemplate.worker.type` instead | One of worker, workerPoolRef, or type |
+| `spec.taskTemplate.credentials` | **(Deprecated)** Credentials — use `taskTemplate.worker.credentials` instead | Required with type unless `spec.credentials` is set |
 | `spec.taskTemplate.model` | **(Deprecated)** Model override — use `taskTemplate.worker.model` instead | Legacy |
 | `spec.taskTemplate.effort` | **(Deprecated)** Reasoning effort — use `taskTemplate.worker.effort` instead | Legacy |
 | `spec.taskTemplate.image` | **(Deprecated)** Custom agent image — use `taskTemplate.worker.image` instead | Legacy |
@@ -639,13 +847,49 @@ to receive refreshed credentials during long-running work.
 | `spec.taskTemplate.ttlSecondsAfterFinished` | Auto-delete spawned tasks after N seconds | No |
 | `spec.taskTemplate.podFailurePolicy` | Kubernetes Job pod failure policy copied to spawned Tasks as `Task.spec.podFailurePolicy` | No |
 | `spec.taskTemplate.podOverrides` | **(Deprecated)** Pod customization — use `taskTemplate.worker.podOverrides` instead | Legacy |
-| `spec.taskTemplate.metadata.labels` | Labels merged into spawned Tasks; values support the same Go template variables as `branch`/`promptTemplate`; the `kelos.dev/taskspawner` label is always set to the TaskSpawner name and overrides any user value for that key | No |
+| `spec.taskTemplate.metadata.labels` | Labels merged into spawned Tasks; values support the same Go template variables as `branch`/`promptTemplate`; `kelos.dev/taskspawner` and, when `spec.credentials` is configured, `kelos.dev/spawner-credential` are reserved and override conflicting user values | No |
 | `spec.taskTemplate.metadata.annotations` | Annotations merged into spawned Tasks; values support the same Go template variables as `branch`/`promptTemplate`; source annotations (e.g. `kelos.dev/source-kind`) are applied after rendering and override conflicting user values | No |
 | `spec.taskTemplate.contextSources` | External data sources fetched in parallel before task creation; each source's value is exposed as `{{.Context.NAME}}` in `branch`, `promptTemplate`, and `metadata` templates — but not in `nameTemplate` (see [Context Sources](#context-sources) below). Maximum 8 entries; names must be unique | No |
 | `spec.taskTemplate.upstreamRepo` | Upstream repository in `owner/repo` format; injected as `KELOS_UPSTREAM_REPO` into the agent container. Typically auto-derived from `githubIssues.repo`/`githubPullRequests.repo`, but can be set explicitly for fork workflows | No |
 | `spec.maxConcurrency` | Limit max concurrent running tasks (important for cost control) | No |
 | `spec.maxTotalTasks` | Lifetime limit on total tasks created by this spawner | No |
 | `spec.suspend` | Pause the spawner without deleting it; resume with `spec.suspend: false` (default: `false`) | No |
+
+When `spec.credentials` is configured, omit credentials from
+`spec.taskTemplate`. Before creating each Task, the TaskSpawner selects the
+credential uniformly at random. It copies the selected credential into the
+generated Task and records the selection in the
+`kelos.dev/spawner-credential` label. The Task keeps that credential for its
+lifetime, including Job retries. Assignments are independent, so a small number
+of Tasks may not be distributed evenly.
+
+Choose exactly one execution source: `spec.taskTemplate.worker`,
+`spec.taskTemplate.workerPoolRef`, or the legacy `spec.taskTemplate.type`.
+Inline `worker` and legacy `type` sources require credentials from their
+corresponding template field or from `spec.credentials`.
+
+```yaml
+spec:
+  credentials:
+    - name: account-a
+      type: oauth
+      secretRef:
+        name: claude-account-a
+    - name: account-b
+      type: oauth
+      secretRef:
+        name: claude-account-b
+  taskTemplate:
+    worker:
+      type: claude-code
+      workspaceRef:
+        name: my-workspace
+    promptTemplate: "Fix issue #{{.Number}}: {{.Title}}"
+```
+
+`spec.credentials` is mutually exclusive with
+`spec.taskTemplate.worker.credentials`, deprecated
+`spec.taskTemplate.credentials`, and `spec.taskTemplate.workerPoolRef`.
 
 ### Generated Task Names
 
@@ -779,6 +1023,8 @@ The `promptTemplate` field uses Go `text/template` syntax. Available variables d
 | `spec.taskTemplate.contextSources[].http.method` | HTTP method: `GET` or `POST` (default: `GET`) | No |
 | `spec.taskTemplate.contextSources[].http.headers` | Static HTTP headers. Values support Go `text/template` variables from the work item | No |
 | `spec.taskTemplate.contextSources[].http.headersFrom` | HTTP header values sourced from Kubernetes Secrets in the same namespace as the TaskSpawner. Each entry sets `header` to the HTTP header name, `secretName` to the Secret name, and `secretKey` to the key within the Secret. Merged with `headers`; `headersFrom` wins on conflict. Maximum 16 entries | No |
+| `spec.taskTemplate.contextSources[].http.githubAppAuth.secretRef.name` | Name of a Secret in the same namespace as the TaskSpawner holding GitHub App credentials (`appID`, `installationID`, `privateKey` keys). When set, an `Authorization: token <installation-token>` header is minted and added to the request. An explicit `Authorization` header from `headers`/`headersFrom` takes precedence and disables this. The token is reused across work items until it nears expiry | No |
+| `spec.taskTemplate.contextSources[].http.githubAppAuth.apiBaseURL` | GitHub API base URL used to mint installation tokens (default: `https://api.github.com`). Must be an HTTPS URL, at most 2048 characters. Set for GitHub Enterprise Server, e.g. `https://github.example.com/api/v3` | No |
 | `spec.taskTemplate.contextSources[].http.body` | Request body template (Go `text/template`); used with `POST` | No |
 | `spec.taskTemplate.contextSources[].http.responseFilter.type` | Filter language for extracting a subset of the response. Currently only `JSONPath` is supported | No |
 | `spec.taskTemplate.contextSources[].http.responseFilter.expression` | Filter expression (e.g., `$.data.value` for JSONPath). When set, only the extracted value is stored; otherwise the entire response body is used | Conditional |
@@ -828,6 +1074,63 @@ spec:
       Linked Jira description:
       {{.Context.jira}}
 ```
+
+Example — fetch a GitHub API resource authenticated with a GitHub App installation token, reusing an existing GitHub App Secret:
+
+```yaml
+    contextSources:
+      - name: pr
+        http:
+          url: "https://api.github.com/repos/my-org/my-repo/pulls/{{.Number}}"
+          githubAppAuth:
+            secretRef:
+              name: my-github-app
+          responseFilter:
+            type: JSONPath
+            expression: "$.body"
+```
+
+## WebhookGateway
+
+A `WebhookGateway` is a per-channel authentication and routing boundary for
+webhook-driven TaskSpawners and SessionSpawners. It owns one inbound path,
+`/webhook/<namespace>/<name>` (surfaced in `status.path`), verifies inbound
+deliveries against its own secret (github/linear), and fans out only to
+spawners in its own namespace that reference it via `gatewayRef`. This
+enables per-tenant secrets and multiple GitHub instances (github.com plus GitHub
+Enterprise) without a per-instance Deployment. Enable the gateway server with
+`webhookServer.gatewayServer.enabled` in the Helm chart. See
+[example 18](../examples/18-webhookgateway).
+
+Exactly one provider sub-struct (`spec.github`, `spec.linear`, or `spec.generic`)
+must be set; the one that is present selects the source.
+
+| Field | Description | Required |
+| --- | --- | --- |
+| `spec.github` | GitHub gateway configuration (see below). Set exactly one of `github`/`linear`/`generic` | Conditional |
+| `spec.github.secretRef.name` | Secret holding the inbound HMAC secret (under a `webhook-secret` key) | Yes (for github) |
+| `spec.github.apiBaseURL` | GitHub API base URL for outbound calls (PR-file enrichment, status reporting, and GitHub App token minting), e.g. `https://ghe.example.com/api/v3`. Defaults to `https://api.github.com` | No |
+| `spec.github.credentialsRef.name` | Secret holding outbound GitHub API credentials — a `GITHUB_TOKEN` key (PAT) or GitHub App keys (`appID`, `installationID`, `privateKey`) | No |
+| `spec.linear.secretRef.name` | Secret holding the inbound HMAC secret (under a `webhook-secret` key) | Yes (for linear) |
+| `spec.generic` | Generic gateway configuration (no fields yet; deliveries are accepted without verification) | Conditional |
+| `status.path` | Derived inbound path, `/webhook/<namespace>/<name>`, relative to the configured webhook host | — |
+| `status.phase` | `Authenticated`, `SecretMissing`, or `Unauthenticated` (generic gateways are `Unauthenticated`) | — |
+
+> `generic` gateways are accepted but **not** signature-verified;
+> restrict access at the network layer. Task execution (clone/push) credentials
+> come from the Workspace's `secretRef`, separate from a gateway's
+> `github.credentialsRef`.
+
+### "Gateway" terminology
+
+Several distinct "gateway" concepts coexist:
+
+| Term | What it is |
+| --- | --- |
+| `WebhookGateway` (CRD) | The per-channel auth/routing resource described above. |
+| `gatewayRef` | The field on a TaskSpawner or SessionSpawner webhook source that binds it to a `WebhookGateway`. |
+| `Gateway` (gateway.networking.k8s.io) | The Gateway-API ingress object that fronts the webhook server; created by the chart as `kelos-webhook-gateway` when `webhookServer.gateway.enabled`. |
+| `webhookServer.gateway*` (Helm values) | `webhookServer.gateway` configures the Gateway-API `Gateway`/`HTTPRoute`; `webhookServer.gatewayServer` enables the gateway-mode webhook server that serves `WebhookGateway` paths. |
 
 ## Task Status
 
@@ -1043,7 +1346,7 @@ The `kelos` CLI lets you manage the full lifecycle without writing YAML.
 |---------|-------------|
 | `kelos run` | Create and run a new Task |
 | `kelos run --from taskspawner/<name>` | Run a standalone Task from a TaskSpawner template |
-| `kelos session connect NAME` | Continue a ready Session through terminal chat |
+| `kelos session connect NAME` | Continue a ready Session through terminal chat, resuming it first when it was suspended by its idle policy |
 | `kelos session reset NAME` | Permanently clear a Session workspace and start a fresh conversation |
 | `kelos create workspace` | Create a Workspace resource |
 | `kelos create agentconfig` | Create an AgentConfig resource |
@@ -1053,7 +1356,7 @@ The `kelos` CLI lets you manage the full lifecycle without writing YAML.
 | `kelos suspend taskspawner <name>` | Pause a TaskSpawner (stops polling, running tasks continue) |
 | `kelos resume taskspawner <name>` | Resume a paused TaskSpawner |
 
-`kelos logs <task-name> -f` waits while the task Pod is unscheduled, Pending, or initializing its target container, then streams logs once the container is available. Failed Tasks and non-transient container startup failures return an error instead of retrying indefinitely.
+`kelos logs <task-name> -f` waits while the task Pod is unscheduled, Pending, or initializing its target container, then streams logs once the container is available. If Kubernetes closes an empty agent log stream while the Task is still active, the command reconnects instead of reporting completion. Failed Tasks and non-transient container startup failures return an error instead of retrying indefinitely.
 
 ### `kelos install` Flags
 
@@ -1195,6 +1498,23 @@ Each spawner pod emits metrics scoped to its own TaskSpawner:
 | `kelos_spawner_items_discovered_total` | Counter | Work items discovered |
 | `kelos_spawner_tasks_created_total` | Counter | Tasks created by this spawner |
 | `kelos_spawner_discovery_duration_seconds` | Histogram | Duration of discovery cycles |
+
+### Scraping with Prometheus Operator
+
+The Helm chart can ship optional [Prometheus Operator](https://github.com/prometheus-operator/prometheus-operator)
+`PodMonitor` resources (`monitoring.coreos.com/v1`). They are disabled by
+default so the chart installs on clusters without the Prometheus Operator CRDs.
+Enable them via the `podMonitor` values:
+
+| Value | Default | Description |
+|-------|---------|-------------|
+| `podMonitor.enabled` | `false` | Ship a PodMonitor for the control-plane pods (controller manager, webhook servers, slack server). They all expose the `metrics` port (8080). Target discovery spans both `kelos-system` (where the controller manager runs) and the release namespace (where the webhook and slack servers run); under `kelos install` these are the same namespace. The Console server is not scraped — its 8080 port serves the web app, not metrics. |
+| `podMonitor.interval` | `30s` | Scrape interval. |
+| `podMonitor.scrapeTimeout` | `10s` | Per-scrape timeout. |
+| `podMonitor.honorLabels` | `false` | Keep target-exposed labels when they collide with labels Prometheus would add. |
+| `podMonitor.labels` | `{}` | Extra labels on the PodMonitor object(s); commonly used to match a Prometheus instance's `podMonitorSelector`. |
+| `podMonitor.annotations` | `{}` | Extra annotations on the PodMonitor object(s). |
+| `podMonitor.spawners.enabled` | `false` | Additionally ship a PodMonitor for long-lived spawner pods (event- and poll-based TaskSpawners). Spawner pods run in arbitrary namespaces, so this PodMonitor discovers pod targets across all namespaces (`spec.namespaceSelector.any: true`); the scraping Prometheus's service account must have RBAC to read/scrape pods in those namespaces. Cron-based (one-shot) spawners expose no metrics port and are not scraped. |
 
 ## Telemetry
 

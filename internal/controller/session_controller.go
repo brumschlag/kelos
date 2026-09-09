@@ -4,14 +4,17 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
 	"time"
 
+	"github.com/google/uuid"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,6 +31,7 @@ import (
 	kelos "github.com/kelos-dev/kelos/api/v1alpha2"
 	"github.com/kelos-dev/kelos/internal/githubapp"
 	"github.com/kelos-dev/kelos/internal/sessionreset"
+	"github.com/kelos-dev/kelos/internal/sessionsuspend"
 	"github.com/kelos-dev/kelos/internal/sessionupdate"
 )
 
@@ -35,16 +39,22 @@ const (
 	SessionRuntimeImageRepository = "ghcr.io/kelos-dev/kelos-session-runtime"
 	DefaultSessionRuntimeImage    = SessionRuntimeImageRepository + ":latest"
 
-	sessionRuntimeContainerName = "kelos-session-runtime"
-	sessionRuntimeVolumeName    = "kelos-session-runtime"
-	sessionRuntimeMountPath     = "/kelos/bin"
-	sessionRuntimeBinary        = sessionRuntimeMountPath + "/kelos-session-runtime"
-	sessionClaudeConfigDir      = "/workspace/.kelos/session/claude-config"
-	sessionCodexHome            = "/workspace/.kelos/session/codex-home"
-	sessionOpenCodeConfigDir    = "/workspace/.kelos/session/opencode-config"
-	sessionOpenCodeDataDir      = "/workspace/.kelos/session/opencode-data"
-	sessionInitializedPath      = "/workspace/.kelos/session/initialized"
-	sessionNameAnnotation       = "kelos.dev/session-name"
+	sessionRuntimeContainerName       = "kelos-session-runtime"
+	sessionRuntimeVolumeName          = "kelos-session-runtime"
+	sessionRuntimeMountPath           = "/kelos/bin"
+	sessionRuntimeBinary              = sessionRuntimeMountPath + "/kelos-session-runtime"
+	sessionClaudeConfigDir            = "/workspace/.kelos/session/claude-config"
+	sessionCodexHome                  = "/workspace/.kelos/session/codex-home"
+	sessionOpenCodeConfigDir          = "/workspace/.kelos/session/opencode-config"
+	sessionOpenCodeDataDir            = "/workspace/.kelos/session/opencode-data"
+	sessionInitializedPath            = "/workspace/.kelos/session/initialized"
+	sessionNameAnnotation             = "kelos.dev/session-name"
+	sessionPluginChecksumAnnotation   = "kelos.dev/plugin-content-checksum"
+	sessionTokenFingerprintAnnotation = "kelos.dev/github-token-mint-fingerprint"
+	// ControllerRevision names append a hyphen and up to 10 hash characters and are used as Pod label values.
+	sessionWorkloadNameMaxLength   = 52
+	idleResumeAcknowledgementGrace = 5 * time.Second
+	idleResumeRequestTimeout       = 10 * time.Minute
 )
 
 // SessionReconciler reconciles a Session object.
@@ -58,8 +68,58 @@ type SessionReconciler struct {
 	TokenClient                   *githubapp.TokenClient
 }
 
-// +kubebuilder:rbac:groups=kelos.dev,resources=sessions,verbs=get;list;watch;patch
+type sessionConfigurationError struct {
+	err error
+}
+
+func (e *sessionConfigurationError) Error() string {
+	return e.err.Error()
+}
+
+func (e *sessionConfigurationError) Unwrap() error {
+	return e.err
+}
+
+func invalidSessionConfiguration(err error) error {
+	return &sessionConfigurationError{err: err}
+}
+
+func isInvalidSessionConfiguration(err error) bool {
+	var configurationError *sessionConfigurationError
+	return errors.As(err, &configurationError)
+}
+
+type sessionInputClient struct {
+	client.Client
+}
+
+type sessionInputUnavailableError struct {
+	err error
+}
+
+func (e *sessionInputUnavailableError) Error() string {
+	return e.err.Error()
+}
+
+func (e *sessionInputUnavailableError) Unwrap() error {
+	return e.err
+}
+
+func (c sessionInputClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if err := c.Client.Get(ctx, key, obj, opts...); err != nil {
+		return &sessionInputUnavailableError{err: err}
+	}
+	return nil
+}
+
+func isSessionInputUnavailable(err error) bool {
+	var unavailableError *sessionInputUnavailableError
+	return errors.As(err, &unavailableError)
+}
+
+// +kubebuilder:rbac:groups=kelos.dev,resources=sessions,verbs=get;list;watch;patch;delete
 // +kubebuilder:rbac:groups=kelos.dev,resources=sessions/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=kelos.dev,resources=workspaces;agentconfigs,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;delete;patch
 // +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create
@@ -67,11 +127,11 @@ type SessionReconciler struct {
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
-// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;patch
+// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update
 
 // Reconcile creates and observes the StatefulSet that owns a Session conversation.
-func (r *SessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *SessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, reconcileErr error) {
 	logger := log.FromContext(ctx)
 
 	var session kelos.Session
@@ -101,41 +161,206 @@ func (r *SessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 		return r.reconcileSessionReset(ctx, &session, &statefulSet)
 	}
-	if apierrors.IsNotFound(err) {
+	if sessionSuspendedByUser(&session) && sessionsuspend.ResumeRequested(&session) {
+		if err := r.clearSessionIdleResumeRequest(ctx, &session); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+	if sessionsuspend.ResumeRequested(&session) {
+		protectionEndsAt := time.Time{}
+		if sessionsuspend.ResumeAcknowledged(&session) {
+			acknowledgedAt, observed := sessionsuspend.ResumeAcknowledgementTime(&session)
+			if !observed {
+				if err := r.setSessionIdleResumeTime(ctx, &session, sessionsuspend.ResumeAcknowledgementTimeAnnotation); err != nil {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{Requeue: true}, nil
+			}
+			idleBaseline := acknowledgedAt.Truncate(time.Second)
+			if session.Status.LastActivityTime == nil || idleBaseline.After(session.Status.LastActivityTime.Time) {
+				lastActivityTime := metav1.NewTime(idleBaseline)
+				session.Status.LastActivityTime = &lastActivityTime
+				if err := r.Status().Update(ctx, &session); err != nil {
+					return ctrl.Result{}, fmt.Errorf("starting idle period for resumed Session %q: %w", session.Name, err)
+				}
+				return ctrl.Result{Requeue: true}, nil
+			}
+			protectionEndsAt = acknowledgedAt.Add(idleResumeAcknowledgementGrace)
+			if !time.Now().Before(protectionEndsAt) {
+				if err := r.clearSessionIdleResumeRequest(ctx, &session); err != nil {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{Requeue: true}, nil
+			}
+		} else {
+			requestedAt, observed := sessionsuspend.ResumeRequestTime(&session)
+			if !observed {
+				if err := r.setSessionIdleResumeTime(ctx, &session, sessionsuspend.ResumeRequestTimeAnnotation); err != nil {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{Requeue: true}, nil
+			}
+			protectionEndsAt = requestedAt.Add(idleResumeRequestTimeout)
+			if !time.Now().Before(protectionEndsAt) {
+				if statefulSetMissing {
+					return r.expireSessionIdleResumeRequest(ctx, &session, nil)
+				}
+				return r.expireSessionIdleResumeRequest(ctx, &session, &statefulSet)
+			}
+		}
+		defer func() {
+			if reconcileErr != nil || result.Requeue {
+				return
+			}
+			remaining := time.Until(protectionEndsAt)
+			if remaining <= 0 {
+				result = ctrl.Result{Requeue: true}
+				return
+			}
+			if result.RequeueAfter == 0 || remaining < result.RequeueAfter {
+				result.RequeueAfter = remaining
+			}
+		}()
+	}
+	idleSuspended := sessionsuspend.IsIdlePolicySuspended(&session)
+	if idleSuspended && sessionsuspend.ResumeRequested(&session) {
+		if session.Annotations[sessionupdate.IdleDrainRequestAnnotation] != "" ||
+			session.Annotations[sessionupdate.IdleDrainReportAnnotation] != "" {
+			if err := r.clearSessionIdleDrainRequest(ctx, &session); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{Requeue: true}, nil
+		}
+		if err := r.updateSessionStatus(ctx, &session, nil, kelos.SessionPhasePending, "Session Pod is resuming after idle suspension", "IdleResumeRequested"); err != nil {
+			return ctrl.Result{}, err
+		}
+		logger.Info("Started resuming idle-suspended Session", "session", session.Name)
+		if r.Recorder != nil {
+			r.Recorder.Event(&session, corev1.EventTypeNormal, "SessionIdleResumeStarted", "Started resuming Session after a client requested a connection")
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+	if statefulSetMissing {
+		// Reap an already-idle Session whose workload is gone rather than
+		// recreating it just to delete it later. A missing StatefulSet does not
+		// prove its ordinal Pod is gone, so reapMissingWorkloadIdleSession drains a
+		// surviving Pod before deleting; the unknown-activity guard lives in
+		// sessionIdleExpired and the resource-version precondition in
+		// reapIdleSession handles any status change since the fetch above.
+		if session.DeletionTimestamp == nil {
+			if expired, _ := sessionIdleExpired(&session); expired {
+				if idleSuspended {
+					return r.reapIdleSession(ctx, &session)
+				}
+				return r.reapMissingWorkloadIdleSession(ctx, &session, workloadName)
+			}
+		}
+		// Drop any idle-drain request before re-creating a runtime that must accept
+		// turns while the controller re-evaluates its activity.
+		if err := r.clearSessionIdleDrainRequest(ctx, &session); err != nil {
+			return ctrl.Result{}, err
+		}
 		return r.createSessionStatefulSet(ctx, &session)
 	}
 	if statefulSet.DeletionTimestamp != nil {
+		if idleSuspended {
+			if session.DeletionTimestamp == nil {
+				if expired, _ := sessionIdleExpired(&session); expired {
+					return r.reapIdleSession(ctx, &session)
+				}
+			}
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
 		return ctrl.Result{}, r.updateSessionStatus(ctx, &session, nil, kelos.SessionPhasePending, "Session StatefulSet is terminating and will be recreated", "StatefulSetTerminating")
 	}
-	serviceAccountName := statefulSet.Spec.Template.Spec.ServiceAccountName
-	if serviceAccountName == "" {
-		serviceAccountName = sessionRuntimeAccessName(&session)
+	suspended := sessionSuspended(&session)
+	if suspended {
+		// Suspension must remain fail-safe even when referenced configuration
+		// is missing or invalid. Continue below so available desired state is
+		// still reconciled while the runtime remains stopped.
+		if err := r.setSessionReplicas(ctx, &statefulSet, 0); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
+	if idleSuspended && session.DeletionTimestamp == nil {
+		if expired, _ := sessionIdleExpired(&session); expired {
+			return r.reapIdleSession(ctx, &session)
+		}
+	}
+	runtimeStopped := statefulSet.Spec.Replicas != nil && *statefulSet.Spec.Replicas == 0
+	workspace, agentConfig, waitingMessage, err := r.resolveSessionInputs(
+		ctx,
+		&session,
+		sessionGitHubTokenMinimumValidity(&session, &statefulSet),
+	)
+	if err != nil {
+		if isInvalidSessionConfiguration(err) {
+			message := fmt.Sprintf("Failed to resolve Session configuration: %v", err)
+			_ = r.updateSessionStatus(ctx, &session, nil, kelos.SessionPhaseFailed, message, "ConfigurationInvalid")
+		}
+		return ctrl.Result{}, err
+	}
+	if waitingMessage != "" {
+		phase := kelos.SessionPhasePending
+		message := waitingMessage
+		reason := "WaitingForDependency"
+		if suspended {
+			phase = kelos.SessionPhaseSuspended
+			if idleSuspended {
+				message = "Session runtime is suspended after exceeding its idle policy"
+				reason = sessionsuspend.IdlePolicyReason
+			} else {
+				message = fmt.Sprintf("Session runtime is suspended: %s", waitingMessage)
+			}
+		}
+		if err := r.updateSessionStatus(ctx, &session, nil, phase, message, reason); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+	desiredStatefulSet, configMap, err := r.buildSessionStatefulSet(&session, workspace, agentConfig)
+	if err != nil {
+		message := fmt.Sprintf("Failed to build Session StatefulSet: %v", err)
+		_ = r.updateSessionStatus(ctx, &session, nil, kelos.SessionPhaseFailed, message, "StatefulSetBuildFailed")
+		return ctrl.Result{}, err
+	}
+	if err := r.ensureSessionPluginConfigMap(ctx, &session, configMap); err != nil {
+		return ctrl.Result{}, err
+	}
+	serviceAccountName := desiredStatefulSet.Spec.Template.Spec.ServiceAccountName
 	if err := r.ensureSessionRuntimeAccess(ctx, &session, serviceAccountName); err != nil {
 		message := fmt.Sprintf("Failed to prepare Session runtime access: %v", err)
 		return ctrl.Result{}, r.updateSessionStatus(ctx, &session, nil, kelos.SessionPhaseFailed, message, "RuntimeAccessFailed")
 	}
-	if err := r.ensureSessionWorkspaceClaimRetention(ctx, &session, &statefulSet); err != nil {
+	if err := r.ensureSessionService(ctx, &session); err != nil {
+		message := fmt.Sprintf("Failed to prepare Session governing Service: %v", err)
+		return ctrl.Result{}, r.updateSessionStatus(ctx, &session, nil, kelos.SessionPhaseFailed, message, "ServiceFailed")
+	}
+	if _, err := r.reconcileSessionStatefulSet(ctx, &session, &statefulSet, desiredStatefulSet); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := r.ensureSessionWorkspaceClaimOwnership(ctx, &session, &statefulSet); err != nil {
 		return ctrl.Result{}, err
 	}
-	if sessionSuspended(&session) {
+	if suspended {
 		if err := r.setSessionReplicas(ctx, &statefulSet, 0); err != nil {
 			return ctrl.Result{}, err
 		}
+		if idleSuspended {
+			deleteExpired, deleteRemaining := sessionIdleExpired(&session)
+			if deleteExpired && session.DeletionTimestamp == nil {
+				return r.reapIdleSession(ctx, &session)
+			}
+			err := r.updateSessionStatus(ctx, &session, nil, kelos.SessionPhaseSuspended, "Session runtime is suspended after exceeding its idle policy", sessionsuspend.IdlePolicyReason)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: deleteRemaining}, nil
+		}
 		return ctrl.Result{}, r.updateSessionStatus(ctx, &session, nil, kelos.SessionPhaseSuspended, "Session runtime is suspended", "RuntimeSuspended")
 	}
-	runtimeStopped := statefulSet.Spec.Replicas != nil && *statefulSet.Spec.Replicas == 0
-	if err := r.ensureSessionService(ctx, &session); err != nil {
-		message := fmt.Sprintf("Failed to prepare Session governing Service: %v", err)
-		return ctrl.Result{}, r.updateSessionStatus(ctx, &session, nil, kelos.SessionPhaseFailed, message, "ServiceFailed")
-	}
-	if err := r.ensureSessionRuntime(ctx, &session, &statefulSet, serviceAccountName); err != nil {
-		return ctrl.Result{}, err
-	}
-	result := ctrl.Result{}
+	result = ctrl.Result{}
 	if next, err := r.refreshSessionGitHubAppTokenIfNeeded(ctx, &session, &statefulSet.Spec.Template.Spec); err != nil {
 		logger.Error(err, "Unable to refresh Session GitHub App token", "session", session.Name)
 		if runtimeStopped {
@@ -185,19 +410,315 @@ func (r *SessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if waitingForUpdate && (result.RequeueAfter == 0 || updateResult.RequeueAfter < result.RequeueAfter) {
 		result = updateResult
 	}
+	// Evaluate idle actions only after the Active condition has been validated
+	// against the current Pod above, so a stale condition from a previous Pod
+	// cannot trigger suspension or deletion.
+	if session.DeletionTimestamp == nil && !sessionsuspend.ResumeRequested(&session) {
+		deleteExpired, deleteRemaining := sessionIdleExpired(&session)
+		if deleteExpired {
+			return r.reconcileIdleReap(ctx, &session, &pod)
+		}
+		suspendExpired, suspendRemaining := sessionIdleSuspendExpired(&session)
+		if suspendExpired {
+			return r.reconcileIdleSuspend(ctx, &session, &statefulSet, &pod)
+		}
+		// No idle action is due. Cancel any pending drain so the runtime resumes
+		// accepting turns after activity or a resume request.
+		if err := r.clearSessionIdleDrainRequest(ctx, &session); err != nil {
+			return ctrl.Result{}, err
+		}
+		for _, remaining := range []time.Duration{deleteRemaining, suspendRemaining} {
+			if remaining > 0 && (result.RequeueAfter == 0 || remaining < result.RequeueAfter) {
+				result.RequeueAfter = remaining
+			}
+		}
+	}
 	return result, nil
 }
 
-func (r *SessionReconciler) createSessionStatefulSet(ctx context.Context, session *kelos.Session) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-	workspace, agentConfig, waitingMessage, err := r.resolveSessionInputs(ctx, session)
+func (r *SessionReconciler) expireSessionIdleResumeRequest(
+	ctx context.Context,
+	session *kelos.Session,
+	statefulSet *appsv1.StatefulSet,
+) (ctrl.Result, error) {
+	var pod corev1.Pod
+	err := r.Get(ctx, client.ObjectKey{Namespace: session.Namespace, Name: sessionWorkloadName(session) + "-0"}, &pod)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return ctrl.Result{}, fmt.Errorf("getting Session Pod before expiring resume request for Session %q: %w", session.Name, err)
+	}
+	podIsOurs := err == nil && (statefulSet != nil || pod.Annotations[sessionNameAnnotation] == session.Name)
+	if podIsOurs {
+		if pod.DeletionTimestamp != nil {
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+		if pod.Status.Phase == corev1.PodRunning || pod.Status.Phase == corev1.PodUnknown {
+			drained, err := r.ensureSessionIdleDrained(
+				ctx,
+				session,
+				&pod,
+				"Waiting for Session Pod %s to drain after its idle resume request expired",
+			)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if !drained {
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			}
+		}
+	}
+
+	if err := r.updateSessionStatus(ctx, session, nil, kelos.SessionPhaseSuspended, "Session runtime is suspended after its idle resume request expired", sessionsuspend.IdlePolicyReason); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.clearSessionIdleResumeRequest(ctx, session); err != nil {
+		return ctrl.Result{}, err
+	}
+	if statefulSet != nil && statefulSet.DeletionTimestamp == nil {
+		if err := r.setSessionReplicas(ctx, statefulSet, 0); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	log.FromContext(ctx).Info("Expired idle Session resume request", "session", session.Name)
+	return ctrl.Result{Requeue: true}, nil
+}
+
+// reapMissingWorkloadIdleSession reaps an idle Session whose StatefulSet has
+// been deleted. A missing StatefulSet does not prove its ordinal Pod is gone:
+// background garbage collection can leave the Pod running temporarily, and
+// orphan propagation leaves it running indefinitely. If the Pod still exists and
+// is running it is drained through the normal handshake before deletion so a turn
+// it has accepted but not yet published to status is not lost.
+//
+// When no live runtime remains (the Pod is absent, terminal, or belongs to a
+// different Session), a Session with a persistent workspace is not deleted from
+// its possibly stale Active=False status: its journal may hold activity that a
+// Pod accepted or completed while its ordered status patches were still retrying,
+// which the resource-version precondition cannot detect. Such a Session has its
+// runtime recreated so it recovers the journal and republishes activity — leaving
+// the idle-period reset intact — before the normal reconcile decides whether it
+// is still idle. Only a Session without persistent workspace state, which has no
+// journal to recover, is reaped directly.
+func (r *SessionReconciler) reapMissingWorkloadIdleSession(ctx context.Context, session *kelos.Session, workloadName string) (ctrl.Result, error) {
+	podName := workloadName + "-0"
+	var pod corev1.Pod
+	err := r.Get(ctx, client.ObjectKey{Namespace: session.Namespace, Name: podName}, &pod)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return ctrl.Result{}, fmt.Errorf("getting Session Pod %q before idle reap: %w", podName, err)
+	}
+	podIsOurs := err == nil && pod.Annotations[sessionNameAnnotation] == session.Name
+	if podIsOurs {
+		if pod.DeletionTimestamp != nil {
+			// The Pod is terminating; wait for its absence to be confirmed rather than
+			// reaping while it may still be finishing an accepted turn.
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+		if pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
+			// A running Pod can still acknowledge the drain handshake.
+			return r.reconcileIdleReap(ctx, session, &pod)
+		}
+	}
+	// No live runtime remains. Preserve any unpublished activity in a persistent
+	// workspace journal by recovering the runtime rather than deleting the Session
+	// and its workspace against a possibly stale Active=False status.
+	if session.Spec.VolumeClaimTemplate != nil {
+		if podIsOurs {
+			// Clear the leftover terminal Pod so the recreated StatefulSet can start a
+			// fresh ordinal Pod that mounts the retained workspace and recovers.
+			if err := r.Delete(ctx, &pod, client.Preconditions{UID: &pod.UID}); err != nil && !apierrors.IsNotFound(err) {
+				return ctrl.Result{}, fmt.Errorf("deleting terminal Session Pod %q before recovery: %w", pod.Name, err)
+			}
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+		return r.createSessionStatefulSet(ctx, session)
+	}
+	return r.reapIdleSession(ctx, session)
+}
+
+// reconcileIdleReap drains the Session Pod before deleting an idle Session, so a
+// turn the runtime has locally accepted but not yet published to status is not
+// lost. It sets an idle-drain request and waits for the runtime to acknowledge
+// that no turn is in flight and it is no longer accepting turns, then deletes.
+func (r *SessionReconciler) reconcileIdleReap(ctx context.Context, session *kelos.Session, pod *corev1.Pod) (ctrl.Result, error) {
+	drained, err := r.ensureSessionIdleDrained(
+		ctx,
+		session,
+		pod,
+		"Waiting for Session Pod %s to drain before reclaiming the idle Session",
+	)
 	if err != nil {
-		message := fmt.Sprintf("Failed to resolve Session configuration: %v", err)
-		_ = r.updateSessionStatus(ctx, session, nil, kelos.SessionPhaseFailed, message, "ConfigurationInvalid")
+		return ctrl.Result{}, err
+	}
+	if !drained {
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+	return r.reapIdleSession(ctx, session)
+}
+
+func (r *SessionReconciler) reconcileIdleSuspend(
+	ctx context.Context,
+	session *kelos.Session,
+	statefulSet *appsv1.StatefulSet,
+	pod *corev1.Pod,
+) (ctrl.Result, error) {
+	drained, err := r.ensureSessionIdleDrained(
+		ctx,
+		session,
+		pod,
+		"Waiting for Session Pod %s to drain before suspending the idle Session",
+	)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !drained {
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+	if err := r.updateSessionStatus(
+		ctx,
+		session,
+		nil,
+		kelos.SessionPhaseSuspended,
+		"Session runtime is suspended after exceeding its idle policy",
+		sessionsuspend.IdlePolicyReason,
+	); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.setSessionReplicas(ctx, statefulSet, 0); err != nil {
+		return ctrl.Result{}, fmt.Errorf("suspending idle Session %q: %w", session.Name, err)
+	}
+	log.FromContext(ctx).Info("Suspended idle Session", "session", session.Name)
+	if r.Recorder != nil {
+		r.Recorder.Event(session, corev1.EventTypeNormal, "SessionIdleSuspended", "Suspended Session after exceeding its idle policy")
+	}
+	return ctrl.Result{Requeue: true}, nil
+}
+
+func (r *SessionReconciler) ensureSessionIdleDrained(
+	ctx context.Context,
+	session *kelos.Session,
+	pod *corev1.Pod,
+	eventMessage string,
+) (bool, error) {
+	if pod.UID == "" {
+		return false, nil
+	}
+	request, installed := installedSessionIdleDrainRequest(session, pod)
+	if !installed {
+		request = newSessionIdleDrainRequest(pod)
+		encoded, err := sessionupdate.Encode(request)
+		if err != nil {
+			return false, err
+		}
+		if err := r.setSessionIdleDrainRequest(ctx, session, encoded); err != nil {
+			return false, err
+		}
+		if r.Recorder != nil {
+			r.Recorder.Eventf(session, corev1.EventTypeNormal, "SessionIdleDraining", eventMessage, pod.Name)
+		}
+		return false, nil
+	}
+	drained, err := sessionIdleDrainComplete(session, request, pod)
+	if err != nil {
+		return false, err
+	}
+	return drained, nil
+}
+
+func (r *SessionReconciler) setSessionIdleDrainRequest(ctx context.Context, session *kelos.Session, value string) error {
+	original := session.DeepCopy()
+	if session.Annotations == nil {
+		session.Annotations = map[string]string{}
+	}
+	session.Annotations[sessionupdate.IdleDrainRequestAnnotation] = value
+	// Drop any report from a previous idle period so a stale Drained
+	// acknowledgement cannot satisfy this newly installed request before the
+	// runtime has observed it and stopped accepting turns.
+	delete(session.Annotations, sessionupdate.IdleDrainReportAnnotation)
+	if err := r.Patch(ctx, session, client.MergeFrom(original)); err != nil {
+		return fmt.Errorf("requesting idle drain for Session %q: %w", session.Name, err)
+	}
+	return nil
+}
+
+// clearSessionIdleDrainRequest removes a pending idle-drain request so the
+// runtime stops rejecting new turns. It is a no-op when no request is present.
+// The runtime clears its own report once it observes the request is gone.
+func (r *SessionReconciler) clearSessionIdleDrainRequest(ctx context.Context, session *kelos.Session) error {
+	if session.Annotations[sessionupdate.IdleDrainRequestAnnotation] == "" &&
+		session.Annotations[sessionupdate.IdleDrainReportAnnotation] == "" {
+		return nil
+	}
+	original := session.DeepCopy()
+	delete(session.Annotations, sessionupdate.IdleDrainRequestAnnotation)
+	delete(session.Annotations, sessionupdate.IdleDrainReportAnnotation)
+	if err := r.Patch(ctx, session, client.MergeFrom(original)); err != nil {
+		return fmt.Errorf("clearing idle drain request for Session %q: %w", session.Name, err)
+	}
+	return nil
+}
+
+// sessionIdleDrainComplete reports whether the runtime has acknowledged the
+// idle-drain request for the current Pod with a Drained phase.
+func sessionIdleDrainComplete(session *kelos.Session, request sessionupdate.Request, pod *corev1.Pod) (bool, error) {
+	value := session.Annotations[sessionupdate.IdleDrainReportAnnotation]
+	if value == "" {
+		return false, nil
+	}
+	report, err := sessionupdate.DecodeReport(value)
+	if err != nil {
+		return false, fmt.Errorf("reading idle drain report for Session %q: %w", session.Name, err)
+	}
+	return report.RequestID == request.ID && report.PodUID == pod.UID && report.Phase == sessionupdate.PhaseDrained, nil
+}
+
+// reapIdleSession deletes a Session that has exceeded its idle delete policy.
+// The delete is guarded by a UID and resource-version precondition so that a
+// turn starting between the status read and the delete (for example, the
+// runtime publishing Active=True) fails the precondition and forces a requeue
+// rather than deleting a Session whose activity is in flight.
+func (r *SessionReconciler) reapIdleSession(ctx context.Context, session *kelos.Session) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	preconditions := client.Preconditions{UID: &session.UID, ResourceVersion: &session.ResourceVersion}
+	if err := r.Delete(ctx, session, preconditions); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+		if apierrors.IsConflict(err) {
+			logger.Info("Session changed before idle deletion; requeuing to re-evaluate", "session", session.Name)
+			return ctrl.Result{Requeue: true}, nil
+		}
+		logger.Error(err, "Unable to delete idle Session", "session", session.Name)
+		return ctrl.Result{}, err
+	}
+	logger.Info("Deleted Session due to idle delete policy", "session", session.Name)
+	if r.Recorder != nil {
+		r.Recorder.Event(session, corev1.EventTypeNormal, "SessionIdleReaped", "Deleted Session after exceeding its idle delete policy")
+	}
+	return ctrl.Result{}, nil
+}
+
+func (r *SessionReconciler) createSessionStatefulSet(ctx context.Context, session *kelos.Session) (ctrl.Result, error) {
+	workspace, agentConfig, waitingMessage, err := r.resolveSessionInputs(
+		ctx,
+		session,
+		sessionGitHubTokenMinimumValidity(session, nil),
+	)
+	if err != nil {
+		if isInvalidSessionConfiguration(err) {
+			message := fmt.Sprintf("Failed to resolve Session configuration: %v", err)
+			_ = r.updateSessionStatus(ctx, session, nil, kelos.SessionPhaseFailed, message, "ConfigurationInvalid")
+		}
 		return ctrl.Result{}, err
 	}
 	if waitingMessage != "" {
-		if err := r.updateSessionStatus(ctx, session, nil, kelos.SessionPhasePending, waitingMessage, "WaitingForDependency"); err != nil {
+		phase := kelos.SessionPhasePending
+		message := waitingMessage
+		reason := "WaitingForDependency"
+		if sessionsuspend.IsIdlePolicySuspended(session) {
+			phase = kelos.SessionPhaseSuspended
+			message = "Session runtime is suspended after exceeding its idle policy"
+			reason = sessionsuspend.IdlePolicyReason
+		}
+		if err := r.updateSessionStatus(ctx, session, nil, phase, message, reason); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
@@ -208,52 +729,34 @@ func (r *SessionReconciler) createSessionStatefulSet(ctx context.Context, sessio
 		_ = r.updateSessionStatus(ctx, session, nil, kelos.SessionPhaseFailed, message, "StatefulSetBuildFailed")
 		return ctrl.Result{}, err
 	}
+	if err := r.ensureSessionPluginConfigMap(ctx, session, configMap); err != nil {
+		return ctrl.Result{}, err
+	}
 	if err := r.ensureSessionRuntimeAccess(ctx, session, statefulSet.Spec.Template.Spec.ServiceAccountName); err != nil {
 		message := fmt.Sprintf("Failed to prepare Session runtime access: %v", err)
 		_ = r.updateSessionStatus(ctx, session, nil, kelos.SessionPhaseFailed, message, "RuntimeAccessFailed")
 		return ctrl.Result{}, err
 	}
-	if configMap != nil {
-		if err := controllerutil.SetControllerReference(session, configMap, r.Scheme); err != nil {
-			return ctrl.Result{}, fmt.Errorf("setting Session owner on plugin ConfigMap: %w", err)
-		}
-		if err := r.Create(ctx, configMap); err != nil {
-			if !apierrors.IsAlreadyExists(err) {
-				return ctrl.Result{}, fmt.Errorf("creating Session plugin ConfigMap: %w", err)
-			}
-			var existing corev1.ConfigMap
-			if err := r.Get(ctx, client.ObjectKeyFromObject(configMap), &existing); err != nil {
-				return ctrl.Result{}, fmt.Errorf("getting existing Session plugin ConfigMap: %w", err)
-			}
-			if !metav1.IsControlledBy(&existing, session) {
-				return ctrl.Result{}, fmt.Errorf("plugin ConfigMap %q already exists and is not controlled by this Session", configMap.Name)
-			}
-		}
-	}
-
 	if err := r.ensureSessionService(ctx, session); err != nil {
 		message := fmt.Sprintf("Failed to prepare Session governing Service: %v", err)
 		_ = r.updateSessionStatus(ctx, session, nil, kelos.SessionPhaseFailed, message, "ServiceFailed")
 		return ctrl.Result{}, err
 	}
-	if err := controllerutil.SetControllerReference(session, statefulSet, r.Scheme); err != nil {
-		return ctrl.Result{}, fmt.Errorf("setting Session owner on StatefulSet: %w", err)
-	}
-	if err := r.Create(ctx, statefulSet); err != nil {
-		if apierrors.IsAlreadyExists(err) {
-			return ctrl.Result{Requeue: true}, nil
-		}
-		logger.Error(err, "Unable to create Session StatefulSet", "session", session.Name)
+	created, err := r.reconcileSessionStatefulSet(ctx, session, nil, statefulSet)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
-
-	if r.Recorder != nil {
-		r.Recorder.Eventf(session, corev1.EventTypeNormal, "StatefulSetCreated", "Created StatefulSet %s for Session", statefulSet.Name)
+	if !created {
+		return ctrl.Result{Requeue: true}, nil
 	}
 	phase := kelos.SessionPhasePending
 	message := "Session Pod is starting"
 	reason := "PodStarting"
-	if sessionSuspended(session) {
+	if sessionsuspend.IsIdlePolicySuspended(session) {
+		phase = kelos.SessionPhaseSuspended
+		message = "Session runtime is suspended after exceeding its idle policy"
+		reason = sessionsuspend.IdlePolicyReason
+	} else if sessionSuspended(session) {
 		phase = kelos.SessionPhaseSuspended
 		message = "Session runtime is suspended"
 		reason = "RuntimeSuspended"
@@ -265,68 +768,100 @@ func (r *SessionReconciler) createSessionStatefulSet(ctx context.Context, sessio
 	return ctrl.Result{Requeue: true}, nil
 }
 
-func (r *SessionReconciler) ensureSessionRuntime(ctx context.Context, session *kelos.Session, statefulSet *appsv1.StatefulSet, serviceAccountName string) error {
-	original := statefulSet.DeepCopy()
-	runtimeFound := false
-	for i := range statefulSet.Spec.Template.Spec.InitContainers {
-		container := &statefulSet.Spec.Template.Spec.InitContainers[i]
-		if container.Name != sessionRuntimeContainerName {
-			continue
+// reconcileSessionStatefulSet applies the complete controller-managed
+// StatefulSet state. Fields preserved by sessionStatefulSetUpdateCandidate are
+// reconciled through their dedicated lifecycle paths or fixed at creation.
+func (r *SessionReconciler) reconcileSessionStatefulSet(
+	ctx context.Context,
+	session *kelos.Session,
+	current *appsv1.StatefulSet,
+	desired *appsv1.StatefulSet,
+) (bool, error) {
+	if current == nil {
+		if err := controllerutil.SetControllerReference(session, desired, r.Scheme); err != nil {
+			return false, fmt.Errorf("setting Session owner on StatefulSet: %w", err)
 		}
-		runtimeFound = true
-		pullPolicyMatches := r.SessionRuntimeImagePullPolicy == "" || container.ImagePullPolicy == r.SessionRuntimeImagePullPolicy
-		if container.Image != r.SessionRuntimeImage || !pullPolicyMatches {
-			container.Image = r.SessionRuntimeImage
-			if r.SessionRuntimeImagePullPolicy != "" {
-				container.ImagePullPolicy = r.SessionRuntimeImagePullPolicy
+		if err := r.Create(ctx, desired); err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				return false, nil
 			}
+			return false, fmt.Errorf("creating Session StatefulSet %q: %w", desired.Name, err)
 		}
-		break
+		if r.Recorder != nil {
+			r.Recorder.Eventf(session, corev1.EventTypeNormal, "StatefulSetCreated", "Created StatefulSet %s for Session", desired.Name)
+		}
+		return true, nil
 	}
-	if !runtimeFound {
-		return fmt.Errorf("Session StatefulSet %q has no session runtime init container", statefulSet.Name)
+
+	candidate := sessionStatefulSetUpdateCandidate(current, desired)
+
+	// Let the API server apply StatefulSet and Pod defaults before comparing.
+	// This keeps the complete desired spec authoritative without repeatedly
+	// updating fields defaulted by Kubernetes or admission webhooks.
+	if err := r.Update(ctx, candidate, client.DryRunAll); err != nil {
+		return false, fmt.Errorf("dry-run updating Session StatefulSet %q: %w", current.Name, err)
 	}
-	if len(statefulSet.Spec.Template.Spec.Containers) == 0 {
-		return fmt.Errorf("Session StatefulSet %q has no agent container", statefulSet.Name)
+	if apiequality.Semantic.DeepEqual(current.Labels, candidate.Labels) &&
+		apiequality.Semantic.DeepEqual(current.Spec, candidate.Spec) {
+		return false, nil
 	}
-	mainContainer := &statefulSet.Spec.Template.Spec.Containers[0]
-	setSessionContainerEnv(mainContainer, "KELOS_SESSION_NAME", session.Name)
-	setSessionContainerEnv(mainContainer, "KELOS_SESSION_NAMESPACE", session.Namespace)
-	setSessionContainerEnvVar(mainContainer, corev1.EnvVar{
-		Name: "KELOS_SESSION_POD_UID",
-		ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
-			APIVersion: "v1",
-			FieldPath:  "metadata.uid",
-		}},
-	})
-	statefulSet.Spec.Template.Spec.ServiceAccountName = serviceAccountName
-	statefulSet.Spec.Template.Spec.AutomountServiceAccountToken = ptr.To(true)
-	statefulSet.Spec.UpdateStrategy = appsv1.StatefulSetUpdateStrategy{Type: appsv1.OnDeleteStatefulSetStrategyType}
-	if reflect.DeepEqual(original.Spec.Template.Spec, statefulSet.Spec.Template.Spec) &&
-		reflect.DeepEqual(original.Spec.UpdateStrategy, statefulSet.Spec.UpdateStrategy) {
-		return nil
+	if err := r.Update(ctx, candidate); err != nil {
+		return false, fmt.Errorf("updating Session StatefulSet %q: %w", current.Name, err)
 	}
-	if err := r.Patch(ctx, statefulSet, client.MergeFrom(original)); err != nil {
-		return fmt.Errorf("patching Session StatefulSet %q runtime configuration: %w", statefulSet.Name, err)
+	*current = *candidate
+	if r.Recorder != nil {
+		r.Recorder.Eventf(session, corev1.EventTypeNormal, "StatefulSetUpdated", "Updated StatefulSet %s for Session", current.Name)
 	}
-	return nil
+	return false, nil
 }
 
-func (r *SessionReconciler) ensureSessionWorkspaceClaimRetention(ctx context.Context, session *kelos.Session, statefulSet *appsv1.StatefulSet) error {
-	if session.Spec.VolumeClaimTemplate == nil {
+func sessionStatefulSetUpdateCandidate(current, desired *appsv1.StatefulSet) *appsv1.StatefulSet {
+	candidate := current.DeepCopy()
+	desiredCopy := desired.DeepCopy()
+	candidate.Labels = desiredCopy.Labels
+	candidate.Spec = desiredCopy.Spec
+
+	// Replica changes are gated separately by suspension and credential
+	// refresh. Retain fields that cannot be updated across every supported
+	// Kubernetes version.
+	liveSpec := current.Spec.DeepCopy()
+	candidate.Spec.Replicas = liveSpec.Replicas
+	candidate.Spec.ServiceName = liveSpec.ServiceName
+	candidate.Spec.PodManagementPolicy = liveSpec.PodManagementPolicy
+	candidate.Spec.Selector = liveSpec.Selector
+	candidate.Spec.VolumeClaimTemplates = liveSpec.VolumeClaimTemplates
+	candidate.Spec.RevisionHistoryLimit = liveSpec.RevisionHistoryLimit
+	return candidate
+}
+
+func (r *SessionReconciler) ensureSessionPluginConfigMap(ctx context.Context, session *kelos.Session, desired *corev1.ConfigMap) error {
+	if desired == nil {
 		return nil
 	}
-	desired := &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
-		WhenDeleted: appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
-		WhenScaled:  appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
+	if err := controllerutil.SetControllerReference(session, desired, r.Scheme); err != nil {
+		return fmt.Errorf("setting Session owner on plugin ConfigMap: %w", err)
 	}
-	if reflect.DeepEqual(statefulSet.Spec.PersistentVolumeClaimRetentionPolicy, desired) {
+	var existing corev1.ConfigMap
+	if err := r.Get(ctx, client.ObjectKeyFromObject(desired), &existing); apierrors.IsNotFound(err) {
+		if err := r.Create(ctx, desired); err != nil {
+			return fmt.Errorf("creating Session plugin ConfigMap: %w", err)
+		}
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("getting Session plugin ConfigMap: %w", err)
+	}
+	if !metav1.IsControlledBy(&existing, session) {
+		return fmt.Errorf("plugin ConfigMap %q already exists and is not controlled by this Session", desired.Name)
+	}
+	original := existing.DeepCopy()
+	existing.Data = desired.Data
+	existing.BinaryData = desired.BinaryData
+	if apiequality.Semantic.DeepEqual(original.Data, existing.Data) &&
+		apiequality.Semantic.DeepEqual(original.BinaryData, existing.BinaryData) {
 		return nil
 	}
-	original := statefulSet.DeepCopy()
-	statefulSet.Spec.PersistentVolumeClaimRetentionPolicy = desired
-	if err := r.Patch(ctx, statefulSet, client.MergeFrom(original)); err != nil {
-		return fmt.Errorf("patching Session StatefulSet %q workspace claim retention: %w", statefulSet.Name, err)
+	if err := r.Patch(ctx, &existing, client.MergeFrom(original)); err != nil {
+		return fmt.Errorf("patching Session plugin ConfigMap %q: %w", existing.Name, err)
 	}
 	return nil
 }
@@ -558,8 +1093,40 @@ func (r *SessionReconciler) setSessionReplicas(ctx context.Context, statefulSet 
 	return nil
 }
 
-func sessionSuspended(session *kelos.Session) bool {
+func (r *SessionReconciler) clearSessionIdleResumeRequest(ctx context.Context, session *kelos.Session) error {
+	if !sessionsuspend.ResumeRequested(session) {
+		return nil
+	}
+	original := session.DeepCopy()
+	delete(session.Annotations, sessionsuspend.ResumeRequestAnnotation)
+	delete(session.Annotations, sessionsuspend.ResumeRequestTimeAnnotation)
+	delete(session.Annotations, sessionsuspend.ResumeAcknowledgementAnnotation)
+	delete(session.Annotations, sessionsuspend.ResumeAcknowledgementTimeAnnotation)
+	if err := r.Patch(ctx, session, client.MergeFromWithOptions(original, client.MergeFromWithOptimisticLock{})); err != nil {
+		return fmt.Errorf("clearing idle resume request for Session %q: %w", session.Name, err)
+	}
+	return nil
+}
+
+func (r *SessionReconciler) setSessionIdleResumeTime(ctx context.Context, session *kelos.Session, annotation string) error {
+	original := session.DeepCopy()
+	if session.Annotations == nil {
+		session.Annotations = map[string]string{}
+	}
+	session.Annotations[annotation] = time.Now().UTC().Format(time.RFC3339Nano)
+	if err := r.Patch(ctx, session, client.MergeFromWithOptions(original, client.MergeFromWithOptimisticLock{})); err != nil {
+		return fmt.Errorf("recording idle resume progress for Session %q: %w", session.Name, err)
+	}
+	return nil
+}
+
+func sessionSuspendedByUser(session *kelos.Session) bool {
 	return ptr.Deref(session.Spec.Suspend, false)
+}
+
+func sessionSuspended(session *kelos.Session) bool {
+	return sessionSuspendedByUser(session) ||
+		(sessionsuspend.IsIdlePolicySuspended(session) && !sessionsuspend.ResumeRequested(session))
 }
 
 func sessionRuntimeReplicas(session *kelos.Session) int32 {
@@ -732,7 +1299,7 @@ func (r *SessionReconciler) ensureSessionWorkspaceClaimOwnership(ctx context.Con
 
 func (r *SessionReconciler) ensureSessionService(ctx context.Context, session *kelos.Session) error {
 	var existing corev1.Service
-	key := client.ObjectKey{Namespace: session.Namespace, Name: sessionWorkloadName(session)}
+	key := client.ObjectKey{Namespace: session.Namespace, Name: sessionServiceName(session)}
 	if err := r.Get(ctx, key, &existing); err == nil {
 		if !metav1.IsControlledBy(&existing, session) {
 			return fmt.Errorf("Service %q already exists and is not controlled by this Session", existing.Name)
@@ -752,7 +1319,26 @@ func (r *SessionReconciler) ensureSessionService(ctx context.Context, session *k
 	return nil
 }
 
-func (r *SessionReconciler) resolveSessionInputs(ctx context.Context, session *kelos.Session) (*kelos.WorkspaceSpec, *kelos.AgentConfigSpec, string, error) {
+func sessionGitHubTokenMinimumValidity(session *kelos.Session, statefulSet *appsv1.StatefulSet) time.Duration {
+	if statefulSet != nil &&
+		(statefulSet.Spec.Replicas == nil || *statefulSet.Spec.Replicas > 0) &&
+		session.Status.Phase == kelos.SessionPhaseReady &&
+		session.Status.PodName != "" &&
+		sessionPodSpecUsesSecret(&statefulSet.Spec.Template.Spec, sessionGitHubTokenSecretName(session.Name)) {
+		// A ready runtime can keep using its unexpired token while proactive
+		// refresh retries transient failures without taking it offline.
+		return 0
+	}
+	// Creation and any stopped-to-running transition require enough token
+	// lifetime to initialize the runtime safely.
+	return tokenRefreshMargin
+}
+
+func (r *SessionReconciler) resolveSessionInputs(
+	ctx context.Context,
+	session *kelos.Session,
+	minimumGitHubTokenValidity time.Duration,
+) (*kelos.WorkspaceSpec, *kelos.AgentConfigSpec, string, error) {
 	var workspace *kelos.WorkspaceSpec
 	if ref := session.Spec.Worker.WorkspaceRef; ref != nil {
 		var value kelos.Workspace
@@ -764,7 +1350,7 @@ func (r *SessionReconciler) resolveSessionInputs(ctx context.Context, session *k
 		}
 		workspace = value.Spec.DeepCopy()
 		if workspace.SecretRef != nil {
-			resolved, err := r.resolveSessionGitHubAppToken(ctx, session, workspace)
+			resolved, err := r.resolveSessionGitHubAppToken(ctx, session, workspace, minimumGitHubTokenValidity)
 			if err != nil {
 				return nil, nil, "", err
 			}
@@ -790,16 +1376,23 @@ func (r *SessionReconciler) resolveSessionInputs(ctx context.Context, session *k
 	}
 
 	agentConfig := MergeAgentConfigs(specs)
+	inputClient := sessionInputClient{Client: r.Client}
 	if len(agentConfig.Skills) > 0 {
-		taskReconciler := TaskReconciler{Client: r.Client}
+		taskReconciler := TaskReconciler{Client: inputClient}
 		if err := taskReconciler.validateSkillsAuthSecrets(ctx, session.Namespace, agentConfig.Skills); err != nil {
-			return nil, nil, "", err
+			if isSessionInputUnavailable(err) {
+				return nil, nil, "", err
+			}
+			return nil, nil, "", invalidSessionConfiguration(err)
 		}
 	}
 	if len(agentConfig.MCPServers) > 0 {
-		resolved, err := resolveMCPServerSecrets(ctx, r.Client, session.Namespace, agentConfig.MCPServers)
+		resolved, err := resolveMCPServerSecrets(ctx, inputClient, session.Namespace, agentConfig.MCPServers)
 		if err != nil {
-			return nil, nil, "", err
+			if isSessionInputUnavailable(err) {
+				return nil, nil, "", err
+			}
+			return nil, nil, "", invalidSessionConfiguration(err)
 		}
 		agentConfig.MCPServers = resolved
 	}
@@ -807,7 +1400,12 @@ func (r *SessionReconciler) resolveSessionInputs(ctx context.Context, session *k
 	return workspace, agentConfig, "", nil
 }
 
-func (r *SessionReconciler) resolveSessionGitHubAppToken(ctx context.Context, session *kelos.Session, workspace *kelos.WorkspaceSpec) (*kelos.WorkspaceSpec, error) {
+func (r *SessionReconciler) resolveSessionGitHubAppToken(
+	ctx context.Context,
+	session *kelos.Session,
+	workspace *kelos.WorkspaceSpec,
+	minimumValidity time.Duration,
+) (*kelos.WorkspaceSpec, error) {
 	var source corev1.Secret
 	if err := r.Get(ctx, client.ObjectKey{Namespace: session.Namespace, Name: workspace.SecretRef.Name}, &source); err != nil {
 		return nil, fmt.Errorf("fetching Workspace Secret %q: %w", workspace.SecretRef.Name, err)
@@ -816,26 +1414,48 @@ func (r *SessionReconciler) resolveSessionGitHubAppToken(ctx context.Context, se
 		return workspace, nil
 	}
 	if r.TokenClient == nil {
-		return nil, errors.New("GitHub App Secret detected but TokenClient is not configured")
+		return nil, invalidSessionConfiguration(errors.New("GitHub App Secret detected but TokenClient is not configured"))
+	}
+	tokenClient := sessionGitHubTokenClient(r.TokenClient, workspace.Repo)
+	fingerprint := sessionGitHubTokenMintFingerprint(&source, tokenClient.BaseURL)
+
+	tokenSecretName := sessionGitHubTokenSecretName(session.Name)
+	var existing corev1.Secret
+	if err := r.Get(ctx, client.ObjectKey{Namespace: session.Namespace, Name: tokenSecretName}, &existing); err == nil {
+		if !metav1.IsControlledBy(&existing, session) {
+			return nil, invalidSessionConfiguration(fmt.Errorf("GitHub token Secret %q already exists and is not controlled by this Session", tokenSecretName))
+		}
+		if sessionGitHubTokenSecretReusable(
+			&existing,
+			workspace.SecretRef.Name,
+			fingerprint,
+			minimumValidity,
+			time.Now(),
+		) {
+			resolved := workspace.DeepCopy()
+			resolved.SecretRef = &kelos.SecretReference{Name: tokenSecretName}
+			return resolved, nil
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return nil, fmt.Errorf("getting existing Session GitHub token Secret: %w", err)
 	}
 	credentials, err := githubapp.ParseCredentials(source.Data)
 	if err != nil {
-		return nil, fmt.Errorf("parsing GitHub App credentials: %w", err)
+		return nil, invalidSessionConfiguration(fmt.Errorf("parsing GitHub App credentials: %w", err))
 	}
-	tokenClient := sessionGitHubTokenClient(r.TokenClient, workspace.Repo)
 	response, err := tokenClient.GenerateInstallationToken(ctx, credentials)
 	if err != nil {
 		return nil, fmt.Errorf("generating GitHub App installation token: %w", err)
 	}
 
-	tokenSecretName := sessionGitHubTokenSecretName(session.Name)
 	tokenSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      tokenSecretName,
 			Namespace: session.Namespace,
 			Annotations: map[string]string{
-				githubAppSecretAnnotation: workspace.SecretRef.Name,
-				tokenExpiresAtAnnotation:  response.ExpiresAt.UTC().Format(time.RFC3339),
+				githubAppSecretAnnotation:         workspace.SecretRef.Name,
+				sessionTokenFingerprintAnnotation: fingerprint,
+				tokenExpiresAtAnnotation:          response.ExpiresAt.UTC().Format(time.RFC3339),
 			},
 		},
 		Data: map[string][]byte{GitHubTokenSecretKey: []byte(response.Token)},
@@ -852,7 +1472,7 @@ func (r *SessionReconciler) resolveSessionGitHubAppToken(ctx context.Context, se
 			return nil, fmt.Errorf("getting existing Session GitHub token Secret: %w", err)
 		}
 		if !metav1.IsControlledBy(&existing, session) {
-			return nil, fmt.Errorf("GitHub token Secret %q already exists and is not controlled by this Session", tokenSecretName)
+			return nil, invalidSessionConfiguration(fmt.Errorf("GitHub token Secret %q already exists and is not controlled by this Session", tokenSecretName))
 		}
 		existing.Data = tokenSecret.Data
 		existing.Annotations = tokenSecret.Annotations
@@ -865,14 +1485,30 @@ func (r *SessionReconciler) resolveSessionGitHubAppToken(ctx context.Context, se
 	return resolved, nil
 }
 
+func sessionGitHubTokenSecretReusable(
+	secret *corev1.Secret,
+	sourceName string,
+	fingerprint string,
+	minimumValidity time.Duration,
+	now time.Time,
+) bool {
+	if secret.Annotations[githubAppSecretAnnotation] != sourceName ||
+		secret.Annotations[sessionTokenFingerprintAnnotation] != fingerprint ||
+		len(secret.Data[GitHubTokenSecretKey]) == 0 {
+		return false
+	}
+	expiresAt, err := time.Parse(time.RFC3339, secret.Annotations[tokenExpiresAtAnnotation])
+	return err == nil && now.Before(expiresAt.Add(-minimumValidity))
+}
+
 func (r *SessionReconciler) refreshSessionGitHubAppTokenIfNeeded(ctx context.Context, session *kelos.Session, podSpec *corev1.PodSpec) (time.Duration, error) {
 	tokenSecretName := sessionGitHubTokenSecretName(session.Name)
+	if !sessionPodSpecUsesSecret(podSpec, tokenSecretName) {
+		return 0, nil
+	}
 	var tokenSecret corev1.Secret
 	if err := r.Get(ctx, client.ObjectKey{Namespace: session.Namespace, Name: tokenSecretName}, &tokenSecret); err != nil {
 		if apierrors.IsNotFound(err) {
-			if !sessionPodSpecUsesSecret(podSpec, tokenSecretName) {
-				return 0, nil
-			}
 			return r.recreateSessionGitHubAppToken(ctx, session)
 		}
 		return 0, err
@@ -945,7 +1581,7 @@ func (r *SessionReconciler) recreateSessionGitHubAppToken(ctx context.Context, s
 	if workspace.Spec.SecretRef == nil {
 		return 0, nil
 	}
-	resolved, err := r.resolveSessionGitHubAppToken(ctx, session, workspace.Spec.DeepCopy())
+	resolved, err := r.resolveSessionGitHubAppToken(ctx, session, workspace.Spec.DeepCopy(), tokenRefreshMargin)
 	if err != nil {
 		return 0, err
 	}
@@ -963,6 +1599,16 @@ func sessionGitHubTokenClient(base *githubapp.TokenClient, repo string) *githuba
 		}
 	}
 	return client
+}
+
+func sessionGitHubTokenMintFingerprint(source *corev1.Secret, apiBaseURL string) string {
+	value := source.Namespace + "\x00" +
+		source.Name + "\x00" +
+		string(source.UID) + "\x00" +
+		source.ResourceVersion + "\x00" +
+		apiBaseURL
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
 }
 
 func sessionGitHubTokenSecretName(sessionName string) string {
@@ -1097,7 +1743,11 @@ func (r *SessionReconciler) buildSessionStatefulSet(session *kelos.Session, work
 			WhenScaled:  appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
 		}
 	}
-	if err := prepareSessionWorkspaceInit(podSpec.InitContainers); err != nil {
+	credentialHelper := ""
+	if workspace != nil && workspace.SecretRef != nil {
+		credentialHelper = gitCredentialHelper()
+	}
+	if err := prepareSessionWorkspaceInit(podSpec.InitContainers, credentialHelper); err != nil {
 		return nil, nil, err
 	}
 
@@ -1140,6 +1790,14 @@ func (r *SessionReconciler) buildSessionStatefulSet(session *kelos.Session, work
 	labels["kelos.dev/session"] = sessionLabelValue(session)
 
 	selector := sessionSelectorLabels(session)
+	templateAnnotations := map[string]string{sessionNameAnnotation: session.Name}
+	if configMap != nil {
+		checksum, err := sessionPluginConfigMapChecksum(configMap)
+		if err != nil {
+			return nil, nil, err
+		}
+		templateAnnotations[sessionPluginChecksumAnnotation] = checksum
+	}
 	statefulSet := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      sessionWorkloadName(session),
@@ -1148,14 +1806,16 @@ func (r *SessionReconciler) buildSessionStatefulSet(session *kelos.Session, work
 		},
 		Spec: appsv1.StatefulSetSpec{
 			Replicas:                             ptr.To(sessionRuntimeReplicas(session)),
-			ServiceName:                          sessionWorkloadName(session),
+			ServiceName:                          sessionServiceName(session),
+			PodManagementPolicy:                  appsv1.OrderedReadyPodManagement,
 			Selector:                             &metav1.LabelSelector{MatchLabels: selector},
 			UpdateStrategy:                       appsv1.StatefulSetUpdateStrategy{Type: appsv1.OnDeleteStatefulSetStrategyType},
+			RevisionHistoryLimit:                 ptr.To(int32(10)),
 			PersistentVolumeClaimRetentionPolicy: retentionPolicy,
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels:      labels,
-					Annotations: map[string]string{sessionNameAnnotation: session.Name},
+					Annotations: templateAnnotations,
 				},
 				Spec: podSpec,
 			},
@@ -1165,11 +1825,26 @@ func (r *SessionReconciler) buildSessionStatefulSet(session *kelos.Session, work
 	return statefulSet, configMap, nil
 }
 
+func sessionPluginConfigMapChecksum(configMap *corev1.ConfigMap) (string, error) {
+	content, err := json.Marshal(struct {
+		Data       map[string]string `json:"data,omitempty"`
+		BinaryData map[string][]byte `json:"binaryData,omitempty"`
+	}{
+		Data:       configMap.Data,
+		BinaryData: configMap.BinaryData,
+	})
+	if err != nil {
+		return "", fmt.Errorf("marshalling Session plugin ConfigMap content: %w", err)
+	}
+	sum := sha256.Sum256(content)
+	return hex.EncodeToString(sum[:]), nil
+}
+
 func buildSessionService(session *kelos.Session) *corev1.Service {
 	labels := sessionSelectorLabels(session)
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      sessionWorkloadName(session),
+			Name:      sessionServiceName(session),
 			Namespace: session.Namespace,
 			Labels:    labels,
 		},
@@ -1181,7 +1856,11 @@ func buildSessionService(session *kelos.Session) *corev1.Service {
 }
 
 func sessionWorkloadName(session *kelos.Session) string {
-	return truncateResourceName("session-" + session.Name)
+	return truncateResourceNameTo(session.Name, sessionWorkloadNameMaxLength)
+}
+
+func sessionServiceName(session *kelos.Session) string {
+	return truncateResourceName("s-" + session.Name)
 }
 
 func sessionSelectorLabels(session *kelos.Session) map[string]string {
@@ -1191,12 +1870,19 @@ func sessionSelectorLabels(session *kelos.Session) map[string]string {
 	}
 }
 
-func prepareSessionWorkspaceInit(containers []corev1.Container) error {
+func prepareSessionWorkspaceInit(containers []corev1.Container, credentialHelper string) error {
 	for i := range containers {
 		container := &containers[i]
 		switch container.Name {
 		case "git-clone":
-			prefix := `if [ -f ` + sessionInitializedPath + ` ]; then exit 0; fi
+			initializedAction := "exit 0"
+			if credentialHelper != "" {
+				initializedAction = fmt.Sprintf(
+					`{ %s; } || exit $?; exit 0`,
+					workspaceGitCredentialConfigScript(credentialHelper),
+				)
+			}
+			prefix := `if [ -f ` + sessionInitializedPath + ` ]; then ` + initializedAction + `; fi
 rm -rf -- /workspace/repo
 `
 			if len(container.Command) == 0 {
@@ -1251,6 +1937,86 @@ func sessionLabelValue(session *kelos.Session) string {
 	}
 	sum := sha256.Sum256([]byte(session.Name))
 	return hex.EncodeToString(sum[:16])
+}
+
+// sessionIdleExpired reports whether an idle Session has exceeded its idle
+// delete policy. It returns (true, 0) if the Session should be deleted now, or
+// (false, duration) if it should be requeued after the given duration. A Session
+// is only considered idle when its Active condition is explicitly False; an
+// active or unknown turn never counts as idle.
+func sessionIdleExpired(session *kelos.Session) (bool, time.Duration) {
+	if session.Spec.IdlePolicy == nil {
+		return false, 0
+	}
+	return sessionIdlePolicyExpired(session, session.Spec.IdlePolicy.DeleteAfterSeconds)
+}
+
+// sessionIdleSuspendExpired reports whether an idle Session has exceeded its
+// idle suspend policy.
+func sessionIdleSuspendExpired(session *kelos.Session) (bool, time.Duration) {
+	if session.Spec.IdlePolicy == nil || sessionSuspendedByUser(session) {
+		return false, 0
+	}
+	return sessionIdlePolicyExpired(session, session.Spec.IdlePolicy.SuspendAfterSeconds)
+}
+
+func sessionIdlePolicyExpired(session *kelos.Session, afterSeconds *int32) (bool, time.Duration) {
+	if afterSeconds == nil || sessionsuspend.ResumeRequested(session) {
+		return false, 0
+	}
+	active := apiMeta.FindStatusCondition(session.Status.Conditions, kelos.SessionConditionActive)
+	if (active == nil || active.Status != metav1.ConditionFalse) && !sessionsuspend.IsIdlePolicySuspended(session) {
+		return false, 0
+	}
+	ttl := time.Duration(*afterSeconds) * time.Second
+	expireAt := sessionIdleSince(session).Add(ttl)
+	remaining := time.Until(expireAt)
+	if remaining <= 0 {
+		return true, 0
+	}
+	return false, remaining
+}
+
+// sessionIdleSince returns the time from which Session idleness is measured: the
+// later of the Session creation time and the last reported activity time. The
+// Active condition transition is deliberately not consulted: status.lastActivityTime
+// is preserved across Pod replacement, so measuring from it keeps the idle clock
+// running when a replacement Pod re-reports Active=False without any user activity.
+func sessionIdleSince(session *kelos.Session) time.Time {
+	since := session.CreationTimestamp.Time
+	if last := session.Status.LastActivityTime; last != nil && last.After(since) {
+		since = last.Time
+	}
+	return since
+}
+
+// installedSessionIdleDrainRequest returns the idle-drain request already
+// installed on the Session for the given Pod, if any. The request is reused
+// across reconciles so its ID stays stable while the drain is in progress; it is
+// only treated as installed when it decodes and targets the current Pod.
+func installedSessionIdleDrainRequest(session *kelos.Session, pod *corev1.Pod) (sessionupdate.Request, bool) {
+	value := session.Annotations[sessionupdate.IdleDrainRequestAnnotation]
+	if value == "" {
+		return sessionupdate.Request{}, false
+	}
+	request, err := sessionupdate.Decode(value)
+	if err != nil || request.PodUID != pod.UID {
+		return sessionupdate.Request{}, false
+	}
+	return request, true
+}
+
+// newSessionIdleDrainRequest mints a drain request whose ID is unique to this
+// drain episode. A random ID (rather than one derived from the idle-start time)
+// guarantees that a Drained report left over from a previous idle period cannot
+// be mistaken for an acknowledgement of the current request: metav1.Time is
+// persisted with whole-second precision, so an ID salted with the idle-start
+// time collides for distinct idle periods that begin within the same second
+// (most acutely with deleteAfterSeconds: 0). The ID is persisted on the Session
+// and reused via installedSessionIdleDrainRequest, so it remains stable across
+// reconciles of the same episode.
+func newSessionIdleDrainRequest(pod *corev1.Pod) sessionupdate.Request {
+	return sessionupdate.Request{ID: uuid.NewString(), PodUID: pod.UID}
 }
 
 func sessionPhaseForPod(pod *corev1.Pod) (kelos.SessionPhase, string, string) {
@@ -1319,6 +2085,7 @@ func (r *SessionReconciler) updateSessionStatus(ctx context.Context, session *ke
 		session.Status.PodUID = ""
 	}
 	if pod == nil || phase != kelos.SessionPhaseReady || session.Status.PodUID != pod.UID {
+		session.Status.Model = ""
 		session.Status.Branch = ""
 		session.Status.PullRequest = nil
 		if session.Status.LastActivityTime == nil {
@@ -1374,12 +2141,94 @@ func (r *SessionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.Secret{}).
+		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&corev1.ServiceAccount{}).
 		Owns(&rbacv1.Role{}).
 		Owns(&rbacv1.RoleBinding{}).
+		Watches(&kelos.Workspace{}, handler.EnqueueRequestsFromMapFunc(r.findSessionsForWorkspace)).
+		Watches(&kelos.AgentConfig{}, handler.EnqueueRequestsFromMapFunc(r.findSessionsForAgentConfig)).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.findSessionsForSecret)).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.findSessionForPod)).
 		Complete(r)
+}
+
+func (r *SessionReconciler) findSessionsForWorkspace(ctx context.Context, obj client.Object) []reconcile.Request {
+	workspace, ok := obj.(*kelos.Workspace)
+	if !ok {
+		return nil
+	}
+	var sessions kelos.SessionList
+	if err := r.List(ctx, &sessions, client.InNamespace(workspace.Namespace)); err != nil {
+		return nil
+	}
+	var requests []reconcile.Request
+	for i := range sessions.Items {
+		session := &sessions.Items[i]
+		if session.Spec.Worker.WorkspaceRef != nil && session.Spec.Worker.WorkspaceRef.Name == workspace.Name {
+			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(session)})
+		}
+	}
+	return requests
+}
+
+func (r *SessionReconciler) findSessionsForAgentConfig(ctx context.Context, obj client.Object) []reconcile.Request {
+	agentConfig, ok := obj.(*kelos.AgentConfig)
+	if !ok {
+		return nil
+	}
+	var sessions kelos.SessionList
+	if err := r.List(ctx, &sessions, client.InNamespace(agentConfig.Namespace)); err != nil {
+		return nil
+	}
+	var requests []reconcile.Request
+	for i := range sessions.Items {
+		session := &sessions.Items[i]
+		for _, ref := range session.Spec.Worker.AgentConfigRefs {
+			if ref.Name == agentConfig.Name {
+				requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(session)})
+				break
+			}
+		}
+	}
+	return requests
+}
+
+func (r *SessionReconciler) findSessionsForSecret(ctx context.Context, obj client.Object) []reconcile.Request {
+	secret, ok := obj.(*corev1.Secret)
+	if !ok {
+		return nil
+	}
+	var workspaces kelos.WorkspaceList
+	if err := r.List(ctx, &workspaces, client.InNamespace(secret.Namespace)); err != nil {
+		return nil
+	}
+	workspaceNames := make(map[string]struct{})
+	for i := range workspaces.Items {
+		workspace := &workspaces.Items[i]
+		if workspace.Spec.SecretRef != nil && workspace.Spec.SecretRef.Name == secret.Name {
+			workspaceNames[workspace.Name] = struct{}{}
+		}
+	}
+	if len(workspaceNames) == 0 {
+		return nil
+	}
+
+	var sessions kelos.SessionList
+	if err := r.List(ctx, &sessions, client.InNamespace(secret.Namespace)); err != nil {
+		return nil
+	}
+	var requests []reconcile.Request
+	for i := range sessions.Items {
+		session := &sessions.Items[i]
+		if session.Spec.Worker.WorkspaceRef == nil {
+			continue
+		}
+		if _, ok := workspaceNames[session.Spec.Worker.WorkspaceRef.Name]; ok {
+			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(session)})
+		}
+	}
+	return requests
 }
 
 func (r *SessionReconciler) findSessionForPod(_ context.Context, obj client.Object) []reconcile.Request {

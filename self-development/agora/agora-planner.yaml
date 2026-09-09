@@ -27,6 +27,8 @@ metadata:
 spec:
   when:
     githubWebhook:
+      gatewayRef:
+        name: agora
       repository: kelos-dev/agora
       excludeAuthors:
         - kelos-bot[bot]
@@ -40,13 +42,14 @@ spec:
           state: open
           author: gjkim42
       reporting:
-        enabled: true
+        comments:
+          mode: Sticky
   maxConcurrency: 2
   taskTemplate:
     worker:
       workspaceRef:
         name: agora-agent
-      model: gpt-5.6-sol
+      model: gpt-6-astra
       effort: xhigh
       type: codex
       credentials:
@@ -58,9 +61,9 @@ spec:
           requests:
             cpu: "250m"
             memory: "512Mi"
-            ephemeral-storage: "2Gi"
+            ephemeral-storage: "10Gi"
           limits:
-            ephemeral-storage: "2Gi"
+            ephemeral-storage: "10Gi"
       agentConfigRefs:
         - name: base-agent
         - name: agora-planner-agent

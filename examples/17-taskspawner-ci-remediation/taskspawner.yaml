@@ -7,6 +7,7 @@ spec:
   # Watch for failing CI checks and dispatch an agent to diagnose and fix them.
   when:
     githubWebhook:
+      # TODO: Replace with your repository in "owner/repo" format.
       repository: myorg/myrepo
       events:
         - "check_run"
@@ -108,6 +109,7 @@ metadata:
   name: my-repo-workspace
   namespace: default
 spec:
+  # TODO: Replace with the clone URL for the repository above.
   repo: "https://github.com/myorg/myrepo.git"
   # secretRef:
   #   name: github-token

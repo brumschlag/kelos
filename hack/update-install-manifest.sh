@@ -293,6 +293,7 @@ generate_chart_crd_templates() {
   write_chart_crd_template "${source}" "CustomResourceDefinition" "taskspawners.kelos.dev" "${CHART_CRD_DIR}/taskspawner-crd.yaml"
   write_chart_crd_template "${source}" "CustomResourceDefinition" "workerpools.kelos.dev" "${CHART_CRD_DIR}/workerpool-crd.yaml"
   write_chart_crd_template "${source}" "CustomResourceDefinition" "workspaces.kelos.dev" "${CHART_CRD_DIR}/workspace-crd.yaml"
+  write_chart_crd_template "${source}" "CustomResourceDefinition" "webhookgateways.kelos.dev" "${CHART_CRD_DIR}/webhookgateway-crd.yaml"
 }
 
 inject_validating_webhook_ca_annotation() {

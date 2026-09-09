@@ -10,7 +10,46 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 
 	kelos "github.com/kelos-dev/kelos/api/v1alpha2"
+	"github.com/kelos-dev/kelos/internal/spawnercredentials"
 )
+
+func TestAssignSpawnerCredentialUsesConfiguredCredential(t *testing.T) {
+	spawner := &kelos.TaskSpawner{
+		Spec: kelos.TaskSpawnerSpec{
+			Credentials: []kelos.SpawnerCredential{
+				{Name: "account-b", Type: kelos.CredentialTypeOAuth, SecretRef: kelos.SecretReference{Name: "secret-b"}},
+				{Name: "account-a", Type: kelos.CredentialTypeAPIKey, SecretRef: kelos.SecretReference{Name: "secret-a"}},
+			},
+		},
+	}
+	tb, err := NewTaskBuilder(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := &kelos.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "next", Namespace: "default"},
+		Spec: kelos.TaskSpec{
+			Worker: &kelos.WorkerSpec{Type: "claude-code"},
+			Prompt: "test",
+		},
+	}
+
+	if err := tb.AssignSpawnerCredential(spawner, task); err != nil {
+		t.Fatalf("AssignSpawnerCredential() error = %v", err)
+	}
+	if task.Spec.Worker.Credentials == nil {
+		t.Fatal("worker credentials were not assigned")
+	}
+	selected := task.Labels[spawnercredentials.AssignmentLabel]
+	wantSecrets := map[string]string{"account-a": "secret-a", "account-b": "secret-b"}
+	wantSecret, ok := wantSecrets[selected]
+	if !ok {
+		t.Fatalf("credential label = %q, want a configured credential", selected)
+	}
+	if got := task.Spec.Worker.Credentials.SecretRef.Name; got != wantSecret {
+		t.Errorf("SecretRef.Name = %q, want %q for %s", got, wantSecret, selected)
+	}
+}
 
 func TestBuildTask_ForwardsEffort(t *testing.T) {
 	tb := &TaskBuilder{}

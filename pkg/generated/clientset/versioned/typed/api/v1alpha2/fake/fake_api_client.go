@@ -56,6 +56,10 @@ func (c *FakeApiV1alpha2) TaskSpawners(namespace string) v1alpha2.TaskSpawnerInt
 	return newFakeTaskSpawners(c, namespace)
 }
 
+func (c *FakeApiV1alpha2) WebhookGateways(namespace string) v1alpha2.WebhookGatewayInterface {
+	return newFakeWebhookGateways(c, namespace)
+}
+
 func (c *FakeApiV1alpha2) WorkerPools(namespace string) v1alpha2.WorkerPoolInterface {
 	return newFakeWorkerPools(c, namespace)
 }

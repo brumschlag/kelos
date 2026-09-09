@@ -20,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kelos "github.com/kelos-dev/kelos/api/v1alpha2"
+	"github.com/kelos-dev/kelos/internal/githubapp"
 )
 
 const (
@@ -35,6 +36,18 @@ type Fetcher struct {
 	HTTPClient *http.Client
 	Namespace  string
 	Logger     logr.Logger
+
+	// GitHubTokenHTTPClient, when set, is used by the GitHub App token client
+	// to mint installation tokens. When nil, a client with a default timeout
+	// is used. Primarily a test seam.
+	GitHubTokenHTTPClient *http.Client
+
+	// tokenMu guards tokenProviders.
+	tokenMu sync.Mutex
+	// tokenProviders caches GitHub App token providers keyed by secret name
+	// and API base URL, so tokens are reused across work items fetched by
+	// the same Fetcher instead of minted per request.
+	tokenProviders map[string]*githubapp.TokenProvider
 }
 
 // FetchAll fetches all context sources in parallel and returns a map
@@ -194,7 +207,98 @@ func (f *Fetcher) resolveHeaders(ctx context.Context, httpSrc *kelos.HTTPContext
 		headers[hfs.Header] = string(val)
 	}
 
+	// Mint a GitHub App installation token unless an explicit Authorization
+	// header was already supplied via Headers or HeadersFrom.
+	if httpSrc.GitHubAppAuth != nil && !hasHeader(headers, "Authorization") {
+		token, err := f.gitHubAppToken(ctx, httpSrc.GitHubAppAuth)
+		if err != nil {
+			return nil, err
+		}
+		headers["Authorization"] = "token " + token
+	}
+
 	return headers, nil
+}
+
+// hasHeader reports whether headers already contains name (case-insensitive).
+func hasHeader(headers map[string]string, name string) bool {
+	for k := range headers {
+		if strings.EqualFold(k, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// gitHubAppToken reads the GitHub App credentials Secret referenced by auth and
+// returns a valid installation token, reusing a cached provider when possible.
+func (f *Fetcher) gitHubAppToken(ctx context.Context, auth *kelos.GitHubAppContextAuth) (string, error) {
+	secretName := auth.SecretRef.Name
+	if err := validateGitHubAPIBaseURL(auth.APIBaseURL); err != nil {
+		return "", err
+	}
+
+	secret := &corev1.Secret{}
+	key := client.ObjectKey{Name: secretName, Namespace: f.Namespace}
+	if err := f.Client.Get(ctx, key, secret); err != nil {
+		return "", fmt.Errorf("reading GitHub App Secret %q: %w", secretName, err)
+	}
+	creds, err := githubapp.ParseCredentials(secret.Data)
+	if err != nil {
+		return "", fmt.Errorf("parsing GitHub App credentials from Secret %q: %w", secretName, err)
+	}
+
+	provider := f.tokenProvider(auth, creds)
+	token, err := provider.Token(ctx)
+	if err != nil {
+		return "", fmt.Errorf("minting GitHub App installation token from Secret %q: %w", secretName, err)
+	}
+	return token, nil
+}
+
+// validateGitHubAPIBaseURL enforces that a custom GitHub API base URL is HTTPS,
+// so the signed GitHub App JWT is never sent over plaintext. An empty value is
+// valid and selects the default https://api.github.com endpoint.
+func validateGitHubAPIBaseURL(baseURL string) error {
+	if baseURL == "" {
+		return nil
+	}
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return fmt.Errorf("invalid GitHub App apiBaseURL %q: %w", baseURL, err)
+	}
+	if parsed.Scheme != "https" || parsed.Host == "" {
+		return fmt.Errorf("GitHub App apiBaseURL must be an https URL, got %q", baseURL)
+	}
+	return nil
+}
+
+// tokenProvider returns a cached GitHub App token provider for the given auth
+// config, creating one if necessary. Providers are keyed by secret name and
+// API base URL.
+func (f *Fetcher) tokenProvider(auth *kelos.GitHubAppContextAuth, creds *githubapp.Credentials) *githubapp.TokenProvider {
+	cacheKey := auth.SecretRef.Name + "|" + auth.APIBaseURL
+
+	f.tokenMu.Lock()
+	defer f.tokenMu.Unlock()
+
+	if f.tokenProviders == nil {
+		f.tokenProviders = make(map[string]*githubapp.TokenProvider)
+	}
+	if tp, ok := f.tokenProviders[cacheKey]; ok {
+		return tp
+	}
+
+	tc := githubapp.NewTokenClient()
+	if auth.APIBaseURL != "" {
+		tc.BaseURL = auth.APIBaseURL
+	}
+	if f.GitHubTokenHTTPClient != nil {
+		tc.Client = f.GitHubTokenHTTPClient
+	}
+	tp := githubapp.NewTokenProvider(tc, creds)
+	f.tokenProviders[cacheKey] = tp
+	return tp
 }
 
 func validateURLScheme(rawURL string, allowInsecure bool) error {

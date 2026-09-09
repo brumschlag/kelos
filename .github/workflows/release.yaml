@@ -27,6 +27,7 @@ jobs:
   build-images:
     needs: determine-version
     strategy:
+      max-parallel: 1
       matrix:
         arch: [amd64, arm64]
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
@@ -52,6 +53,7 @@ jobs:
 
       - name: Build and push image
         env:
+          GHCR_RETRY_COUNT: 3
           VERSION: ${{ needs.determine-version.outputs.version }}
         run: make image IMAGE_PLATFORMS=linux/${{ matrix.arch }} PUSH=true VERSION="$VERSION-${{ matrix.arch }}" KELOS_VERSION="$VERSION"
 
@@ -76,12 +78,14 @@ jobs:
 
       - name: Create and push multi-arch manifests
         env:
+          GHCR_RETRY_COUNT: 3
           VERSION: ${{ needs.determine-version.outputs.version }}
         run: make manifest IMAGE_PLATFORMS=linux/amd64,linux/arm64 VERSION="$VERSION"
 
       - name: Create and push latest manifests
         if: startsWith(github.ref, 'refs/tags/v')
         env:
+          GHCR_RETRY_COUNT: 3
           VERSION: ${{ needs.determine-version.outputs.version }}
         run: make manifest IMAGE_PLATFORMS=linux/amd64,linux/arm64 VERSION=latest SOURCE_VERSION="$VERSION"
 

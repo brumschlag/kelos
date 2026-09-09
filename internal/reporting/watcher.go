@@ -21,6 +21,10 @@ const (
 	// enabled for this Task.
 	AnnotationGitHubReporting = "kelos.dev/github-reporting"
 
+	// AnnotationGitHubCommentMode records whether the reporter creates a
+	// comment per Task or reuses a sticky comment across Tasks.
+	AnnotationGitHubCommentMode = "kelos.dev/github-comment-mode"
+
 	// AnnotationSourceKind records whether the source item is an issue or pull-request.
 	AnnotationSourceKind = "kelos.dev/source-kind"
 
@@ -35,6 +39,13 @@ const (
 	// AnnotationSourceRepo records the GitHub repository name the event came
 	// from. Pairs with AnnotationSourceOwner.
 	AnnotationSourceRepo = "kelos.dev/source-repo"
+
+	// AnnotationWebhookGateway records the name of the WebhookGateway (in the
+	// Task's namespace) that created the Task. The reporting reconciler uses it
+	// to resolve per-gateway GitHub credentials and API base URL, so reporting
+	// targets the correct GitHub instance (github.com or a GitHub Enterprise
+	// server). Source-specific webhook handlers leave it unset.
+	AnnotationWebhookGateway = "kelos.dev/webhook-gateway"
 
 	// AnnotationGitHubCommentID stores the GitHub comment ID for the status
 	// comment created by the reporter so subsequent updates edit the same
@@ -268,6 +279,20 @@ func (tr *TaskReporter) reportViaComment(ctx context.Context, task *kelos.Task) 
 		body = FormatFailedComment(task.Name)
 	}
 
+	if annotations[AnnotationGitHubCommentMode] == string(kelos.GitHubCommentModeSticky) {
+		marker, err := stickyCommentMarker(task)
+		if err != nil {
+			return err
+		}
+		body += "\n\n" + marker
+		if commentID == 0 {
+			commentID, err = tr.Reporter.FindCommentByMarker(ctx, number, marker)
+			if err != nil {
+				return fmt.Errorf("finding sticky GitHub comment for task %s: %w", task.Name, err)
+			}
+		}
+	}
+
 	if commentID == 0 {
 		log.Info("Creating GitHub status comment", "task", task.Name, "number", number, "phase", desiredPhase)
 		newID, err := tr.Reporter.CreateComment(ctx, number, body)
@@ -288,6 +313,14 @@ func (tr *TaskReporter) reportViaComment(ctx context.Context, task *kelos.Task) 
 	tr.Cache.store(task.UID, commentID, desiredPhase)
 
 	return tr.persistReportingState(ctx, task, commentID, desiredPhase)
+}
+
+func stickyCommentMarker(task *kelos.Task) (string, error) {
+	spawnerName := task.Labels["kelos.dev/taskspawner"]
+	if spawnerName == "" {
+		return "", fmt.Errorf("sticky GitHub comment for task %s requires kelos.dev/taskspawner label", task.Name)
+	}
+	return fmt.Sprintf("<!-- kelos.dev/github-status-comment:%s/%s -->", task.Namespace, spawnerName), nil
 }
 
 // reportViaCheckRun creates or updates a GitHub Check Run.
@@ -479,6 +512,18 @@ type SlackTaskReporter struct {
 	lastProgress map[types.UID]string         // taskUID -> last posted text
 	progressTS   map[types.UID]string         // taskUID -> message ts of the progress reply
 	activity     map[types.UID]*activityState // taskUID -> current activity indicator
+
+	// progressBlocked marks tasks whose thread permanently rejects replies.
+	// Like the maps above it is process-local, so a restart or a leader
+	// failover clears it: the phase annotation is durable and sends the task
+	// back through updateProgress, which posts once more against the rejected
+	// thread before re-blocking. The residue is one rejected API call and one
+	// log line per task per restart, and nothing reaches the thread because
+	// the post fails. Making it durable needs a new annotation plus a write on
+	// the reporting path, which is worth doing alongside progressTS — that one
+	// resets the same way and does post a duplicate progress message on
+	// restart — rather than for this flag alone.
+	progressBlocked map[types.UID]bool
 }
 
 // ReportTaskStatus checks a Task's current phase against its last reported
@@ -554,6 +599,17 @@ func (tr *SlackTaskReporter) ReportTaskStatus(ctx context.Context, task *kelos.T
 		log.Info("Posting Slack thread reply", "task", task.Name, "channel", channel, "phase", desiredPhase, "part", i+1, "total", len(msgs))
 		replyTS, err := tr.Reporter.PostThreadReply(ctx, channel, threadTS, msg)
 		if err != nil {
+			if isPermanentSlackError(err) {
+				// Slack will never accept a reply to this message (for
+				// example, the thread is closed). Mark the phase as reported
+				// anyway so the reporting cycle stops retrying every tick, and
+				// suppress progress posting too — the next cycle would otherwise
+				// read pod logs and post once more against the same thread
+				// before updateProgress sets the flag itself.
+				log.Error(err, "Not retrying Slack reply: permanent API error", "task", task.Name, "channel", channel, "threadTS", threadTS, "phase", desiredPhase, "part", i+1, "total", len(msgs))
+				tr.blockProgress(task.UID)
+				break
+			}
 			return fmt.Errorf("posting Slack reply for task %s (part %d/%d): %w", task.Name, i+1, len(msgs), err)
 		}
 		if i == 0 {
@@ -635,6 +691,12 @@ func (tr *SlackTaskReporter) updateProgress(ctx context.Context, task *kelos.Tas
 		return nil
 	}
 
+	// Slack permanently rejected a progress reply for this task, so skip the
+	// pod log read and the doomed post entirely.
+	if tr.isProgressBlocked(task.UID) {
+		return nil
+	}
+
 	log := ctrl.Log.WithName("slack-reporter")
 
 	podName := task.Status.PodName
@@ -682,7 +744,13 @@ func (tr *SlackTaskReporter) updateProgress(ctx context.Context, task *kelos.Tas
 	log.V(1).Info("Posting Slack progress update", "task", task.Name)
 	replyTS, err := tr.Reporter.PostThreadReply(ctx, channel, threadTS, msg)
 	if err != nil {
-		log.Error(err, "Failed to post Slack progress update", "task", task.Name)
+		log.Error(err, "Failed to post Slack progress update", "task", task.Name, "channel", channel, "threadTS", threadTS)
+		if isPermanentSlackError(err) {
+			// The thread will never accept a reply, for any snapshot — not
+			// just this one. Suppress progress posting for the task so later
+			// snapshots do not each retry against the rejected thread.
+			tr.blockProgress(task.UID)
+		}
 		return nil
 	}
 
@@ -720,6 +788,24 @@ func (tr *SlackTaskReporter) setLastProgress(uid types.UID, text string) {
 	tr.lastProgress[uid] = text
 }
 
+// blockProgress records that Slack permanently rejects progress replies for
+// a task, so no further snapshot is attempted for it.
+func (tr *SlackTaskReporter) blockProgress(uid types.UID) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	if tr.progressBlocked == nil {
+		tr.progressBlocked = make(map[types.UID]bool)
+	}
+	tr.progressBlocked[uid] = true
+}
+
+// isProgressBlocked reports whether progress posting is suppressed for a task.
+func (tr *SlackTaskReporter) isProgressBlocked(uid types.UID) bool {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	return tr.progressBlocked[uid]
+}
+
 // getProgressTS returns the Slack message timestamp of the progress reply
 // for a task, or empty string if no progress has been posted yet.
 func (tr *SlackTaskReporter) getProgressTS(uid types.UID) string {
@@ -747,6 +833,7 @@ func (tr *SlackTaskReporter) clearProgressCache(uid types.UID) {
 	defer tr.mu.Unlock()
 	delete(tr.lastProgress, uid)
 	delete(tr.progressTS, uid)
+	delete(tr.progressBlocked, uid)
 }
 
 // SweepProgressCache removes entries for tasks that are no longer active.
@@ -770,6 +857,11 @@ func (tr *SlackTaskReporter) SweepProgressCache(activeUIDs map[types.UID]bool) {
 	for uid := range tr.activity {
 		if !activeUIDs[uid] {
 			delete(tr.activity, uid)
+		}
+	}
+	for uid := range tr.progressBlocked {
+		if !activeUIDs[uid] {
+			delete(tr.progressBlocked, uid)
 		}
 	}
 }

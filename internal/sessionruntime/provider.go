@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 )
 
 var (
@@ -28,10 +29,43 @@ type ProviderConfig struct {
 
 // Provider runs turns against one provider-owned conversation.
 type Provider interface {
-	RunTurn(ctx context.Context, prompt string, sink EventSink) error
+	RunTurn(ctx context.Context, input TurnInput, sink EventSink) error
 	Interrupt(ctx context.Context) error
 	Done() <-chan struct{}
 	Close() error
+}
+
+type shellCommandRecord struct {
+	command  string
+	exitCode int
+	duration time.Duration
+	output   string
+}
+
+type shellCommandContextProvider interface {
+	recordShellCommand(context.Context, shellCommandRecord) error
+}
+
+var (
+	_ shellCommandContextProvider = (*ClaudeProvider)(nil)
+	_ shellCommandContextProvider = (*CodexProvider)(nil)
+	_ shellCommandContextProvider = (*OpenCodeProvider)(nil)
+)
+
+func formatShellCommandRecord(record shellCommandRecord) string {
+	return fmt.Sprintf(
+		"<user_shell_command>\n<command>\n%s\n</command>\n<result>\nExit code: %d\nDuration: %.4f seconds\nOutput:\n%s\n</result>\n</user_shell_command>",
+		record.command,
+		record.exitCode,
+		record.duration.Seconds(),
+		record.output,
+	)
+}
+
+type goalProvider interface {
+	RunGoal(context.Context, goalCommand, EventSink) error
+	ControlGoal(context.Context, goalCommand, EventSink) error
+	ActiveGoal() *Goal
 }
 
 // NewProvider creates the configured conversation adapter.

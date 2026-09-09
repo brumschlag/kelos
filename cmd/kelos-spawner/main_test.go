@@ -31,6 +31,7 @@ import (
 	kelos "github.com/kelos-dev/kelos/api/v1alpha2"
 	"github.com/kelos-dev/kelos/internal/reporting"
 	"github.com/kelos-dev/kelos/internal/source"
+	"github.com/kelos-dev/kelos/internal/spawnercredentials"
 )
 
 var noToken = func(context.Context) (string, error) { return "", nil }
@@ -198,6 +199,53 @@ func TestRunCycleWithSource_LowercasesTaskNameIdempotently(t *testing.T) {
 	}
 	if task.Spec.Prompt != "MPF-17" {
 		t.Errorf("Task prompt = %q, want raw ID %q", task.Spec.Prompt, "MPF-17")
+	}
+}
+
+func TestRunCycleWithSource_AssignsTaskSpawnerCredentials(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.TaskTemplate.Type = ""
+	ts.Spec.TaskTemplate.Credentials = nil
+	ts.Spec.TaskTemplate.WorkspaceRef = nil
+	ts.Spec.TaskTemplate.Worker = &kelos.WorkerSpec{
+		Type:         "claude-code",
+		WorkspaceRef: &kelos.WorkspaceReference{Name: "test-ws"},
+	}
+	ts.Spec.Credentials = []kelos.SpawnerCredential{
+		{Name: "account-b", Type: kelos.CredentialTypeOAuth, SecretRef: kelos.SecretReference{Name: "secret-b"}},
+		{Name: "account-a", Type: kelos.CredentialTypeOAuth, SecretRef: kelos.SecretReference{Name: "secret-a"}},
+	}
+	cl, key := setupTest(t, ts)
+	src := &fakeSource{items: []source.WorkItem{
+		{ID: "issue-1", Title: "First issue"},
+		{ID: "issue-2", Title: "Second issue"},
+	}}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("runCycleWithSource() error = %v", err)
+	}
+
+	var taskList kelos.TaskList
+	if err := cl.List(context.Background(), &taskList, client.InNamespace("default")); err != nil {
+		t.Fatalf("Listing tasks: %v", err)
+	}
+	if len(taskList.Items) != 2 {
+		t.Fatalf("Task count = %d, want 2", len(taskList.Items))
+	}
+	wantSecrets := map[string]string{"account-a": "secret-a", "account-b": "secret-b"}
+	for i := range taskList.Items {
+		task := &taskList.Items[i]
+		if task.Spec.Worker == nil || task.Spec.Worker.Credentials == nil || task.Spec.Worker.Credentials.SecretRef == nil {
+			t.Fatalf("Task %s has no assigned worker credentials", task.Name)
+		}
+		credentialName := task.Labels[spawnercredentials.AssignmentLabel]
+		wantSecret, ok := wantSecrets[credentialName]
+		if !ok {
+			t.Fatalf("Task %s credential label = %q, want a configured credential", task.Name, credentialName)
+		}
+		if got := task.Spec.Worker.Credentials.SecretRef.Name; got != wantSecret {
+			t.Errorf("Task %s Secret = %q, want %q for %s", task.Name, got, wantSecret, credentialName)
+		}
 	}
 }
 
@@ -2156,6 +2204,21 @@ func TestReportingEnabled_IssuesEnabled(t *testing.T) {
 	}
 }
 
+func TestReportingEnabled_CommentsConfigured(t *testing.T) {
+	ts := &kelos.TaskSpawner{
+		Spec: kelos.TaskSpawnerSpec{
+			When: kelos.When{
+				GitHubIssues: &kelos.GitHubIssues{
+					Reporting: &kelos.GitHubReporting{Comments: &kelos.GitHubCommentsReporting{}},
+				},
+			},
+		},
+	}
+	if !reportingEnabled(ts) {
+		t.Error("Expected reporting to be enabled when comments are configured")
+	}
+}
+
 func TestReportingEnabled_IssuesDisabled(t *testing.T) {
 	ts := &kelos.TaskSpawner{
 		Spec: kelos.TaskSpawnerSpec{
@@ -2329,6 +2392,28 @@ func TestSourceAnnotations_ChecksAndCommentsEnabled(t *testing.T) {
 	}
 	if annotations[reporting.AnnotationGitHubChecks] != "enabled" {
 		t.Errorf("Expected github-checks 'enabled', got %q", annotations[reporting.AnnotationGitHubChecks])
+	}
+}
+
+func TestSourceAnnotations_StickyComments(t *testing.T) {
+	ts := &kelos.TaskSpawner{
+		Spec: kelos.TaskSpawnerSpec{
+			When: kelos.When{
+				GitHubPullRequests: &kelos.GitHubPullRequests{
+					Reporting: &kelos.GitHubReporting{
+						Comments: &kelos.GitHubCommentsReporting{Mode: kelos.GitHubCommentModeSticky},
+					},
+				},
+			},
+		},
+	}
+
+	annotations := sourceAnnotations(ts, source.WorkItem{Number: 5, Kind: "PR"})
+	if annotations[reporting.AnnotationGitHubReporting] != "enabled" {
+		t.Errorf("Expected github-reporting 'enabled', got %q", annotations[reporting.AnnotationGitHubReporting])
+	}
+	if annotations[reporting.AnnotationGitHubCommentMode] != string(kelos.GitHubCommentModeSticky) {
+		t.Errorf("Expected Sticky comment mode, got %q", annotations[reporting.AnnotationGitHubCommentMode])
 	}
 }
 

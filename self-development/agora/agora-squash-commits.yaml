@@ -5,6 +5,8 @@ metadata:
 spec:
   when:
     githubWebhook:
+      gatewayRef:
+        name: agora
       repository: kelos-dev/agora
       events:
         - issue_comment
@@ -22,7 +24,8 @@ spec:
           state: open
           author: gjkim42
       reporting:
-        enabled: true
+        comments:
+          mode: Sticky
         checks: {}
   maxConcurrency: 1
   taskTemplate:
@@ -41,9 +44,9 @@ spec:
           requests:
             cpu: "250m"
             memory: "512Mi"
-            ephemeral-storage: "4Gi"
+            ephemeral-storage: "20Gi"
           limits:
-            ephemeral-storage: "4Gi"
+            ephemeral-storage: "20Gi"
         env:
           - name: GIT_AUTHOR_NAME
             value: "Gunju Kim"

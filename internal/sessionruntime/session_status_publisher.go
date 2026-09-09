@@ -15,7 +15,9 @@ import (
 
 // ObservedSessionStatus contains the status fields owned by one Session runtime.
 type ObservedSessionStatus struct {
-	Active bool
+	Active          bool
+	WaitingForInput bool
+	Model           string
 	// WorkspaceStatus is omitted when the runtime cannot inspect the workspace.
 	WorkspaceStatus *WorkspaceStatus
 }
@@ -46,6 +48,10 @@ func NewSessionStatusPublisher(client clientv1alpha2.SessionInterface, sessionNa
 			conditionStatus = metav1.ConditionTrue
 			reason = "TurnActive"
 			message = "Session runtime has an unfinished turn"
+			if status.WaitingForInput {
+				reason = "WaitingForInput"
+				message = "Session runtime is waiting for user input"
+			}
 		}
 		previousActive := apiMeta.FindStatusCondition(session.Status.Conditions, kelos.SessionConditionActive)
 		conditions := append([]metav1.Condition(nil), session.Status.Conditions...)
@@ -57,14 +63,21 @@ func NewSessionStatusPublisher(client clientv1alpha2.SessionInterface, sessionNa
 			Message:            message,
 		})
 		activityTime := session.Status.LastActivityTime
-		if activityTime == nil || (previousActive != nil && previousActive.Status != metav1.ConditionUnknown && previousActive.Status != conditionStatus) {
+		activeStateChanged := previousActive != nil && previousActive.Status != metav1.ConditionUnknown &&
+			(previousActive.Status != conditionStatus || previousActive.Reason != reason)
+		if activityTime == nil || activeStateChanged {
 			if previousActive != nil && previousActive.Status != metav1.ConditionUnknown && previousActive.Status == conditionStatus {
-				activityTime = &previousActive.LastTransitionTime
+				if previousActive.Reason == reason {
+					activityTime = &previousActive.LastTransitionTime
+				} else {
+					now := metav1.Now()
+					activityTime = &now
+				}
 			} else if active := apiMeta.FindStatusCondition(conditions, kelos.SessionConditionActive); active != nil {
 				activityTime = &active.LastTransitionTime
 			}
 		}
-		operations := make([]sessionStatusPatchOperation, 0, 7)
+		operations := make([]sessionStatusPatchOperation, 0, 8)
 		if session.ResourceVersion != "" {
 			operations = append(operations, sessionStatusPatchOperation{Op: "test", Path: "/metadata/resourceVersion", Value: session.ResourceVersion})
 		}
@@ -73,6 +86,7 @@ func NewSessionStatusPublisher(client clientv1alpha2.SessionInterface, sessionNa
 			sessionStatusPatchOperation{Op: "test", Path: "/status/phase", Value: kelos.SessionPhaseReady},
 			sessionStatusPatchOperation{Op: "add", Path: "/status/conditions", Value: conditions},
 			sessionStatusPatchOperation{Op: "add", Path: "/status/lastActivityTime", Value: activityTime},
+			sessionStatusPatchOperation{Op: "add", Path: "/status/model", Value: status.Model},
 		)
 		if status.WorkspaceStatus != nil {
 			operations = append(operations,

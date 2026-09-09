@@ -30,6 +30,8 @@ GENERATED_FILES=(
   internal/manifests/charts/kelos/templates/validating-webhook.yaml
   api/v1alpha1/zz_generated.deepcopy.go
   api/v1alpha2/zz_generated.deepcopy.go
+  internal/consoleserver/web/app.js
+  internal/consoleserver/web/login.js
 )
 
 TMPDIR="$(mktemp -d)"
@@ -56,6 +58,8 @@ fi
 ${CONTROLLER_GEN} object:headerFile="hack/boilerplate.go.txt" paths="./..."
 hack/update-install-manifest.sh "${CONTROLLER_GEN}"
 hack/update-codegen.sh
+npm --prefix internal/consoleserver/frontend ci --ignore-scripts
+npm --prefix internal/consoleserver/frontend run build
 
 # ---------------------------------------------------------------------------
 # 3. Compare generated files and restore originals.

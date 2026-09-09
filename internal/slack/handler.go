@@ -390,6 +390,9 @@ func (h *SlackHandler) createTask(ctx context.Context, spawner *kelos.TaskSpawne
 	if err != nil {
 		return fmt.Errorf("Building task: %w", err)
 	}
+	if err := h.taskBuilder.AssignSpawnerCredential(spawner, task); err != nil {
+		return fmt.Errorf("Assigning TaskSpawner credential: %w", err)
+	}
 
 	// Add Slack reporting annotations
 	if task.Annotations == nil {

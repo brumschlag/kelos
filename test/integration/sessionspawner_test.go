@@ -80,6 +80,32 @@ var _ = Describe("SessionSpawner", func() {
 		err := k8sClient.Create(ctx, spawner)
 		Expect(apierrors.IsInvalid(err)).To(BeTrue(), "error: %v", err)
 	})
+
+	It("accepts credentials without session template credentials", func() {
+		spawner := validSessionSpawner(namespace, "multi-account")
+		spawner.Spec.SessionTemplate.Worker.Credentials = nil
+		spawner.Spec.Credentials = []kelos.SpawnerCredential{
+			{Name: "account-a", Type: kelos.CredentialTypeOAuth, SecretRef: kelos.SecretReference{Name: "secret-a"}},
+			{Name: "account-b", Type: kelos.CredentialTypeOAuth, SecretRef: kelos.SecretReference{Name: "secret-b"}},
+		}
+		Expect(k8sClient.Create(ctx, spawner)).To(Succeed())
+	})
+
+	It("rejects credentials combined with session template credentials", func() {
+		spawner := validSessionSpawner(namespace, "credential-conflict")
+		spawner.Spec.Credentials = []kelos.SpawnerCredential{
+			{Name: "account-a", Type: kelos.CredentialTypeOAuth, SecretRef: kelos.SecretReference{Name: "secret-a"}},
+		}
+		err := k8sClient.Create(ctx, spawner)
+		Expect(apierrors.IsInvalid(err)).To(BeTrue(), "error: %v", err)
+	})
+
+	It("requires session template or spawner credentials", func() {
+		spawner := validSessionSpawner(namespace, "missing-credentials")
+		spawner.Spec.SessionTemplate.Worker.Credentials = nil
+		err := k8sClient.Create(ctx, spawner)
+		Expect(apierrors.IsInvalid(err)).To(BeTrue(), "error: %v", err)
+	})
 })
 
 func validSessionSpawner(namespace, name string) *kelos.SessionSpawner {

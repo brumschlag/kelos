@@ -245,6 +245,57 @@ func TestWorkerPoolReconciler_CommitRefWorkspaceUsesCheckoutScript(t *testing.T)
 	}
 }
 
+func TestWorkerPoolReconciler_ExistingWorkspaceRefreshesCredentialConfig(t *testing.T) {
+	refs := map[string]string{
+		"branch": "main",
+		"commit": "0123456789abcdef0123456789abcdef01234567",
+	}
+	for name, ref := range refs {
+		t.Run(name, func(t *testing.T) {
+			scheme := newWorkerPoolTestScheme()
+			pool := newTestWorkerPool("my-pool", "default", 1)
+			ws := newTestWorkspace("default")
+			ws.Spec.Ref = ref
+			ws.Spec.SecretRef = &kelos.SecretReference{Name: "github-token"}
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "github-token", Namespace: "default"},
+				StringData: map[string]string{GitHubTokenSecretKey: "test-token"},
+			}
+
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithStatusSubresource(&kelos.WorkerPool{}).
+				WithObjects(pool, ws, secret).
+				Build()
+			r := newWorkerPoolReconciler(cl, scheme)
+
+			_, err := r.Reconcile(context.Background(), ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "my-pool", Namespace: "default"},
+			})
+			require.NoError(t, err)
+
+			var sts appsv1.StatefulSet
+			require.NoError(t, cl.Get(context.Background(), types.NamespacedName{
+				Name: "wp-my-pool", Namespace: "default",
+			}, &sts))
+			var script string
+			for _, container := range sts.Spec.Template.Spec.InitContainers {
+				if container.Name == "git-clone" {
+					require.Len(t, container.Command, 3)
+					script = container.Command[2]
+					break
+				}
+			}
+			require.NotEmpty(t, script)
+			config := strings.Index(script, "config credential.username "+gitCredentialDefaultUsername)
+			exit := strings.Index(script, "exit 0")
+			if config == -1 || exit <= config {
+				t.Fatalf("git-clone command does not refresh credentials before exiting: %q", script)
+			}
+		})
+	}
+}
+
 func TestWorkerPoolReconciler_RejectsExtraContainerInitContainerNameCollision(t *testing.T) {
 	scheme := newWorkerPoolTestScheme()
 	pool := newTestWorkerPool("my-pool", "default", 1)

@@ -2,10 +2,13 @@
 
 <!--
 Add one of the following kinds:
+/kind api
 /kind bug
 /kind cleanup
 /kind docs
 /kind feature
+
+Use /kind api for PRs that modify files under api/.
 -->
 
 #### What this PR does / why we need it:

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 const (
 	workspaceStatusFileName       = "workspace-status.json"
 	workspaceStatusCommandTimeout = 5 * time.Second
+	pullRequestStatusQuery        = `query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){url state isDraft commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename ... on CheckRun{status conclusion} ... on StatusContext{state}}}}}}} mergeQueueEntry{headCommit{statusCheckRollup{contexts(first:100){nodes{__typename ... on CheckRun{status conclusion} ... on StatusContext{state}}}}}}}}}`
 )
 
 // WorkspaceStatus describes the git work currently visible in a Session.
@@ -29,6 +31,45 @@ type WorkspaceStatus struct {
 
 type workspaceStatusRunner interface {
 	run(context.Context, string, string, ...string) (string, error)
+}
+
+type githubStatusCheck struct {
+	TypeName   string `json:"__typename"`
+	Status     string `json:"status"`
+	Conclusion string `json:"conclusion"`
+	State      string `json:"state"`
+}
+
+type githubRepository struct {
+	Host  string
+	Owner string
+	Name  string
+}
+
+type githubStatusCheckRollup struct {
+	Contexts struct {
+		Nodes []githubStatusCheck `json:"nodes"`
+	} `json:"contexts"`
+}
+
+type githubCommit struct {
+	StatusCheckRollup *githubStatusCheckRollup `json:"statusCheckRollup"`
+}
+
+type githubMergeQueueEntry struct {
+	HeadCommit *githubCommit `json:"headCommit"`
+}
+
+type githubPullRequestStatus struct {
+	URL     string `json:"url"`
+	State   string `json:"state"`
+	IsDraft bool   `json:"isDraft"`
+	Commits struct {
+		Nodes []struct {
+			Commit githubCommit `json:"commit"`
+		} `json:"nodes"`
+	} `json:"commits"`
+	MergeQueueEntry *githubMergeQueueEntry `json:"mergeQueueEntry"`
 }
 
 type realWorkspaceStatusRunner struct{}
@@ -43,6 +84,10 @@ func (realWorkspaceStatusRunner) run(ctx context.Context, workingDir, name strin
 }
 
 func captureWorkspaceStatus(ctx context.Context, runner workspaceStatusRunner, workingDir string, environment []string) (WorkspaceStatus, error) {
+	return captureWorkspaceStatusFromPrevious(ctx, runner, workingDir, environment, WorkspaceStatus{}, true)
+}
+
+func captureWorkspaceStatusFromPrevious(ctx context.Context, runner workspaceStatusRunner, workingDir string, environment []string, previous WorkspaceStatus, forceDiscovery bool) (WorkspaceStatus, error) {
 	isGitWorkspace, err := isGitWorkspace(ctx, runner, workingDir)
 	if err != nil {
 		return WorkspaceStatus{}, err
@@ -58,17 +103,28 @@ func captureWorkspaceStatus(ctx context.Context, runner workspaceStatusRunner, w
 		return WorkspaceStatus{}, nil
 	}
 	status := WorkspaceStatus{Branch: branch}
-	headOwner, err := repositoryOwner(ctx, runner, workingDir, branch)
+	if !forceDiscovery && branch == previous.Branch && reusablePullRequest(previous.PullRequest) {
+		status.PullRequest, err = readPullRequestStatus(ctx, runner, workingDir, previous.PullRequest.URL)
+		if err != nil {
+			status.PullRequest = previous.PullRequest
+		}
+		return status, err
+	}
+	repository, headOwner, err := repositoryContext(ctx, runner, workingDir, branch)
 	if err != nil {
 		return status, err
 	}
-	status.PullRequest, err = findPullRequest(ctx, runner, workingDir, branch, "", headOwner)
+	status.PullRequest, err = findPullRequest(ctx, runner, workingDir, branch, repository, headOwner)
 	if err != nil {
 		return status, err
 	}
 	if status.PullRequest == nil {
 		if upstreamRepo := environmentValue(environment, "KELOS_UPSTREAM_REPO"); upstreamRepo != "" {
-			status.PullRequest, err = findPullRequest(ctx, runner, workingDir, branch, upstreamRepo, headOwner)
+			repository, parseErr := repositoryFromName(repository.Host, upstreamRepo)
+			if parseErr != nil {
+				return status, parseErr
+			}
+			status.PullRequest, err = findPullRequest(ctx, runner, workingDir, branch, repository, headOwner)
 			if err != nil {
 				return status, err
 			}
@@ -77,47 +133,67 @@ func captureWorkspaceStatus(ctx context.Context, runner workspaceStatusRunner, w
 	return status, nil
 }
 
-func repositoryOwner(ctx context.Context, runner workspaceStatusRunner, workingDir, branch string) (string, error) {
+func reusablePullRequest(pullRequest *kelos.SessionPullRequest) bool {
+	return pullRequest != nil && pullRequest.State != kelos.SessionPullRequestStateMerged && pullRequest.State != kelos.SessionPullRequestStateClosed
+}
+
+func repositoryContext(ctx context.Context, runner workspaceStatusRunner, workingDir, branch string) (githubRepository, string, error) {
 	remote, err := runner.run(ctx, workingDir, "git", "for-each-ref", "--format=%(push:remotename)", "refs/heads/"+branch)
 	if err != nil {
-		return "", fmt.Errorf("reading Session branch push remote: %w", err)
+		return githubRepository{}, "", fmt.Errorf("reading Session branch push remote: %w", err)
 	}
 	if remote == "" {
 		remote = "origin"
 	}
-	remoteURL, err := runner.run(ctx, workingDir, "git", "remote", "get-url", "--push", remote)
+	remoteURL, err := runner.run(ctx, workingDir, "git", "remote", "get-url", remote)
 	if err != nil {
-		return "", fmt.Errorf("reading Session branch push URL: %w", err)
+		return githubRepository{}, "", fmt.Errorf("reading Session repository URL: %w", err)
 	}
-	owner, err := repositoryOwnerFromRemoteURL(remoteURL)
+	repository, err := repositoryFromRemoteURL(remoteURL)
 	if err != nil {
-		return "", fmt.Errorf("identifying Session branch push repository: %w", err)
+		return githubRepository{}, "", fmt.Errorf("identifying Session repository: %w", err)
 	}
-	return owner, nil
+	remoteURL, err = runner.run(ctx, workingDir, "git", "remote", "get-url", "--push", remote)
+	if err != nil {
+		return githubRepository{}, "", fmt.Errorf("reading Session branch push URL: %w", err)
+	}
+	pushRepository, err := repositoryFromRemoteURL(remoteURL)
+	if err != nil {
+		return githubRepository{}, "", fmt.Errorf("identifying Session branch push repository: %w", err)
+	}
+	return repository, pushRepository.Owner, nil
 }
 
-func repositoryOwnerFromRemoteURL(remoteURL string) (string, error) {
+func repositoryFromRemoteURL(remoteURL string) (githubRepository, error) {
 	repositoryPath := remoteURL
+	host := ""
 	parsed, err := url.Parse(remoteURL)
 	if err == nil && parsed.Scheme != "" {
 		repositoryPath = parsed.Path
+		host = parsed.Hostname()
 	} else if prefix, path, ok := strings.Cut(remoteURL, ":"); ok && strings.Contains(prefix, "@") {
 		repositoryPath = path
+		host = strings.TrimPrefix(prefix, "git@")
 	}
 	repositoryPath = strings.Trim(strings.TrimSuffix(repositoryPath, ".git"), "/")
 	parts := strings.Split(repositoryPath, "/")
-	if len(parts) < 2 || parts[len(parts)-2] == "" || parts[len(parts)-1] == "" {
-		return "", fmt.Errorf("invalid remote URL %q", remoteURL)
+	if host == "" || len(parts) < 2 || parts[len(parts)-2] == "" || parts[len(parts)-1] == "" {
+		return githubRepository{}, fmt.Errorf("invalid remote URL %q", remoteURL)
 	}
-	return parts[len(parts)-2], nil
+	return githubRepository{Host: host, Owner: parts[len(parts)-2], Name: parts[len(parts)-1]}, nil
 }
 
-func findPullRequest(ctx context.Context, runner workspaceStatusRunner, workingDir, branch, repo, headOwner string) (*kelos.SessionPullRequest, error) {
-	args := []string{"pr", "list", "--head", branch, "--state", "all", "--json", "url,headRepositoryOwner,state,isDraft", "--limit", "100"}
-	if repo != "" {
-		args = append(args, "--repo", repo)
+func repositoryFromName(host, name string) (githubRepository, error) {
+	parts := strings.Split(strings.Trim(name, "/"), "/")
+	if host == "" || len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return githubRepository{}, fmt.Errorf("invalid GitHub repository %q", name)
 	}
-	output, err := runner.run(ctx, workingDir, "gh", args...)
+	return githubRepository{Host: host, Owner: parts[0], Name: parts[1]}, nil
+}
+
+func findPullRequest(ctx context.Context, runner workspaceStatusRunner, workingDir, branch string, repository githubRepository, headOwner string) (*kelos.SessionPullRequest, error) {
+	endpoint := fmt.Sprintf("repos/%s/%s/pulls", repository.Owner, repository.Name)
+	output, err := runner.run(ctx, workingDir, "gh", "api", "--hostname", repository.Host, "--method", "GET", endpoint, "-f", "state=all", "-f", "head="+headOwner+":"+branch, "-F", "per_page=1")
 	if err != nil {
 		return nil, fmt.Errorf("listing pull requests: %w", err)
 	}
@@ -125,26 +201,147 @@ func findPullRequest(ctx context.Context, runner workspaceStatusRunner, workingD
 		return nil, nil
 	}
 	var pullRequests []struct {
-		URL                 string `json:"url"`
-		State               string `json:"state"`
-		IsDraft             bool   `json:"isDraft"`
-		HeadRepositoryOwner struct {
-			Login string `json:"login"`
-		} `json:"headRepositoryOwner"`
+		URL      string  `json:"html_url"`
+		State    string  `json:"state"`
+		Draft    bool    `json:"draft"`
+		MergedAt *string `json:"merged_at"`
 	}
 	if err := json.Unmarshal([]byte(output), &pullRequests); err != nil {
 		return nil, fmt.Errorf("decoding pull requests: %w", err)
 	}
-	for _, pullRequest := range pullRequests {
-		if strings.EqualFold(pullRequest.HeadRepositoryOwner.Login, headOwner) {
-			state, err := sessionPullRequestState(pullRequest.State, pullRequest.IsDraft)
-			if err != nil {
-				return nil, err
-			}
-			return &kelos.SessionPullRequest{URL: pullRequest.URL, State: state}, nil
+	if len(pullRequests) == 0 {
+		return nil, nil
+	}
+	pullRequest := pullRequests[0]
+	state := strings.ToUpper(pullRequest.State)
+	if pullRequest.MergedAt != nil {
+		state = "MERGED"
+	}
+	fallbackState, err := sessionPullRequestState(state, pullRequest.Draft)
+	if err != nil {
+		return nil, err
+	}
+	fallback := &kelos.SessionPullRequest{URL: pullRequest.URL, State: fallbackState}
+	status, err := readPullRequestStatus(ctx, runner, workingDir, pullRequest.URL)
+	if err != nil {
+		return fallback, err
+	}
+	return status, nil
+}
+
+func readPullRequestStatus(ctx context.Context, runner workspaceStatusRunner, workingDir, pullRequestURL string) (*kelos.SessionPullRequest, error) {
+	repository, number, err := pullRequestCoordinatesFromURL(pullRequestURL)
+	if err != nil {
+		return nil, err
+	}
+	output, err := runner.run(ctx, workingDir, "gh", "api", "--hostname", repository.Host, "graphql", "-f", "owner="+repository.Owner, "-f", "repo="+repository.Name, "-F", "number="+strconv.Itoa(number), "-f", "query="+pullRequestStatusQuery)
+	if err != nil {
+		return nil, fmt.Errorf("reading pull request status: %w", err)
+	}
+	var response struct {
+		Data struct {
+			Repository struct {
+				PullRequest *githubPullRequestStatus `json:"pullRequest"`
+			} `json:"repository"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(output), &response); err != nil {
+		return nil, fmt.Errorf("decoding pull request status: %w", err)
+	}
+	pullRequest := response.Data.Repository.PullRequest
+	if pullRequest == nil {
+		return nil, fmt.Errorf("pull request %s not found", pullRequestURL)
+	}
+	state, err := sessionPullRequestState(pullRequest.State, pullRequest.IsDraft)
+	if err != nil {
+		return nil, err
+	}
+	var checks []githubStatusCheck
+	if len(pullRequest.Commits.Nodes) > 0 {
+		if rollup := pullRequest.Commits.Nodes[0].Commit.StatusCheckRollup; rollup != nil {
+			checks = rollup.Contexts.Nodes
 		}
 	}
-	return nil, nil
+	if pullRequest.MergeQueueEntry != nil {
+		state = kelos.SessionPullRequestStateQueued
+		checks = nil
+		if pullRequest.MergeQueueEntry.HeadCommit != nil && pullRequest.MergeQueueEntry.HeadCommit.StatusCheckRollup != nil {
+			checks = pullRequest.MergeQueueEntry.HeadCommit.StatusCheckRollup.Contexts.Nodes
+		}
+	}
+	return &kelos.SessionPullRequest{
+		URL:    pullRequest.URL,
+		State:  state,
+		Checks: sessionPullRequestChecks(checks),
+	}, nil
+}
+
+func pullRequestCoordinatesFromURL(pullRequestURL string) (githubRepository, int, error) {
+	parsed, err := url.Parse(pullRequestURL)
+	if err != nil || parsed.Hostname() == "" {
+		return githubRepository{}, 0, fmt.Errorf("invalid pull request URL %q", pullRequestURL)
+	}
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if len(parts) != 4 || parts[2] != "pull" {
+		return githubRepository{}, 0, fmt.Errorf("invalid pull request URL %q", pullRequestURL)
+	}
+	number, err := strconv.Atoi(parts[3])
+	if err != nil || number < 1 {
+		return githubRepository{}, 0, fmt.Errorf("invalid pull request URL %q", pullRequestURL)
+	}
+	return githubRepository{Host: parsed.Hostname(), Owner: parts[0], Name: parts[1]}, number, nil
+}
+
+func sessionPullRequestChecks(checks []githubStatusCheck) *kelos.SessionPullRequestChecks {
+	if len(checks) == 0 {
+		return nil
+	}
+
+	result := &kelos.SessionPullRequestChecks{
+		State: kelos.SessionPullRequestChecksStateSuccess,
+		Total: int32(len(checks)),
+	}
+	for _, check := range checks {
+		completed, failed := completedGitHubCheck(check)
+		if completed {
+			result.Completed++
+		}
+		if failed {
+			result.State = kelos.SessionPullRequestChecksStateFailure
+		}
+	}
+	if result.State != kelos.SessionPullRequestChecksStateFailure && result.Completed < result.Total {
+		result.State = kelos.SessionPullRequestChecksStatePending
+	}
+	return result
+}
+
+func completedGitHubCheck(check githubStatusCheck) (completed, failed bool) {
+	switch check.TypeName {
+	case "CheckRun":
+		if !strings.EqualFold(check.Status, "COMPLETED") {
+			return false, false
+		}
+		switch strings.ToUpper(check.Conclusion) {
+		case "SUCCESS", "NEUTRAL", "SKIPPED":
+			return true, false
+		case "ACTION_REQUIRED", "CANCELLED", "FAILURE", "STALE", "STARTUP_FAILURE", "TIMED_OUT":
+			return true, true
+		default:
+			return false, false
+		}
+	case "StatusContext":
+		switch strings.ToUpper(check.State) {
+		case "SUCCESS":
+			return true, false
+		case "ERROR", "FAILURE":
+			return true, true
+		default:
+			return false, false
+		}
+	default:
+		return false, false
+	}
 }
 
 func sessionPullRequestState(state string, draft bool) (kelos.SessionPullRequestState, error) {
@@ -173,22 +370,26 @@ func environmentValue(environment []string, name string) string {
 	return ""
 }
 
-func refreshWorkspaceStatus(ctx context.Context, stateDir, workingDir string, environment []string) (WorkspaceStatus, error) {
-	return refreshWorkspaceStatusWithRunner(ctx, realWorkspaceStatusRunner{}, stateDir, workingDir, environment)
+func refreshWorkspaceStatus(ctx context.Context, stateDir, workingDir string, environment []string, forceDiscovery bool) (WorkspaceStatus, error) {
+	return refreshWorkspaceStatusWithRunner(ctx, realWorkspaceStatusRunner{}, stateDir, workingDir, environment, forceDiscovery)
 }
 
-func refreshWorkspaceStatusWithRunner(ctx context.Context, runner workspaceStatusRunner, stateDir, workingDir string, environment []string) (WorkspaceStatus, error) {
+func refreshWorkspaceStatusWithRunner(ctx context.Context, runner workspaceStatusRunner, stateDir, workingDir string, environment []string, forceDiscovery bool) (WorkspaceStatus, error) {
 	previous, err := readRecordedWorkspaceStatus(stateDir)
 	if err != nil {
 		return WorkspaceStatus{}, err
 	}
-	status, captureErr := captureWorkspaceStatus(ctx, runner, workingDir, environment)
+	status, captureErr := captureWorkspaceStatusFromPrevious(ctx, runner, workingDir, environment, previous, forceDiscovery)
 	if captureErr != nil {
 		if status.Branch == "" {
 			return previous, captureErr
 		}
 		if status.Branch == previous.Branch {
-			status.PullRequest = previous.PullRequest
+			if status.PullRequest == nil {
+				status.PullRequest = previous.PullRequest
+			} else if previous.PullRequest != nil && status.PullRequest.URL == previous.PullRequest.URL && status.PullRequest.Checks == nil {
+				status.PullRequest.Checks = previous.PullRequest.Checks
+			}
 		}
 	}
 	if err := writeWorkspaceStatus(stateDir, status); err != nil {

@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +17,7 @@ import (
 
 	kelos "github.com/kelos-dev/kelos/api/v1alpha2"
 	"github.com/kelos-dev/kelos/internal/sessionruntime"
+	"github.com/kelos-dev/kelos/internal/sessionsuspend"
 )
 
 func TestSessionTerminalReconnectsToReplacementPod(t *testing.T) {
@@ -49,10 +53,10 @@ func TestSessionTerminalReconnectsToReplacementPod(t *testing.T) {
 						t.Error(err)
 						return
 					}
-					if subscribe.Type != "subscribe" || subscribe.Since != 0 || subscribe.JournalID != "" || !subscribe.HistoryBounds {
+					if subscribe.Type != "subscribe" || subscribe.Since != 0 || subscribe.JournalID != "" || !subscribe.HistoryBounds || subscribe.HistoryItems != sessionruntime.DefaultHistoryItemLimit || subscribe.HistoryBytes != sessionruntime.DefaultHistoryByteLimit {
 						t.Errorf("first subscribe = %#v", subscribe)
 					}
-					_ = encoder.Encode(sessionruntime.Event{Type: sessionruntime.EventHistoryStart, JournalID: "journal-1"})
+					_ = encoder.Encode(sessionruntime.Event{Type: sessionruntime.EventHistoryStart, JournalID: "journal-1", LastEventID: 10})
 					_ = encoder.Encode(sessionruntime.Event{ID: 1, Type: sessionruntime.EventTurnStarted, TurnID: "turn-1", Status: "running"})
 					_ = encoder.Encode(sessionruntime.Event{Type: sessionruntime.EventHistoryEnd})
 					close(firstConnected)
@@ -76,7 +80,7 @@ func TestSessionTerminalReconnectsToReplacementPod(t *testing.T) {
 						t.Error(err)
 						return
 					}
-					if subscribe.Type != "subscribe" || subscribe.Since != 1 || subscribe.JournalID != "journal-1" || !subscribe.HistoryBounds {
+					if subscribe.Type != "subscribe" || subscribe.Since != 10 || subscribe.JournalID != "journal-1" || !subscribe.HistoryBounds || subscribe.HistoryItems != sessionruntime.DefaultHistoryItemLimit || subscribe.HistoryBytes != sessionruntime.DefaultHistoryByteLimit {
 						t.Errorf("replacement subscribe = %#v", subscribe)
 					}
 					_ = encoder.Encode(sessionruntime.Event{Type: sessionruntime.EventHistoryStart, JournalID: "journal-2", Reset: true})
@@ -206,6 +210,24 @@ func TestSessionConnectionWaitsForTerminalCleanup(t *testing.T) {
 	}
 }
 
+func TestWaitForReadySessionPreservesNotFoundError(t *testing.T) {
+	_, err := waitForReadySession(
+		t.Context(),
+		"default",
+		"chat",
+		io.Discard,
+		func(context.Context, string, string) (*kelos.Session, error) {
+			return nil, apierrors.NewNotFound(schema.GroupResource{Group: kelos.GroupVersion.Group, Resource: "sessions"}, "chat")
+		},
+		nil,
+		make(chan error),
+		false,
+	)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("waitForReadySession() error = %v, want Kubernetes NotFound error", err)
+	}
+}
+
 func TestWaitForReadySessionReportsSuspension(t *testing.T) {
 	var stderr bytes.Buffer
 	var reads atomic.Int32
@@ -220,6 +242,7 @@ func TestWaitForReadySessionReportsSuspension(t *testing.T) {
 			}
 			return &kelos.Session{Status: kelos.SessionStatus{Phase: kelos.SessionPhaseReady, PodName: "session-pod"}}, nil
 		},
+		nil,
 		make(chan error),
 		false,
 	)
@@ -230,6 +253,120 @@ func TestWaitForReadySessionReportsSuspension(t *testing.T) {
 		t.Fatalf("ready Session Pod = %q, want session-pod", session.Status.PodName)
 	}
 	if !strings.Contains(stderr.String(), `Waiting for Session "chat" to resume`) {
+		t.Fatalf("Session diagnostics = %q", stderr.String())
+	}
+}
+
+func TestWaitForReadySessionRequestsIdleResume(t *testing.T) {
+	var stderr bytes.Buffer
+	var reads atomic.Int32
+	var resumeRequests atomic.Int32
+	session, err := waitForReadySession(
+		t.Context(),
+		"default",
+		"chat",
+		&stderr,
+		func(context.Context, string, string) (*kelos.Session, error) {
+			if reads.Add(1) == 1 {
+				return &kelos.Session{Status: kelos.SessionStatus{
+					Phase: kelos.SessionPhaseSuspended,
+					Conditions: []metav1.Condition{{
+						Type:   kelos.SessionConditionReady,
+						Status: metav1.ConditionFalse,
+						Reason: sessionsuspend.IdlePolicyReason,
+					}},
+				}}, nil
+			}
+			return &kelos.Session{Status: kelos.SessionStatus{Phase: kelos.SessionPhaseReady, PodName: "session-pod"}}, nil
+		},
+		func(_ context.Context, namespace, name string) error {
+			if namespace != "default" || name != "chat" {
+				t.Fatalf("resume Session = %s/%s, want default/chat", namespace, name)
+			}
+			resumeRequests.Add(1)
+			return nil
+		},
+		make(chan error),
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.Status.PodName != "session-pod" {
+		t.Fatalf("ready Session Pod = %q, want session-pod", session.Status.PodName)
+	}
+	if resumeRequests.Load() != 1 {
+		t.Fatalf("resume requests = %d, want 1", resumeRequests.Load())
+	}
+	if !strings.Contains(stderr.String(), `Resuming idle Session "chat"`) {
+		t.Fatalf("Session diagnostics = %q", stderr.String())
+	}
+}
+
+func TestWaitForReadySessionReturnsWhenIdleResumeExpires(t *testing.T) {
+	var reads atomic.Int32
+	_, err := waitForReadySession(
+		t.Context(),
+		"default",
+		"chat",
+		io.Discard,
+		func(context.Context, string, string) (*kelos.Session, error) {
+			return &kelos.Session{Status: kelos.SessionStatus{
+				Phase: kelos.SessionPhaseSuspended,
+				Conditions: []metav1.Condition{{
+					Type:   kelos.SessionConditionReady,
+					Status: metav1.ConditionFalse,
+					Reason: sessionsuspend.IdlePolicyReason,
+				}},
+			}}, nil
+		},
+		func(context.Context, string, string) error {
+			reads.Add(1)
+			return nil
+		},
+		make(chan error),
+		false,
+	)
+	if err == nil || !strings.Contains(err.Error(), "resume request expired") {
+		t.Fatalf("waitForReadySession() error = %v, want resume expiry", err)
+	}
+	if reads.Load() != 1 {
+		t.Fatalf("resume requests = %d, want 1", reads.Load())
+	}
+}
+
+func TestWaitForReadySessionDoesNotResumeIdleSessionAfterConnection(t *testing.T) {
+	var stderr bytes.Buffer
+	var resumeRequests atomic.Int32
+	_, err := waitForReadySession(
+		t.Context(),
+		"default",
+		"chat",
+		&stderr,
+		func(context.Context, string, string) (*kelos.Session, error) {
+			return &kelos.Session{Status: kelos.SessionStatus{
+				Phase: kelos.SessionPhaseSuspended,
+				Conditions: []metav1.Condition{{
+					Type:   kelos.SessionConditionReady,
+					Status: metav1.ConditionFalse,
+					Reason: sessionsuspend.IdlePolicyReason,
+				}},
+			}}, nil
+		},
+		func(context.Context, string, string) error {
+			resumeRequests.Add(1)
+			return nil
+		},
+		make(chan error),
+		true,
+	)
+	if !errors.Is(err, errSessionIdleSuspended) {
+		t.Fatalf("waitForReadySession() error = %v, want %v", err, errSessionIdleSuspended)
+	}
+	if resumeRequests.Load() != 0 {
+		t.Fatalf("resume requests = %d, want 0", resumeRequests.Load())
+	}
+	if !strings.Contains(stderr.String(), `Session "chat" suspended after becoming idle`) {
 		t.Fatalf("Session diagnostics = %q", stderr.String())
 	}
 }
@@ -264,6 +401,50 @@ func TestSessionConnectionReturnsTerminalDeliveryError(t *testing.T) {
 	err := connectSessionWithDependencies(t.Context(), "default", "chat", strings.NewReader(""), io.Discard, io.Discard, false, dependencies)
 	if !errors.Is(err, terminalErr) {
 		t.Fatalf("connectSessionWithDependencies() error = %v, want %v", err, terminalErr)
+	}
+}
+
+func TestSessionConnectionAcknowledgesIdleResumeAfterHistory(t *testing.T) {
+	acknowledged := make(chan struct{})
+	dependencies := sessionReconnectDependencies{
+		getSession: func(context.Context, string, string) (*kelos.Session, error) {
+			return &kelos.Session{
+				ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+					sessionsuspend.ResumeRequestAnnotation: "resume-request",
+				}},
+				Status: kelos.SessionStatus{Phase: kelos.SessionPhaseReady, PodName: "session-pod"},
+			}, nil
+		},
+		acknowledgeResume: func(_ context.Context, namespace, name, requestValue string) error {
+			if namespace != "default" || name != "chat" {
+				t.Fatalf("acknowledged Session = %s/%s, want default/chat", namespace, name)
+			}
+			if requestValue != "resume-request" {
+				t.Fatalf("resume request value = %q, want resume-request", requestValue)
+			}
+			close(acknowledged)
+			return nil
+		},
+		openStream: func(context.Context, string, string, io.Writer) (*sessionPodStream, error) {
+			return fakeSessionPodStream(t, func(decoder *json.Decoder, encoder *json.Encoder) {
+				var subscribe sessionruntime.ClientRequest
+				if err := decoder.Decode(&subscribe); err != nil {
+					t.Error(err)
+					return
+				}
+				if err := encoder.Encode(sessionruntime.Event{Type: sessionruntime.EventHistoryEnd}); err != nil {
+					t.Error(err)
+				}
+			}), nil
+		},
+		runTerminal: func(context.Context, io.Reader, io.Writer, io.Reader, io.Writer, bool) error {
+			<-acknowledged
+			return nil
+		},
+	}
+
+	if err := connectSessionWithDependencies(t.Context(), "default", "chat", strings.NewReader(""), io.Discard, io.Discard, false, dependencies); err != nil {
+		t.Fatal(err)
 	}
 }
 

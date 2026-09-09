@@ -48,11 +48,20 @@ function promptText(message) {
     .join('');
 }
 
+function readPromptAttachment(prompt) {
+  const match = prompt.match(/^- .+ \([^)]+\): (.+)$/m);
+  return match ? readFile(match[1], 'missing').trim() : 'missing';
+}
+
 function handleUser(message) {
   turn += 1;
   fs.mkdirSync(stateDirectory, {recursive: true});
   fs.writeFileSync(turnPath, String(turn));
   const prompt = promptText(message);
+  if (prompt.startsWith('attachment-check\n\n')) {
+    complete(`attachment: ${readPromptAttachment(prompt)}`);
+    return;
+  }
   if (prompt === 'question') {
     pending = {kind: 'question'};
     send({

@@ -9,6 +9,11 @@ repository while keeping the configuration in this repo.
 The nested [`kanon/`](kanon/README.md) directory does the same for the sibling
 [`kelos-dev/kanon`](https://github.com/kelos-dev/kanon) repository.
 
+The nested [`open-actions/`](open-actions/README.md) directory does the same
+for the sibling
+[`kelos-dev/open-actions`](https://github.com/kelos-dev/open-actions)
+repository.
+
 [`cs`](cs) creates persistent interactive Codex environments for developing
 Kelos with the same Workspace, credentials, model, effort, and Git identity as
 the `kelos-workers` SessionSpawner.
@@ -18,14 +23,14 @@ the `kelos-workers` SessionSpawner.
 <img width="2694" height="1966" alt="kelos-self-development" src="https://github.com/user-attachments/assets/10719599-426e-4c3d-87a0-cde43e1b3113" />
 
 Every self-development Task, TaskSpawner, Session, and SessionSpawner in this
-directory and its nested Agora and Kanon directories references
+directory and its nested Agora, Kanon, and Open Actions directories references
 [`base-agent.yaml`](base-agent.yaml), which copies
 [`gjkim42/kanon-repo`'s `instructions/AGENTS.md`](https://github.com/gjkim42/kanon-repo/blob/main/instructions/AGENTS.md)
 and installs all skills from that repository through `spec.skills`.
 Tasks and TaskSpawners add a second role-specific AgentConfig when they need
 local identity, conventions, or workflow instructions. The issue and PR
-pick-up SessionSpawners for Kelos, Agora, and Kanon, plus Sessions created with
-`cs`, use only `base-agent`.
+pick-up SessionSpawners for Kelos, Agora, Kanon, and Open Actions, plus
+Sessions created with `cs`, use only `base-agent`.
 
 Apply the shared AgentConfig before deploying any self-development resource:
 
@@ -37,25 +42,25 @@ All other AgentConfigs provide only role- or repository-specific instructions;
 they do not duplicate the shared skills.
 
 Autonomous discovery agents that publish GitHub issues maintain at most one
-open `generated-by-kelos` issue slot per TaskSpawner. The issue body includes a
-`kelos-taskspawner=<name>` marker so later runs can find it. A run may update
-the unassigned slot when it finds a clearly more impactful or important
-candidate, but it exits without changes when the slot has assignees. Assigned
-issues and PRs are treated as ongoing human or agent work and are not updated by
-autonomous discovery jobs. This cap does not apply to follow-up issues created
-while a worker or PR responder is handling an explicitly requested issue or PR.
+open `generated-by-kelos` issue slot per TaskSpawner. Its title starts with the
+TaskSpawner name in brackets, and its body includes both a
+`kelos-taskspawner=<name>` marker and one replaceable `Latest verdict` section.
+Each run checks whether an unassigned slot is still valid against the current
+repository before retaining, replacing, or closing it. Assigned issues and PRs
+are treated as ongoing human or agent work and are not updated by autonomous
+discovery jobs.
 
 ## Spawners
 
 | Spawner | Trigger | Agent | Description |
 |---|---|---|---|
-| **kelos-workers** | Webhook: issue comment `/kelos pick-up` | Codex | Picks up an open issue in a durable Session, creates or updates its PR, self-reviews, and ensures CI passes |
+| **kelos-workers** | Webhook: issue comment `/kelos pick-up` | Codex | Creates a durable Session with the open issue URL and a dedicated issue branch |
 | **kelos-planner** | Webhook: issue comment `/kelos plan` | Codex | Investigates an issue and posts a structured implementation plan — advisory only, no code changes |
 | **kelos-reviewer** | Webhook: PR comment `/kelos review` | Codex | Reviews PRs on demand — analyzes code, checks conventions, and updates a sticky review comment |
-| **kelos-glm-reviewer** | Webhook: PR comment `/kelos glm-review` | GLM-5.2 | Runs a second code review path with Z.AI GLM-5.2 through OpenCode and updates a sticky review comment |
+| **kelos-claude-reviewer** | Webhook: PR comment `/kelos claude-review` | Claude Fable | Runs an additional code review path with Claude Code and updates a Claude-specific sticky review comment |
 | **kelos-api-reviewer** | Webhook: issue/PR comment `/kelos api-review` | Codex | Reviews Kubernetes API design on issues or PRs — naming, compatibility, CRD validation |
-| **kelos-glm-api-reviewer** | Webhook: issue/PR comment `/kelos glm-api-review` | GLM-5.2 | Runs a second Kubernetes API design review path with Z.AI GLM-5.2 through OpenCode and updates sticky PR comments |
-| **kelos-pr-responder** | Webhook: PR comment/review `/kelos pick-up` | Codex | Picks up an open PR in a durable Session and updates its existing branch incrementally |
+| **kelos-claude-api-reviewer** | Webhook: issue/PR comment `/kelos claude-api-review` | Claude Fable | Runs an additional Kubernetes API design review path with Claude Code and updates Claude-specific sticky PR comments |
+| **kelos-pr-responder** | Webhook: PR comment/review `/kelos pick-up` | Codex | Creates a durable Session with the open PR URL on its existing branch |
 | **kelos-triage** | Webhook: issue opened/labeled/reopened (`needs-actor`) | Codex | Classifies issues by kind/priority, detects duplicates, and recommends an actor |
 | **kelos-fake-user** | Cron (daily 09:00 UTC) | Codex | Tests DX as a new user and maintains one unassigned issue slot for the highest-impact problem found |
 | **kelos-fake-strategist** | Cron (every 12 hours) | Codex | Explores new use cases, integrations, and API ideas while maintaining one unassigned strategic issue slot |
@@ -67,8 +72,9 @@ while a worker or PR responder is handling an explicitly requested issue or PR.
 ### kelos-workers.yaml
 
 Creates a durable Session when the maintainer posts `/kelos pick-up` on an open
-issue. Follow-ups continue through the Session's web or terminal clients after
-the initial turn.
+issue. The initial prompt supplies the issue URL and asks the agent to find the
+best way to address it. Follow-ups continue through the Session's web or
+terminal clients after the initial turn.
 
 | | |
 |---|---|
@@ -77,16 +83,11 @@ the initial turn.
 | **Storage** | 10 GiB persistent volume per created Session |
 
 **Key features:**
-- Automatically checks for existing PRs and updates them incrementally
+- Lets the agent choose how to address the linked issue
 - Uses `kelos-task-<number>` for the issue branch
-- Self-reviews PRs before requesting human review
-- Ensures CI passes before completion
 - Requires `/kelos pick-up` from the maintainer before starting work
 - Excludes comments from `kelos-bot[bot]` to prevent self-trigger loops
 - Keeps the Session available for later web or terminal follow-ups
-- Hands off PR review feedback to `kelos-pr-responder`
-- May create separate follow-up issues for out-of-scope discoveries; those
-  follow-ups are exempt from autonomous discovery issue slot caps
 
 **Deploy:**
 ```bash
@@ -121,11 +122,12 @@ kubectl apply -f self-development/kelos-planner.yaml
 
 ### kelos-reviewer.yaml
 
-Reviews open pull requests on demand when a maintainer posts `/kelos review` or when a Kelos worker posts `/kelos review` after pushing a generated PR and confirming CI passes.
+Reviews open pull requests on demand when a maintainer or `kelos-bot[bot]`
+posts `/kelos review`.
 
 | | |
 |---|---|
-| **Trigger** | GitHub PR comment webhook with `/kelos review` from a maintainer or Kelos worker handoff |
+| **Trigger** | GitHub PR comment webhook with `/kelos review` from a maintainer or `kelos-bot[bot]` |
 | **Agent** | Codex |
 | **Concurrency** | 3 |
 
@@ -139,45 +141,48 @@ Reviews open pull requests on demand when a maintainer posts `/kelos review` or 
 - Read-only agent — does not push code or modify files
 
 **Handoff flow:**
-1. `/kelos review` — maintainer requests a code review on the PR
-2. `/kelos review` — worker hands off a generated PR for review after pushing changes and confirming CI passes
-3. `/kelos review` — maintainer can retrigger review after changes are pushed
+1. `/kelos review` — a maintainer or `kelos-bot[bot]` requests a code review
+2. `/kelos review` — a maintainer can retrigger review after changes are pushed
 
 **Deploy:**
 ```bash
 kubectl apply -f self-development/kelos-reviewer.yaml
 ```
 
-### kelos-glm-reviewer.yaml
+### kelos-claude-reviewer.yaml
 
-Runs a GLM-5.2 review when a maintainer posts `/kelos glm-review`, using
-Z.AI GLM-5.2 through the OpenCode runner. It uses a separate trigger from
-`kelos-reviewer`, which continues to handle `/kelos review`.
+Runs a Claude Fable review when a maintainer posts `/kelos claude-review`,
+using the Claude Code runner. It uses a separate trigger from the Codex
+reviewer.
 
 | | |
 |---|---|
-| **Trigger** | GitHub PR comment webhook with `/kelos glm-review` from a maintainer or Kelos worker handoff |
-| **Agent** | GLM-5.2 via OpenCode |
+| **Trigger** | GitHub PR comment webhook with `/kelos claude-review` from a maintainer or `kelos-bot[bot]` |
+| **Agent** | Claude Fable via Claude Code |
 | **Concurrency** | 3 |
 
 **Key features:**
+
 - Uses the same code review checklist and structured sticky comment output as `kelos-reviewer`
-- Creates or updates a single GLM-specific sticky PR comment with the structured review result
+- Creates or updates a single Claude-specific sticky PR comment with the structured review result
 - Provides an independent model-family review without replacing the Codex reviewer
 - Read-only agent — does not push code or modify files
 
 **Deploy:**
+
 ```bash
-kubectl apply -f self-development/kelos-glm-reviewer.yaml
+kubectl apply -f self-development/kelos-claude-reviewer.yaml
 ```
 
 ### kelos-api-reviewer.yaml
 
-Reviews issues and pull requests for Kubernetes API design conventions, compatibility, and best practices when a maintainer posts `/kelos api-review` or when a Kelos worker posts `/kelos api-review` after pushing generated API changes and confirming CI passes.
+Reviews issues and pull requests for Kubernetes API design conventions,
+compatibility, and best practices when a maintainer or `kelos-bot[bot]` posts
+`/kelos api-review`.
 
 | | |
 |---|---|
-| **Trigger** | GitHub issue/PR comment webhook with `/kelos api-review` from a maintainer or Kelos worker handoff |
+| **Trigger** | GitHub issue/PR comment webhook with `/kelos api-review` from a maintainer or `kelos-bot[bot]` |
 | **Agent** | Codex |
 | **Concurrency** | 3 |
 
@@ -193,46 +198,47 @@ Reviews issues and pull requests for Kubernetes API design conventions, compatib
 - Read-only agent — does not push code or modify files
 
 **Handoff flow:**
-1. `/kelos api-review` — maintainer requests an API design review on a PR or issue
-2. `/kelos api-review` — worker hands off a generated API PR for review after pushing changes and confirming CI passes
-3. `/kelos api-review` — maintainer can retrigger review after changes or further discussion
+1. `/kelos api-review` — a maintainer or `kelos-bot[bot]` requests an API design review
+2. `/kelos api-review` — a maintainer can retrigger review after changes or further discussion
 
 **Deploy:**
 ```bash
 kubectl apply -f self-development/kelos-api-reviewer.yaml
 ```
 
-### kelos-glm-api-reviewer.yaml
+### kelos-claude-api-reviewer.yaml
 
-Runs a GLM-5.2 API design review when a maintainer posts
-`/kelos glm-api-review`, using Z.AI GLM-5.2 through the OpenCode runner. It
-uses a separate trigger from `kelos-api-reviewer`, which continues to handle
-`/kelos api-review`.
+Runs a Claude Fable API design review when a maintainer posts
+`/kelos claude-api-review`, using the Claude Code runner. It uses a separate
+trigger from the Codex API reviewer.
 
 | | |
 |---|---|
-| **Trigger** | GitHub issue/PR comment webhook with `/kelos glm-api-review` from a maintainer or Kelos worker handoff |
-| **Agent** | GLM-5.2 via OpenCode |
+| **Trigger** | GitHub issue/PR comment webhook with `/kelos claude-api-review` from a maintainer or `kelos-bot[bot]` |
+| **Agent** | Claude Fable via Claude Code |
 | **Concurrency** | 3 |
 
 **Key features:**
+
 - Uses the `api-review` skill for API design analysis and verdicts
 - Uses the same Kubernetes API design checklist and structured output as `kelos-api-reviewer`
-- Works on both issues (API design proposals) and pull requests (API implementation review)
-- For PRs: creates or updates a single GLM-specific sticky PR comment with structured API review feedback
-- For issues: posts a structured comment with API design guidance
+- Works on both issues and pull requests
+- Creates or updates a Claude-specific sticky PR comment for pull requests
+- Posts a structured API design comment for issues
 - Provides an independent model-family review without replacing the Codex API reviewer
 - Read-only agent — does not push code or modify files
 
 **Deploy:**
+
 ```bash
-kubectl apply -f self-development/kelos-glm-api-reviewer.yaml
+kubectl apply -f self-development/kelos-claude-api-reviewer.yaml
 ```
 
 ### kelos-pr-responder.yaml
 
 Creates a durable Session when the maintainer posts an exact `/kelos pick-up`
-PR comment or review on an open pull request.
+PR comment or review on an open pull request. The initial prompt supplies the
+PR URL and asks the agent to find the best way to address it.
 
 | | |
 |---|---|
@@ -241,12 +247,10 @@ PR comment or review on an open pull request.
 | **Storage** | 10 GiB persistent volume per created Session |
 
 **Key features:**
-- Reuses the existing PR branch instead of starting over
-- Reads review comments and PR conversation before making incremental changes
+- Starts the Session on the existing PR branch
+- Lets the agent choose how to address the linked PR
 - Keeps the Session available for later web or terminal follow-ups
 - Requires `/kelos pick-up` PR comment or review body to be picked up
-- May create separate follow-up issues for out-of-scope discoveries; those
-  follow-ups are exempt from autonomous discovery issue slot caps
 
 **Deploy:**
 ```bash
@@ -429,9 +433,10 @@ credentials, model, effort, Git identity, and `base-agent` AgentConfig as
 `kelos-workers`. It does not use the worker's resource requests and limits,
 allowing namespace resource defaults to apply.
 
-The Session requires the `base-agent` AgentConfig, `kelos-agent` Workspace, and
-`kelos-credentials` Secret described below. Its `10Gi` workspace persists
-across Pod replacement and is deleted with the Session.
+The Session requires the `base-agent` AgentConfig, `kelos-session-agent`
+Workspace, `personal-github-token` Secret, and `kelos-credentials` Secret
+described below. Its `10Gi` workspace persists across Pod replacement and is
+deleted with the Session.
 
 Add this directory to your `PATH` and run the script from any directory:
 
@@ -448,81 +453,127 @@ connect` command after creation.
 
 Before deploying these examples, you need to create the following resources:
 
-### 1. Workspace Resource
+### 1. Workspace Resources
 
-Create a Workspace that points to your repository:
+[`workspaces.yaml`](workspaces.yaml) defines the `kelos-agent`, `agora-agent`,
+`kanon-agent`, and `open-actions-agent` Workspaces used by Tasks and
+TaskSpawners. They reference the `kelos-agent-credentials` Secret described
+below so GitHub operations use the Kelos bot identity.
+
+Sessions use dedicated Workspaces so they can authenticate with a personal
+token without changing Task credentials. The checked-in manifest includes
+Session Workspaces for Kelos, Agora, Kanon, and `kelos-dev/open-actions`.
+Apply both manifests after creating their Secrets below:
+
+```bash
+kubectl apply -f self-development/workspaces.yaml
+kubectl apply -f self-development/session-workspaces.yaml
+```
+
+The Kelos Session Workspace is equivalent to:
 
 ```yaml
 apiVersion: kelos.dev/v1alpha2
 kind: Workspace
 metadata:
-  name: kelos-agent
+  name: kelos-session-agent
 spec:
-  repo: https://github.com/your-org/your-repo.git
+  repo: https://github.com/kelos-dev/kelos.git
   ref: main
   secretRef:
-    name: github-token  # For pushing branches and creating PRs
-  # Or use GitHub App authentication (recommended for production/org use):
-  # secretRef:
-  #   name: github-app-creds
-  # Create the GitHub App secret with:
-  #   kubectl create secret generic github-app-creds \
-  #     --from-literal=appID=12345 \
-  #     --from-literal=installationID=67890 \
-  #     --from-file=privateKey=my-app.private-key.pem
+    name: personal-github-token
 ```
 
-### 2. GitHub Token Secret
+### 2. Project GitHub App Secret
 
-Create a secret with your GitHub token (needed for `gh` CLI and git authentication):
+Create the GitHub App Secret referenced by `workspaces.yaml`:
 
 ```bash
-kubectl create secret generic github-token \
-  --from-literal=GITHUB_TOKEN=<your-github-token>
+kubectl create secret generic kelos-agent-credentials \
+  --from-literal=appID=<your-github-app-id> \
+  --from-literal=installationID=<your-github-app-installation-id> \
+  --from-file=privateKey=<path-to-private-key.pem>
+```
+
+The GitHub App installation must have access to the repositories used by the
+project Workspaces.
+
+### 3. Session GitHub Token Secret
+
+Create the personal token Secret referenced only by the Session Workspaces:
+
+```bash
+kubectl create secret generic personal-github-token \
+  --from-literal=GITHUB_TOKEN="$(gh auth token)" \
+  --dry-run=client -o yaml | kubectl apply -f -
 ```
 
 The token needs these permissions:
 - `repo` (full control of private repositories)
 - `workflow` (if your repo uses GitHub Actions)
 
-### 3. GitHub Webhook Secret and Delivery
+### 4. WebhookGateway, Secret, and Delivery
 
-The issue and pull request spawners in this directory are webhook-driven.
-Create a secret with the shared webhook secret GitHub will use:
+The issue and pull request TaskSpawners in this directory are webhook-driven and
+routed through a `WebhookGateway` (`webhookgateway.yaml`) that each spawner
+references via `githubWebhook.gatewayRef`. The gateway authenticates inbound
+deliveries against its own secret and resolves outbound GitHub API credentials
+per gateway.
+
+Create the `github-webhook-secret` Secret (in the same namespace as the
+TaskSpawners) and apply the gateway. The gateway reads two things from it: the
+inbound HMAC secret under a `webhook-secret` key, and outbound GitHub API
+credentials for PR-file enrichment and status reporting — a `GITHUB_TOKEN` PAT
+or GitHub App keys; the credential needs `repo` and `checks:write`.
 
 ```bash
 kubectl create secret generic github-webhook-secret \
-  --from-literal=WEBHOOK_SECRET=<your-github-webhook-secret>
+  --from-literal=webhook-secret=<your-github-webhook-secret> \
+  --from-literal=GITHUB_TOKEN=<token-with-repo-and-checks:write>
+# Or use GitHub App credentials instead of GITHUB_TOKEN:
+#   --from-literal=appID=... --from-literal=installationID=... \
+#   --from-file=privateKey=app.private-key.pem
+
+kubectl apply -f webhookgateway.yaml
 ```
 
 Then:
-- Enable the GitHub webhook server in your Kelos deployment (see `examples/helm-values-webhook.yaml` or `examples/webhook-gateway-values.yaml`)
-- Expose `https://<your-domain>/webhook/github` over HTTPS
-- Configure a repository webhook that uses the same secret
-- Subscribe the repository webhook to `issues`, `issue_comment`, and `pull_request_review`
+- Enable the gateway webhook server in your Kelos deployment —
+  `webhookServer.gatewayServer.enabled: true` plus Gateway-API or Ingress routing
+  (see `examples/webhook-gateway-values.yaml`).
+- Find the gateway's inbound path:
+  `kubectl get webhookgateway kelos -o jsonpath='{.status.path}'`
+  (it is `/webhook/<namespace>/kelos`).
+- Expose `https://<your-domain>/webhook/<namespace>/kelos` over HTTPS and
+  configure the repository webhook to POST there using the same secret.
+- Subscribe the repository webhook to `issues`, `issue_comment`, and
+  `pull_request_review`.
+
+> Spawners with a `gatewayRef` are served **only** by the gateway server. The
+> gateway server and referenced `WebhookGateway` must both be available for
+> their webhook deliveries to be processed.
 
 Webhook spawners only react to **new** events after deployment. If an issue
 or PR was already in a matching state before the webhook server went live,
 retrigger it with a fresh comment or relabel after deployment.
 
-### 4. Agent Credentials Secret
+### 5. Agent Credentials Secret
 
 Create a secret with your agent credentials. Most checked-in spawners use
-Codex OAuth. The GLM reviewer spawners use OpenCode with Z.AI GLM-5.2 and read
-the Z.AI key from `OPENCODE_API_KEY` in the same Secret:
+Codex OAuth, and the Claude reviewer spawners use Claude Code with OAuth from
+the same Secret:
 
 ```bash
 kubectl create secret generic kelos-credentials \
   --from-file=CODEX_AUTH_JSON=$HOME/.codex/auth.json \
-  --from-literal=OPENCODE_API_KEY=<your-zai-api-key>
+  --from-literal=CLAUDE_CODE_OAUTH_TOKEN=<your-claude-code-oauth-token>
 kubectl label secret kelos-credentials kelos.dev/codex-oauth-refresh=true
 ```
 
 Labeling the OAuth Secret opts it into controller-managed Codex OAuth refresh.
 Kelos creates one CronJob per labeled Secret with a non-empty `CODEX_AUTH_JSON`
 key, skips unlabeled Secrets and API-key credentials, and preserves other keys
-such as `OPENCODE_API_KEY`. The OpenCode entrypoint maps `OPENCODE_API_KEY` to
-Z.AI's `ZHIPU_API_KEY` for `zai/*` models.
+such as `CLAUDE_CODE_OAUTH_TOKEN`.
 
 For API-key auth, change the task template credential type to `api-key` and
 create the secret without the OAuth refresh label:
@@ -611,31 +662,32 @@ To adapt these examples for your own repository:
    spec:
      taskTemplate:
        worker:
-         model: gpt-5.6-sol
+         model: gpt-6-astra
          effort: xhigh
    ```
 
-   The checked-in spawners use `gpt-5.6-sol` for the tasks that previously used
-   Opus, and `gpt-5.4-mini` for the tasks that previously used Sonnet.
+   The checked-in spawners use `gpt-6-astra` for high-capability tasks and
+   `gpt-5.4-mini` for lower-cost routine tasks.
    They set `effort` by role: `xhigh` for complex planning, coding, strategy,
    review, PR update, and configuration update workflows; `high` for triage;
    and `medium` for routine image, fake-user, and squash workflows.
 
 ## Feedback Loop Pattern
 
-The key pattern in these examples is webhook-triggered handoff plus runtime re-validation:
+The key pattern in these examples is webhook-triggered handoff with durable,
+agent-directed Sessions:
 
 1. GitHub delivers an `issue_comment`, `issues`, or `pull_request_review` webhook
-2. The matching TaskSpawner creates a Task, while the issue and PR pick-up spawners for Kelos, Agora, and Kanon create Sessions
-3. The agent re-reads the latest issue or PR state with `gh` before acting, so asynchronous label updates are respected
-4. If the agent needs human input, it posts a plain-English status comment describing what happened
+2. The matching TaskSpawner creates a Task, while the issue and PR pick-up spawners for Kelos, Agora, Kanon, and Open Actions create Sessions
+3. A pick-up Session receives the issue or PR URL and asks the agent to choose the best way to address it
+4. Issue Sessions start on a dedicated issue branch, while PR Sessions start on the existing PR branch
 5. An exact `/kelos pick-up` command creates a Session for an open issue or PR; explicit commands or relabel events retrigger the other matching automation
 
 Each matching webhook delivery creates a discrete Task or Session. A created
 Session remains available for interactive follow-ups through Session clients.
-Bot status and review replies should not include trigger commands accidentally,
-but explicit worker handoff comments can intentionally retrigger reviewer
-spawners when those spawners include a matching bot-author filter.
+Bot status and review replies should not include trigger commands accidentally.
+Explicit bot comments can trigger reviewer spawners when those spawners include
+a matching bot-author filter.
 
 ## Troubleshooting
 
@@ -643,8 +695,8 @@ spawners when those spawners include a matching bot-author filter.
 - Check the TaskSpawner status: `kubectl get taskspawner <name> -o yaml`
 - Verify the Workspace exists: `kubectl get workspace`
 - Ensure credentials are correctly configured: `kubectl get secret kelos-credentials`
-- Ensure the GitHub webhook server is enabled and the `github-webhook-secret` exists
-- Check webhook server logs: `kubectl logs -l app.kubernetes.io/component=webhook-github`
+- Ensure the gateway webhook server is enabled (`webhookServer.gatewayServer.enabled`), the `WebhookGateway` is `Authenticated` (`kubectl get webhookgateway kelos`), and the `github-webhook-secret` exists with a `webhook-secret` key
+- Check webhook server logs: `kubectl logs -l app.kubernetes.io/component=webhook-gateway-server`
 - Review the repository webhook's recent deliveries in GitHub
 - If the issue or PR matched before you deployed the webhook server, retrigger it with a new comment or relabel
 
@@ -659,9 +711,11 @@ spawners when those spawners include a matching bot-author filter.
 - Review task logs: `kubectl logs -l job-name=<job-name>`
 
 **Agent not creating PRs:**
-- Ensure the `github-token` secret exists and is referenced in the Workspace
+- For Sessions, ensure `personal-github-token` exists and the corresponding
+  `*-session-agent` Workspace references it
+- For Tasks, check the credentials referenced by the regular project Workspace
 - Verify the token has `repo` permissions
-- Check if git user is configured in the agent prompt (see `kelos-workers.yaml` for example)
+- Check if the SessionSpawner configures the Git identity in `worker.podOverrides.env`
 
 ## Next Steps
 

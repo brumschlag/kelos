@@ -28,6 +28,7 @@ Ready-to-use patterns and YAML manifests for orchestrating AI agents with Kelos.
 | [15-workerpool](15-workerpool/) | Run Tasks on pre-warmed WorkerPool pods instead of creating per-task Jobs |
 | [16-session](16-session/) | Keep one interactive Claude Code, Codex, or OpenCode conversation across web and terminal chat |
 | [17-taskspawner-ci-remediation](17-taskspawner-ci-remediation/) | Auto-fix failing CI checks via `check_run` webhooks, filtered by conclusion and check name |
+| [18-webhookgateway](18-webhookgateway/) | Authenticate and route webhook deliveries through named gateways, including multiple GitHub instances |
 
 ## Additional Guides
 

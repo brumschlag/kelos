@@ -63,6 +63,37 @@ func TestBuildTaskFromCronTaskSpawner(t *testing.T) {
 	}
 }
 
+func TestBuildTaskFromTaskSpawnerAssignsCredential(t *testing.T) {
+	spawner := testManualTaskSpawner("multi-account")
+	spawner.Spec.TaskTemplate.Type = ""
+	spawner.Spec.TaskTemplate.Credentials = nil
+	spawner.Spec.TaskTemplate.Worker = &kelos.WorkerSpec{Type: "claude-code"}
+	spawner.Spec.Credentials = []kelos.SpawnerCredential{
+		{Name: "account-b", Type: kelos.CredentialTypeOAuth, SecretRef: kelos.SecretReference{Name: "secret-b"}},
+		{Name: "account-a", Type: kelos.CredentialTypeOAuth, SecretRef: kelos.SecretReference{Name: "secret-a"}},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(spawner).Build()
+
+	task, err := buildTaskFromTaskSpawner(context.Background(), cl, "default", spawner.Name, runFromTaskSpawnerOptions{
+		Name: "manual-task",
+	})
+	if err != nil {
+		t.Fatalf("buildTaskFromTaskSpawner() error = %v", err)
+	}
+	if task.Spec.Worker == nil || task.Spec.Worker.Credentials == nil || task.Spec.Worker.Credentials.SecretRef == nil {
+		t.Fatal("manual Task has no assigned worker credentials")
+	}
+	credentialName := task.Labels["kelos.dev/spawner-credential"]
+	wantSecrets := map[string]string{"account-a": "secret-a", "account-b": "secret-b"}
+	wantSecret, ok := wantSecrets[credentialName]
+	if !ok {
+		t.Fatalf("credential label = %q, want a configured credential", credentialName)
+	}
+	if got := task.Spec.Worker.Credentials.SecretRef.Name; got != wantSecret {
+		t.Errorf("SecretRef.Name = %q, want %q for %s", got, wantSecret, credentialName)
+	}
+}
+
 func TestBuildTaskFromNonCronTaskSpawnerWithValues(t *testing.T) {
 	spawner := testManualTaskSpawner("webhook-spawner")
 	spawner.Spec.When.GenericWebhook = &kelos.GenericWebhook{Source: "alerts"}

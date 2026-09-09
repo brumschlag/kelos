@@ -22,12 +22,17 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kelos "github.com/kelos-dev/kelos/api/v1alpha2"
+	"github.com/kelos-dev/kelos/internal/sessionattachment"
 	"github.com/kelos-dev/kelos/internal/sessionruntime"
+	"github.com/kelos-dev/kelos/internal/sessionsuspend"
 )
 
 const sessionRuntimeClient = "/kelos/bin/kelos-session-runtime"
 
-var errSessionTerminalClosed = errors.New("Session terminal closed")
+var (
+	errSessionTerminalClosed = errors.New("Session terminal closed")
+	errSessionIdleSuspended  = errors.New("Session suspended after becoming idle")
+)
 
 type sessionConnectDependencies struct {
 	resolveConfig func() (*rest.Config, string, error)
@@ -128,9 +133,12 @@ func (s *sessionPodStream) Close() {
 }
 
 type sessionReconnectDependencies struct {
-	getSession  func(context.Context, string, string) (*kelos.Session, error)
-	openStream  func(context.Context, string, string, io.Writer) (*sessionPodStream, error)
-	runTerminal func(context.Context, io.Reader, io.Writer, io.Reader, io.Writer, bool) error
+	getSession        func(context.Context, string, string) (*kelos.Session, error)
+	requestResume     func(context.Context, string, string) error
+	acknowledgeResume func(context.Context, string, string, string) error
+	openStream        func(context.Context, string, string, io.Writer) (*sessionPodStream, error)
+	runTerminal       func(context.Context, io.Reader, io.Writer, io.Reader, io.Writer, bool) error
+	uploadAttachment  func(context.Context, string, string, string) (sessionruntime.Attachment, error)
 }
 
 type sessionEventResult struct {
@@ -291,6 +299,10 @@ func connectSession(ctx context.Context, restConfig *rest.Config, namespace, nam
 	if err != nil {
 		return fmt.Errorf("creating Kubernetes client: %w", err)
 	}
+	attachmentClient, err := sessionattachment.New(restConfig)
+	if err != nil {
+		return err
+	}
 	dependencies := sessionReconnectDependencies{
 		getSession: func(ctx context.Context, namespace, name string) (*kelos.Session, error) {
 			session := &kelos.Session{}
@@ -299,10 +311,45 @@ func connectSession(ctx context.Context, restConfig *rest.Config, namespace, nam
 			}
 			return session, nil
 		},
+		requestResume: func(ctx context.Context, namespace, name string) error {
+			_, _, err := sessionsuspend.RequestResume(
+				ctx,
+				controllerClient,
+				client.ObjectKey{Namespace: namespace, Name: name},
+			)
+			return err
+		},
+		acknowledgeResume: func(ctx context.Context, namespace, name, requestValue string) error {
+			_, err := sessionsuspend.AcknowledgeResume(
+				ctx,
+				controllerClient,
+				client.ObjectKey{Namespace: namespace, Name: name},
+				requestValue,
+			)
+			return err
+		},
 		openStream: func(ctx context.Context, namespace, podName string, diagnostics io.Writer) (*sessionPodStream, error) {
 			return openSessionPodStream(ctx, restConfig, namespace, podName, diagnostics)
 		},
 		runTerminal: runSessionTerminal,
+		uploadAttachment: func(ctx context.Context, namespace, podName, path string) (sessionruntime.Attachment, error) {
+			file, err := os.Open(path)
+			if err != nil {
+				return sessionruntime.Attachment{}, fmt.Errorf("opening attachment %q: %w", path, err)
+			}
+			defer file.Close()
+			info, err := file.Stat()
+			if err != nil {
+				return sessionruntime.Attachment{}, fmt.Errorf("checking attachment %q: %w", path, err)
+			}
+			if !info.Mode().IsRegular() {
+				return sessionruntime.Attachment{}, fmt.Errorf("attachment %q is not a regular file", path)
+			}
+			if info.Size() > sessionruntime.MaxAttachmentBytes {
+				return sessionruntime.Attachment{}, fmt.Errorf("attachment %q exceeds the %d byte limit", path, sessionruntime.MaxAttachmentBytes)
+			}
+			return attachmentClient.Upload(ctx, namespace, podName, info.Name(), file)
+		},
 	}
 	return connectSessionWithDependencies(ctx, namespace, name, stdin, stdout, stderr, color, dependencies)
 }
@@ -410,13 +457,26 @@ func connectSessionWithDependencies(
 	}()
 
 	var lastEventID int64
+	var historyLastEventID int64
 	var journalID string
 	connectedBefore := false
 	pendingRequests := make([]pendingSessionRequest, 0)
 	for {
-		session, err := waitForReadySession(terminalCtx, namespace, name, diagnostics, dependencies.getSession, terminalDone, connectedBefore)
+		session, err := waitForReadySession(
+			terminalCtx,
+			namespace,
+			name,
+			diagnostics,
+			dependencies.getSession,
+			dependencies.requestResume,
+			terminalDone,
+			connectedBefore,
+		)
 		if err != nil {
 			if errors.Is(err, errSessionTerminalClosed) {
+				return nil
+			}
+			if errors.Is(err, errSessionIdleSuspended) {
 				return nil
 			}
 			return err
@@ -443,6 +503,8 @@ func connectSessionWithDependencies(
 			Since:         lastEventID,
 			JournalID:     journalID,
 			HistoryBounds: true,
+			HistoryItems:  sessionruntime.DefaultHistoryItemLimit,
+			HistoryBytes:  sessionruntime.DefaultHistoryByteLimit,
 		}); err != nil {
 			stream.Close()
 			if diagnosticWriter != nil {
@@ -502,6 +564,24 @@ func connectSessionWithDependencies(
 				if request.Type == "subscribe" {
 					continue
 				}
+				if request.Type == sessionTerminalRequestAttachment {
+					var event sessionruntime.Event
+					if dependencies.uploadAttachment == nil {
+						event = sessionruntime.Event{Type: sessionruntime.EventError, Text: "Session attachment upload is unavailable", Status: "rejected"}
+					} else {
+						attachment, err := dependencies.uploadAttachment(terminalCtx, namespace, session.Status.PodName, request.Text)
+						if err != nil {
+							event = sessionruntime.Event{Type: sessionruntime.EventError, Text: err.Error(), Status: "rejected"}
+						} else {
+							event = sessionruntime.Event{Type: sessionTerminalEventAttachmentAdded, Attachments: []sessionruntime.Attachment{attachment}}
+						}
+					}
+					if err := eventSink.send(event); err != nil {
+						stream.Close()
+						return err
+					}
+					continue
+				}
 				if request.RequestID == "" {
 					request.RequestID = string(uuid.NewUUID())
 				}
@@ -523,13 +603,17 @@ func connectSessionWithDependencies(
 				if event.RequestID != "" {
 					pendingRequests = removePendingSessionRequest(pendingRequests, event.RequestID)
 				}
-				if event.Type == sessionruntime.EventHistoryStart {
+				if event.Type == sessionruntime.EventHistoryStart && !event.HistoryPage {
 					journalID = event.JournalID
+					historyLastEventID = event.LastEventID
 					if event.Reset {
 						lastEventID = 0
 					}
 				}
-				if event.Type == sessionruntime.EventHistoryEnd {
+				if event.Type == sessionruntime.EventHistoryEnd && !event.HistoryPage {
+					if historyLastEventID > lastEventID {
+						lastEventID = historyLastEventID
+					}
 					if announceReconnect {
 						reportSessionTerminalDiagnostic(diagnostics, sessionTerminalStatusConnected, "Reconnected to Session runtime")
 						announceReconnect = false
@@ -545,6 +629,17 @@ func connectSessionWithDependencies(
 							reportSessionTerminalDiagnostic(diagnostics, sessionTerminalStatusReconnecting, "Session connection lost while sending input: %v", err)
 							reconnect = true
 							break
+						}
+					}
+					if !reconnect && sessionsuspend.ResumeRequested(session) {
+						if dependencies.acknowledgeResume == nil {
+							reportSessionTerminalDiagnostic(diagnostics, sessionTerminalStatusReconnecting, "Session connection could not acknowledge its idle resume request")
+							reconnect = true
+						} else if err := dependencies.acknowledgeResume(terminalCtx, namespace, name, session.Annotations[sessionsuspend.ResumeRequestAnnotation]); err != nil {
+							reportSessionTerminalDiagnostic(diagnostics, sessionTerminalStatusReconnecting, "Acknowledging Session resume failed; reconnecting: %v", err)
+							reconnect = true
+						} else {
+							delete(session.Annotations, sessionsuspend.ResumeRequestAnnotation)
 						}
 					}
 				}
@@ -605,14 +700,16 @@ func waitForReadySession(
 	namespace, name string,
 	stderr io.Writer,
 	getSession func(context.Context, string, string) (*kelos.Session, error),
+	requestResume func(context.Context, string, string) error,
 	terminalDone <-chan error,
 	retryFailed bool,
 ) (*kelos.Session, error) {
 	reportedWaiting := false
+	resumeRequested := false
 	for {
 		session, err := getSession(ctx, namespace, name)
 		if apierrors.IsNotFound(err) {
-			return nil, fmt.Errorf("Session %q was deleted", name)
+			return nil, err
 		}
 		if err != nil {
 			status := sessionTerminalStatusConnecting
@@ -626,6 +723,25 @@ func waitForReadySession(
 			}
 			if !reportedWaiting {
 				reportSessionTerminalDiagnostic(stderr, sessionTerminalStatusReconnecting, "Waiting for Session %q to recover", name)
+				reportedWaiting = true
+			}
+		} else if sessionsuspend.IsIdlePolicySuspended(session) {
+			if retryFailed {
+				reportSessionTerminalDiagnostic(stderr, sessionTerminalStatusConnected, "Session %q suspended after becoming idle", name)
+				return nil, errSessionIdleSuspended
+			}
+			if resumeRequested && !sessionsuspend.ResumeRequested(session) {
+				return nil, fmt.Errorf("resuming idle Session %q: resume request expired before the runtime became ready", name)
+			}
+			if !resumeRequested {
+				if requestResume == nil {
+					return nil, fmt.Errorf("resuming idle Session %q: resume requester is not configured", name)
+				}
+				if err := requestResume(ctx, namespace, name); err != nil {
+					return nil, fmt.Errorf("resuming idle Session %q: %w", name, err)
+				}
+				reportSessionTerminalDiagnostic(stderr, sessionTerminalStatusConnecting, "Resuming idle Session %q", name)
+				resumeRequested = true
 				reportedWaiting = true
 			}
 		} else if session.Status.Phase == kelos.SessionPhaseSuspended {

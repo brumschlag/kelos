@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="color-scheme" content="light dark">
+  <title>Sign in · Kelos Console</title>
+  <link rel="stylesheet" href="/public/login.css">
+</head>
+<body>
+  <main class="login-shell">
+    <section class="login-card">
+      <div class="brand-mark">K</div>
+      <p class="eyebrow">KELOS CONSOLE</p>
+      <h1>Operate your agent workloads.</h1>
+      <p class="intro">Enter the shared access token configured by your cluster administrator.</p>
+      <form id="login-form">
+        <label for="token">Access token</label>
+        <div class="token-field">
+          <input id="token" name="token" type="password" required autofocus autocomplete="current-password" placeholder="••••••••••••••••">
+          <button type="button" id="reveal" aria-label="Show token">Show</button>
+        </div>
+        <div class="error" id="login-error" role="alert"></div>
+        <button class="sign-in" type="submit">Sign in</button>
+      </form>
+      <p class="footnote">One token grants access to all Kelos resources visible to this server.</p>
+    </section>
+  </main>
+  <script src="/public/login.js" defer></script>
+</body>
+</html>

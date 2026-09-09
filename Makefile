@@ -3,7 +3,7 @@ REGISTRY ?= ghcr.io/kelos-dev
 VERSION ?= latest
 # Release image tags may be architecture-specific while KELOS_VERSION remains shared.
 KELOS_VERSION ?= $(VERSION)
-IMAGE_DIRS ?= cmd/kelos-controller cmd/kelos-spawner cmd/kelos-worker-runner cmd/kelos-session-runtime cmd/kelos-session-server cmd/ghproxy cmd/kelos-webhook-server claude-code codex gemini opencode cursor cmd/kelos-slack-server
+IMAGE_DIRS ?= cmd/kelos-controller cmd/kelos-spawner cmd/kelos-worker-runner cmd/kelos-session-runtime cmd/kelos-console-server cmd/ghproxy cmd/kelos-webhook-server claude-code codex gemini opencode cursor cmd/kelos-slack-server
 LOCAL_ARCH ?= $(shell go env GOARCH)
 
 # Version injection – only set ldflags when an explicit version is given so
@@ -46,6 +46,7 @@ help: ## Display this help.
 
 .PHONY: test
 test: ## Run unit tests.
+	hack/retry-ghcr_test.sh
 	go test $(TEST_FLAGS) $$(go list ./... | grep -v /test/) --skip=E2E
 
 .PHONY: test-integration
@@ -61,6 +62,8 @@ update: controller-gen yamlfmt shfmt ## Run all generators and formatters.
 	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
 	hack/update-install-manifest.sh $(CONTROLLER_GEN)
 	hack/update-codegen.sh
+	npm --prefix internal/consoleserver/frontend ci --ignore-scripts
+	npm --prefix internal/consoleserver/frontend run build
 	go fmt ./...
 	go mod tidy
 	$(YAMLFMT) .
@@ -106,7 +109,7 @@ image: ## Build docker images (use WHAT, IMAGE_PLATFORMS, PUSH=true to customize
 		mv bin/kelos-codex-auth-refresh bin/kelos-codex-auth-refresh-linux-$$arch; \
 	done
 	@for dir in $(or $(WHAT),$(IMAGE_DIRS)); do \
-		docker buildx build --platform $(IMAGE_PLATFORMS) \
+		$(if $(filter true,$(PUSH)),hack/retry-ghcr.sh) docker buildx build --platform $(IMAGE_PLATFORMS) \
 			$(if $(filter true,$(PUSH)),--push,--load) \
 			-t $(REGISTRY)/$$(basename $$dir):$(VERSION) \
 			-f $$dir/Dockerfile .; \
@@ -118,7 +121,7 @@ SOURCE_VERSION ?= $(VERSION)
 manifest: ## Create and push multi-arch manifest from per-arch images (use WHAT, IMAGE_PLATFORMS, SOURCE_VERSION).
 	@for dir in $(or $(WHAT),$(IMAGE_DIRS)); do \
 		name=$$(basename $$dir); \
-		docker buildx imagetools create \
+		hack/retry-ghcr.sh docker buildx imagetools create \
 			-t $(REGISTRY)/$$name:$(VERSION) \
 			$(foreach arch,$(IMAGE_ARCHES),$(REGISTRY)/$$name:$(SOURCE_VERSION)-$(arch) ); \
 	done

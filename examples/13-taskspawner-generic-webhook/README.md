@@ -93,6 +93,24 @@ of:
 When `filters` is empty, every delivery triggers a Task. A filter whose
 `field` is missing in the payload fails (the delivery is skipped).
 
+### `excludeFilters`
+
+A list of conditions that reject a delivery when **any** of them matches
+(OR semantics). Entries have the same shape as `filters` — a `field`
+(JSONPath) and exactly one of `value` or `pattern`.
+
+`excludeFilters` are evaluated after `filters`, so a delivery triggers a
+Task only when it matches every entry in `filters` and no entry in
+`excludeFilters`. An exclude filter whose `field` is missing in the payload
+does not match, so it never excludes the delivery.
+
+This example drops staging events and events whose title starts with
+"test", even when they are `error`-level events on a matching platform.
+
+A malformed JSONPath expression in `filters` or `excludeFilters` is a
+configuration error: the spawner is skipped for that delivery and the error
+is logged, so a broken exclusion never quietly lets deliveries through.
+
 ## Template Variables
 
 Generic webhook TaskSpawners have access to:

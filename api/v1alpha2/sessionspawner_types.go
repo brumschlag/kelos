@@ -27,6 +27,8 @@ type SessionTemplate struct {
 // +kubebuilder:validation:XValidation:rule="!has(self.when.githubWebhook.reporting)",message="when.githubWebhook.reporting is not supported"
 // +kubebuilder:validation:XValidation:rule="has(self.sessionTemplate.worker.workspaceRef) && size(self.sessionTemplate.worker.workspaceRef.name) > 0",message="sessionTemplate.worker.workspaceRef.name is required"
 // +kubebuilder:validation:XValidation:rule="has(self.sessionTemplate.initialPrompt) && size(self.sessionTemplate.initialPrompt) > 0",message="sessionTemplate.initialPrompt is required"
+// +kubebuilder:validation:XValidation:rule="has(self.sessionTemplate.worker.credentials) || has(self.credentials)",message="sessionTemplate.worker.credentials or spec.credentials is required"
+// +kubebuilder:validation:XValidation:rule="!has(self.credentials) || !has(self.sessionTemplate.worker.credentials)",message="spec.credentials is mutually exclusive with sessionTemplate.worker.credentials"
 type SessionSpawnerSpec struct {
 	// When defines the GitHub webhook source and filters.
 	// +kubebuilder:validation:Required
@@ -37,6 +39,15 @@ type SessionSpawnerSpec struct {
 	// with the matching GitHub webhook context.
 	// +kubebuilder:validation:Required
 	SessionTemplate SessionTemplate `json:"sessionTemplate"`
+
+	// Credentials lists named credentials available to generated Sessions. The
+	// spawner selects one credential at random and copies it to the generated
+	// Session. Mutually exclusive with credentials configured in sessionTemplate.
+	// +optional
+	// +kubebuilder:validation:MinItems=1
+	// +listType=map
+	// +listMapKey=name
+	Credentials []SpawnerCredential `json:"credentials,omitempty"`
 }
 
 // SessionSpawnerStatus defines the observed state of a SessionSpawner.

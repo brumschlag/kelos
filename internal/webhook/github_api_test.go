@@ -90,35 +90,28 @@ func TestFetchGitHubPRBranchWithToken_EmptyToken(t *testing.T) {
 	}
 }
 
-func TestSetGitHubTokenResolver(t *testing.T) {
-	orig := githubTokenResolver
-	defer func() { githubTokenResolver = orig }()
-
-	SetGitHubTokenResolver(func(context.Context) (string, error) {
-		return "injected-token", nil
+func TestResolveGitHubToken(t *testing.T) {
+	t.Run("nil resolver returns empty token", func(t *testing.T) {
+		h := &WebhookHandler{}
+		token, err := h.resolveGitHubToken(context.Background())
+		if err != nil {
+			t.Fatalf("resolveGitHubToken() error = %v", err)
+		}
+		if token != "" {
+			t.Errorf("resolveGitHubToken() = %q, want empty", token)
+		}
 	})
 
-	token, err := githubTokenResolver(context.Background())
-	if err != nil {
-		t.Fatalf("resolver() error = %v", err)
-	}
-	if token != "injected-token" {
-		t.Errorf("resolver() = %q, want %q", token, "injected-token")
-	}
-}
-
-func TestFetchGitHubPRBranch_NilResolver(t *testing.T) {
-	orig := githubTokenResolver
-	defer func() { githubTokenResolver = orig }()
-
-	githubTokenResolver = nil
-	head, err := fetchGitHubPRBranch(context.Background(), "http://unused")
-	if err != nil {
-		t.Fatalf("fetchGitHubPRBranch() error = %v", err)
-	}
-	if head.Branch != "" {
-		t.Errorf("fetchGitHubPRBranch() Branch = %q, want empty for nil resolver", head.Branch)
-	}
+	t.Run("uses configured resolver", func(t *testing.T) {
+		h := &WebhookHandler{githubTokenResolver: func(context.Context) (string, error) { return "configured", nil }}
+		token, err := h.resolveGitHubToken(context.Background())
+		if err != nil {
+			t.Fatalf("resolveGitHubToken() error = %v", err)
+		}
+		if token != "configured" {
+			t.Errorf("resolveGitHubToken() = %q, want %q", token, "configured")
+		}
+	})
 }
 
 func TestEnrichGitHubIssueCommentBranch(t *testing.T) {
@@ -127,18 +120,22 @@ func TestEnrichGitHubIssueCommentBranch(t *testing.T) {
 	defer func() { githubPRBranchFetcher = orig }()
 
 	t.Run("enriches branch and SHA from API", func(t *testing.T) {
-		githubPRBranchFetcher = func(ctx context.Context, prAPIURL string) (githubPRHeadInfo, error) {
+		githubPRBranchFetcher = func(ctx context.Context, prAPIURL, token string) (githubPRHeadInfo, error) {
 			if prAPIURL != "https://api.github.com/repos/org/repo/pulls/42" {
 				t.Errorf("Unexpected prAPIURL: %s", prAPIURL)
+			}
+			if token != "per-gateway-token" {
+				t.Errorf("Expected per-gateway token, got %q", token)
 			}
 			return githubPRHeadInfo{Branch: "my-feature-branch", SHA: "abc123sha"}, nil
 		}
 
+		h := &WebhookHandler{githubTokenResolver: func(context.Context) (string, error) { return "per-gateway-token", nil }}
 		eventData := &GitHubEventData{
 			PullRequestAPIURL: "https://api.github.com/repos/org/repo/pulls/42",
 		}
 
-		enrichGitHubIssueCommentBranch(context.Background(), logr.Discard(), eventData)
+		h.enrichGitHubIssueCommentBranch(context.Background(), logr.Discard(), eventData)
 
 		if eventData.Branch != "my-feature-branch" {
 			t.Errorf("Expected Branch = %q, got %q", "my-feature-branch", eventData.Branch)
@@ -149,13 +146,14 @@ func TestEnrichGitHubIssueCommentBranch(t *testing.T) {
 	})
 
 	t.Run("no-op when PullRequestAPIURL is empty", func(t *testing.T) {
-		githubPRBranchFetcher = func(ctx context.Context, prAPIURL string) (githubPRHeadInfo, error) {
+		githubPRBranchFetcher = func(ctx context.Context, prAPIURL, token string) (githubPRHeadInfo, error) {
 			t.Error("Fetcher should not be called when PullRequestAPIURL is empty")
 			return githubPRHeadInfo{}, nil
 		}
 
+		h := &WebhookHandler{}
 		eventData := &GitHubEventData{}
-		enrichGitHubIssueCommentBranch(context.Background(), logr.Discard(), eventData)
+		h.enrichGitHubIssueCommentBranch(context.Background(), logr.Discard(), eventData)
 
 		if eventData.Branch != "" {
 			t.Errorf("Expected empty Branch, got %q", eventData.Branch)
@@ -166,15 +164,16 @@ func TestEnrichGitHubIssueCommentBranch(t *testing.T) {
 	})
 
 	t.Run("handles no credentials gracefully", func(t *testing.T) {
-		githubPRBranchFetcher = func(ctx context.Context, prAPIURL string) (githubPRHeadInfo, error) {
+		githubPRBranchFetcher = func(ctx context.Context, prAPIURL, token string) (githubPRHeadInfo, error) {
 			return githubPRHeadInfo{}, nil // simulates no credentials configured
 		}
 
+		h := &WebhookHandler{}
 		eventData := &GitHubEventData{
 			PullRequestAPIURL: "https://api.github.com/repos/org/repo/pulls/42",
 		}
 
-		enrichGitHubIssueCommentBranch(context.Background(), logr.Discard(), eventData)
+		h.enrichGitHubIssueCommentBranch(context.Background(), logr.Discard(), eventData)
 
 		if eventData.Branch != "" {
 			t.Errorf("Expected empty Branch when no credentials configured, got %q", eventData.Branch)

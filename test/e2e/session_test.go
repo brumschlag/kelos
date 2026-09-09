@@ -7,11 +7,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -28,10 +30,12 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 
 	kelos "github.com/kelos-dev/kelos/api/v1alpha2"
 	"github.com/kelos-dev/kelos/internal/sessionreset"
 	"github.com/kelos-dev/kelos/internal/sessionruntime"
+	"github.com/kelos-dev/kelos/internal/sessionsuspend"
 	"github.com/kelos-dev/kelos/internal/sessionupdate"
 	"github.com/kelos-dev/kelos/test/e2e/framework"
 )
@@ -134,8 +138,8 @@ var _ = Describe("Session remote control", func() {
 		runTerminalTurn(f.Namespace, sessionName, "terminal-one", ContainSubstring("agent › turn 1: terminal-one"))
 		runTerminalTurn(f.Namespace, sessionName, "terminal-two", ContainSubstring("agent › turn 2: terminal-two"))
 
-		By("authenticating to the shared Session web server")
-		baseURL := startSessionServerPortForward()
+		By("authenticating to the shared Console server")
+		baseURL := startConsoleServerPortForward()
 		unauthenticatedClient := &http.Client{Timeout: 30 * time.Second}
 		response, err := unauthenticatedClient.Get(baseURL + "/api/sessions")
 		Expect(err).NotTo(HaveOccurred())
@@ -177,6 +181,7 @@ var _ = Describe("Session remote control", func() {
 		})
 		Expect(input.Questions).To(HaveLen(1))
 		Expect(input.Questions[0].Question).To(Equal("Which database?"))
+		waitForSessionActivityReason(f, f.Namespace, sessionName, metav1.ConditionTrue, "WaitingForInput")
 		sendSessionRequest(connection, sessionruntime.ClientRequest{
 			Type:    "input",
 			InputID: input.InputID,
@@ -211,6 +216,15 @@ var _ = Describe("Session remote control", func() {
 			return event.Type == sessionruntime.EventAssistantDelta && event.Text == "turn 7: state written"
 		})
 		waitForTurnCompletion(connection, "completed")
+
+		By("uploading an attachment before Session Pod recovery")
+		attachmentData := []byte("web attachment persisted across recovery\n")
+		attachment := uploadSessionAttachment(webClient, baseURL, f.Namespace, sessionName, "web-attachment.txt", attachmentData)
+		Expect(attachment.ID).NotTo(BeEmpty())
+		Expect(attachment.Name).To(Equal("web-attachment.txt"))
+		Expect(attachment.MediaType).To(Equal("text/plain"))
+		Expect(attachment.SizeBytes).To(Equal(int64(len(attachmentData))))
+
 		sendSessionRequest(connection, sessionruntime.ClientRequest{Type: "message", Text: "block"})
 		waitForSessionEvent(connection, func(event sessionruntime.Event) bool {
 			return event.Type == sessionruntime.EventTurnStarted && event.TurnID == "turn-8"
@@ -241,9 +255,30 @@ var _ = Describe("Session remote control", func() {
 		}
 		Expect(seenRecovery).To(BeTrue())
 		Expect(seenInterruptedTurn).To(BeTrue())
+
+		By("submitting the persisted attachment through web chat")
+		status, headers, downloaded := downloadSessionAttachment(webClient, baseURL, f.Namespace, sessionName, attachment.ID)
+		Expect(status).To(Equal(http.StatusOK), "Session attachment download response: %s", downloaded)
+		Expect(headers.Get("Content-Type")).To(Equal("text/plain"))
+		Expect(headers.Get("Content-Disposition")).To(ContainSubstring(`filename=web-attachment.txt`))
+		Expect(downloaded).To(Equal(attachmentData))
+		sendSessionRequest(connection, sessionruntime.ClientRequest{
+			Type:          "message",
+			Text:          "attachment-check",
+			AttachmentIDs: []string{attachment.ID},
+		})
+		message := waitForSessionEvent(connection, func(event sessionruntime.Event) bool {
+			return event.Type == sessionruntime.EventUserMessage && event.Text == "attachment-check"
+		})
+		Expect(message.Attachments).To(Equal([]sessionruntime.Attachment{attachment}))
+		waitForSessionEvent(connection, func(event sessionruntime.Event) bool {
+			return event.Type == sessionruntime.EventAssistantDelta && event.Text == "attachment: web attachment persisted across recovery"
+		})
+		waitForTurnCompletion(connection, "completed")
+
 		sendSessionRequest(connection, sessionruntime.ClientRequest{Type: "message", Text: "read-state"})
 		waitForSessionEvent(connection, func(event sessionruntime.Event) bool {
-			return event.Type == sessionruntime.EventAssistantDelta && event.Text == "turn 9: state preserved"
+			return event.Type == sessionruntime.EventAssistantDelta && event.Text == "turn 10: state preserved"
 		})
 		waitForTurnCompletion(connection, "completed")
 
@@ -271,12 +306,18 @@ var _ = Describe("Session remote control", func() {
 
 		connection = connectSessionWebSocket(webClient, baseURL, f.Namespace, sessionName)
 		sendSessionRequest(connection, sessionruntime.ClientRequest{Type: "subscribe"})
-		waitForSessionEvent(connection, func(event sessionruntime.Event) bool {
-			return event.Type == sessionruntime.EventHistoryEnd
-		})
+		seenAttachment := false
+		for {
+			event := readSessionEvent(connection)
+			seenAttachment = seenAttachment || (event.Type == sessionruntime.EventUserMessage && len(event.Attachments) == 1 && event.Attachments[0] == attachment)
+			if event.Type == sessionruntime.EventHistoryEnd {
+				break
+			}
+		}
+		Expect(seenAttachment).To(BeTrue())
 		sendSessionRequest(connection, sessionruntime.ClientRequest{Type: "message", Text: "read-state"})
 		waitForSessionEvent(connection, func(event sessionruntime.Event) bool {
-			return event.Type == sessionruntime.EventAssistantDelta && event.Text == "turn 10: state preserved"
+			return event.Type == sessionruntime.EventAssistantDelta && event.Text == "turn 11: state preserved"
 		})
 		waitForTurnCompletion(connection, "completed")
 
@@ -309,6 +350,13 @@ var _ = Describe("Session remote control", func() {
 			return event.Type == sessionruntime.EventAssistantDelta && event.Text == "turn 1: state missing"
 		})
 		waitForTurnCompletion(connection, "completed")
+		status, _, _ = downloadSessionAttachment(webClient, baseURL, f.Namespace, sessionName, attachment.ID)
+		Expect(status).To(Equal(http.StatusNotFound))
+
+		By("submitting an attachment through the terminal client")
+		terminalAttachmentPath := filepath.Join(GinkgoT().TempDir(), "terminal-attachment.txt")
+		Expect(os.WriteFile(terminalAttachmentPath, []byte("terminal attachment contents\n"), 0o600)).To(Succeed())
+		runTerminalAttachmentTurn(f.Namespace, sessionName, terminalAttachmentPath, "attachment-check", ContainSubstring("agent › attachment: terminal attachment contents"))
 
 		By("deleting the Session and its StatefulSet-backed Pod")
 		Expect(f.KelosClientset.ApiV1alpha2().Sessions(f.Namespace).Delete(context.TODO(), sessionName, metav1.DeleteOptions{})).To(Succeed())
@@ -316,13 +364,19 @@ var _ = Describe("Session remote control", func() {
 		waitForPVCDeletion(f, f.Namespace, oldClaimName)
 	})
 
-	It("waits for active work before updating the Session runtime", func() {
+	It("waits for active work before applying mutable Session runtime configuration", func() {
 		token := os.Getenv(sessionWebTokenEnv)
 		if token == "" {
 			Skip(sessionWebTokenEnv + " not set")
 		}
 
-		const sessionName = "runtime-drain"
+		const (
+			sessionName          = "runtime-drain"
+			credentialSecretName = sessionName + "-credentials"
+			runtimeVersionLabel  = "app.kubernetes.io/version"
+			updatedModel         = "e2e-updated-model"
+			updatedVersion       = "e2e-updated-version"
+		)
 		configMapName := sessionName + "-provider"
 		mode := int32(0555)
 		_, err := f.Clientset.CoreV1().ConfigMaps(f.Namespace).Create(context.TODO(), &corev1.ConfigMap{
@@ -332,6 +386,14 @@ var _ = Describe("Session remote control", func() {
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() {
 			_ = f.Clientset.CoreV1().ConfigMaps(f.Namespace).Delete(context.TODO(), configMapName, metav1.DeleteOptions{})
+		})
+		_, err = f.Clientset.CoreV1().Secrets(f.Namespace).Create(context.TODO(), &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: credentialSecretName, Namespace: f.Namespace},
+			StringData: map[string]string{"ANTHROPIC_API_KEY": "e2e-api-key"},
+		}, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() {
+			_ = f.Clientset.CoreV1().Secrets(f.Namespace).Delete(context.TODO(), credentialSecretName, metav1.DeleteOptions{})
 		})
 
 		createSession(f, &kelos.Session{
@@ -379,10 +441,12 @@ var _ = Describe("Session remote control", func() {
 		originalRuntimeImage := sessionRuntimeImage(statefulSet)
 		Expect(originalRuntimeImage).NotTo(BeEmpty())
 		Expect(statefulSet.Status.UpdateRevision).NotTo(BeEmpty())
+		originalRevision := statefulSet.Status.UpdateRevision
+		Expect(pod.Labels).To(HaveKeyWithValue(appsv1.StatefulSetRevisionLabel, originalRevision))
 		Expect(statefulSet.Spec.UpdateStrategy.Type).To(Equal(appsv1.OnDeleteStatefulSetStrategyType))
 		Expect(statefulSet.Spec.UpdateStrategy.RollingUpdate).To(BeNil())
 
-		baseURL := startSessionServerPortForward()
+		baseURL := startConsoleServerPortForward()
 		connection := connectSessionWebSocket(loginSessionWeb(baseURL, token), baseURL, f.Namespace, sessionName)
 		DeferCleanup(func() { _ = connection.Close() })
 		sendSessionRequest(connection, sessionruntime.ClientRequest{Type: "subscribe"})
@@ -397,30 +461,33 @@ var _ = Describe("Session remote control", func() {
 		})
 		Expect(input.Questions).To(HaveLen(1))
 
-		By("making the current Pod runtime stale")
-		const staleRuntimeImage = "example.invalid/kelos-session-runtime:stale"
-		const staleRuntimeRevision = "stale-runtime-revision"
+		By("updating the Session credentials, model, and Pod overrides")
 		Eventually(func() error {
-			currentPod, getErr := f.Clientset.CoreV1().Pods(f.Namespace).Get(context.TODO(), pod.Name, metav1.GetOptions{})
+			currentSession, getErr := f.KelosClientset.ApiV1alpha2().Sessions(f.Namespace).Get(context.TODO(), sessionName, metav1.GetOptions{})
 			if getErr != nil {
 				return getErr
 			}
-			if currentPod.UID != podUID {
-				return fmt.Errorf("Session Pod was replaced before runtime drift: got UID %s, want %s", currentPod.UID, podUID)
+			currentSession.Spec.Worker.Credentials = &kelos.Credentials{
+				Type:      kelos.CredentialTypeAPIKey,
+				SecretRef: &kelos.SecretReference{Name: credentialSecretName},
 			}
-			if !setPodSessionRuntimeImage(currentPod, staleRuntimeImage) {
-				return fmt.Errorf("Pod %s has no Session runtime init container", currentPod.Name)
+			currentSession.Spec.Worker.Model = updatedModel
+			if currentSession.Spec.Worker.PodOverrides.Labels == nil {
+				currentSession.Spec.Worker.PodOverrides.Labels = map[string]string{}
 			}
-			if currentPod.Labels == nil {
-				currentPod.Labels = map[string]string{}
-			}
-			currentPod.Labels[appsv1.StatefulSetRevisionLabel] = staleRuntimeRevision
-			_, updateErr := f.Clientset.CoreV1().Pods(f.Namespace).Update(context.TODO(), currentPod, metav1.UpdateOptions{})
+			currentSession.Spec.Worker.PodOverrides.Labels[runtimeVersionLabel] = updatedVersion
+			_, updateErr := f.KelosClientset.ApiV1alpha2().Sessions(f.Namespace).Update(context.TODO(), currentSession, metav1.UpdateOptions{})
 			return updateErr
 		}, time.Minute, time.Second).Should(Succeed())
 
-		By("observing the runtime drain while the desired StatefulSet and current Pod stay in place")
+		By("observing the runtime drain while the current Pod stays in place")
 		Eventually(func(g Gomega) {
+			currentStatefulSet, getErr := f.Clientset.AppsV1().StatefulSets(f.Namespace).Get(context.TODO(), statefulSet.Name, metav1.GetOptions{})
+			g.Expect(getErr).NotTo(HaveOccurred())
+			g.Expect(currentStatefulSet.Status.ObservedGeneration).To(Equal(currentStatefulSet.Generation))
+			g.Expect(currentStatefulSet.Status.UpdateRevision).NotTo(Equal(originalRevision))
+			g.Expect(currentStatefulSet.Labels).To(HaveKeyWithValue(runtimeVersionLabel, updatedVersion))
+			g.Expect(currentStatefulSet.Spec.Template.Labels).To(HaveKeyWithValue(runtimeVersionLabel, updatedVersion))
 			session, getErr := f.KelosClientset.ApiV1alpha2().Sessions(f.Namespace).Get(context.TODO(), sessionName, metav1.GetOptions{})
 			g.Expect(getErr).NotTo(HaveOccurred())
 			report, decodeErr := sessionupdate.DecodeReport(session.Annotations[sessionupdate.ReportAnnotation])
@@ -440,9 +507,12 @@ var _ = Describe("Session remote control", func() {
 			session, getErr := f.KelosClientset.ApiV1alpha2().Sessions(f.Namespace).Get(context.TODO(), sessionName, metav1.GetOptions{})
 			return getErr == nil &&
 				sessionRuntimeImage(currentStatefulSet) == originalRuntimeImage &&
+				currentStatefulSet.Labels[runtimeVersionLabel] == updatedVersion &&
+				currentStatefulSet.Spec.Template.Labels[runtimeVersionLabel] == updatedVersion &&
 				currentStatefulSet.Spec.UpdateStrategy.Type == appsv1.OnDeleteStatefulSetStrategyType &&
-				currentPod.UID == podUID && podSessionRuntimeImage(currentPod) == staleRuntimeImage &&
-				currentPod.Labels[appsv1.StatefulSetRevisionLabel] == staleRuntimeRevision &&
+				currentPod.UID == podUID && podSessionRuntimeImage(currentPod) == originalRuntimeImage &&
+				currentPod.Labels[appsv1.StatefulSetRevisionLabel] == originalRevision &&
+				currentPod.Labels[runtimeVersionLabel] == "" &&
 				session.Status.PodUID == podUID
 		}, 5*time.Second, 200*time.Millisecond).Should(BeTrue())
 
@@ -465,7 +535,19 @@ var _ = Describe("Session remote control", func() {
 			g.Expect(getErr).NotTo(HaveOccurred())
 			g.Expect(currentPod.UID).To(Equal(session.Status.PodUID))
 			g.Expect(podSessionRuntimeImage(currentPod)).To(Equal(originalRuntimeImage))
+			g.Expect(currentPod.Labels).To(HaveKeyWithValue(runtimeVersionLabel, updatedVersion))
 			g.Expect(currentPod.Labels).To(HaveKeyWithValue(appsv1.StatefulSetRevisionLabel, currentStatefulSet.Status.UpdateRevision))
+			agentContainer := containerByName(currentPod.Spec.Containers, kelos.AgentContainerName)
+			g.Expect(agentContainer).NotTo(BeNil())
+			modelEnv, found := envVarByName(agentContainer.Env, "KELOS_MODEL")
+			g.Expect(found).To(BeTrue())
+			g.Expect(modelEnv.Value).To(Equal(updatedModel))
+			credentialEnv, found := envVarByName(agentContainer.Env, "ANTHROPIC_API_KEY")
+			g.Expect(found).To(BeTrue())
+			g.Expect(credentialEnv.ValueFrom).NotTo(BeNil())
+			g.Expect(credentialEnv.ValueFrom.SecretKeyRef).NotTo(BeNil())
+			g.Expect(credentialEnv.ValueFrom.SecretKeyRef.Name).To(Equal(credentialSecretName))
+			g.Expect(credentialEnv.ValueFrom.SecretKeyRef.Key).To(Equal("ANTHROPIC_API_KEY"))
 			g.Expect(session.Annotations).NotTo(HaveKey(sessionupdate.RequestAnnotation))
 			g.Expect(session.Annotations).NotTo(HaveKey(sessionupdate.ReportAnnotation))
 			g.Expect(session.Annotations).NotTo(HaveKey(sessionupdate.ForceUpdateAnnotation))
@@ -491,7 +573,7 @@ var _ = Describe("Session remote control", func() {
 			_ = f.KelosClientset.ApiV1alpha2().Workspaces(f.Namespace).Delete(context.TODO(), workspaceName, metav1.DeleteOptions{})
 		})
 
-		baseURL := startSessionServerPortForward()
+		baseURL := startConsoleServerPortForward()
 		webClient := loginSessionWeb(baseURL, token)
 		initialBranch := "feature/web-options"
 		initialPrompt := "Investigate issue #42 interactively\nand summarize the next steps."
@@ -609,6 +691,11 @@ var _ = Describe("Session remote control", func() {
 		pullRequest := &kelos.SessionPullRequest{
 			URL:   "https://github.com/kelos-dev/kelos/pull/42",
 			State: kelos.SessionPullRequestStateOpen,
+			Checks: &kelos.SessionPullRequestChecks{
+				State:     kelos.SessionPullRequestChecksStatePending,
+				Completed: 2,
+				Total:     3,
+			},
 		}
 		sessionName := "workspace-status"
 		configMapName := sessionName + "-provider"
@@ -672,6 +759,179 @@ var _ = Describe("Session remote control", func() {
 		runTerminalTurn(f.Namespace, sessionName, "remove-git-workspace", ContainSubstring("agent › turn 2: git workspace removed"))
 		waitForSessionWorkspaceStatus(f, f.Namespace, sessionName, "", nil)
 	})
+
+	It("reaps an idle Session and its workspace after the idle delete policy elapses", func() {
+		const sessionName = "idle-reap"
+		const idleTTL = 30 * time.Second
+		configMapName := sessionName + "-provider"
+		mode := int32(0555)
+		_, err := f.Clientset.CoreV1().ConfigMaps(f.Namespace).Create(context.TODO(), &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: configMapName, Namespace: f.Namespace},
+			Data:       map[string]string{"claude": fakeClaude},
+		}, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() {
+			_ = f.Clientset.CoreV1().ConfigMaps(f.Namespace).Delete(context.TODO(), configMapName, metav1.DeleteOptions{})
+		})
+
+		createSession(f, &kelos.Session{
+			ObjectMeta: metav1.ObjectMeta{Name: sessionName},
+			Spec: kelos.SessionSpec{
+				Worker:              fakeProviderWorker(configMapName, mode),
+				IdlePolicy:          &kelos.SessionIdlePolicy{DeleteAfterSeconds: ptr.To(int32(idleTTL / time.Second))},
+				VolumeClaimTemplate: sessionTestVolumeClaimTemplate(),
+			},
+		})
+		DeferCleanup(func() {
+			_ = f.KelosClientset.ApiV1alpha2().Sessions(f.Namespace).Delete(context.TODO(), sessionName, metav1.DeleteOptions{})
+		})
+		DeferCleanup(func() {
+			if CurrentSpecReport().Failed() {
+				collectSessionDebugInfo(f, f.Namespace, sessionName)
+			}
+		})
+
+		current := waitForSessionPhase(f, f.Namespace, sessionName, kelos.SessionPhaseReady)
+		Expect(current.Status.PodUID).NotTo(BeEmpty())
+		pod, err := f.Clientset.CoreV1().Pods(f.Namespace).Get(context.TODO(), current.Status.PodName, metav1.GetOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		claimName := sessionWorkspaceClaimName(pod)
+		Expect(claimName).NotTo(BeEmpty())
+
+		By("waiting for the runtime to report the Session idle")
+		waitForSessionActivity(f, f.Namespace, sessionName, metav1.ConditionFalse)
+
+		By("reaping the Session once it has been idle for the policy duration")
+		waitForSessionDeletion(f, f.Namespace, sessionName)
+		waitForPodDeletion(f, f.Namespace, current.Status.PodName)
+		waitForPVCDeletion(f, f.Namespace, claimName)
+	})
+
+	It("suspends and resumes a Session after the idle suspend policy elapses", func() {
+		const sessionName = "idle-suspend"
+		const idleTTL = 30 * time.Second
+		configMapName := sessionName + "-provider"
+		mode := int32(0555)
+		_, err := f.Clientset.CoreV1().ConfigMaps(f.Namespace).Create(context.TODO(), &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: configMapName, Namespace: f.Namespace},
+			Data:       map[string]string{"claude": fakeClaude},
+		}, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() {
+			_ = f.Clientset.CoreV1().ConfigMaps(f.Namespace).Delete(context.TODO(), configMapName, metav1.DeleteOptions{})
+		})
+
+		createSession(f, &kelos.Session{
+			ObjectMeta: metav1.ObjectMeta{Name: sessionName},
+			Spec: kelos.SessionSpec{
+				Worker:              fakeProviderWorker(configMapName, mode),
+				IdlePolicy:          &kelos.SessionIdlePolicy{SuspendAfterSeconds: ptr.To(int32(idleTTL / time.Second))},
+				VolumeClaimTemplate: sessionTestVolumeClaimTemplate(),
+			},
+		})
+		DeferCleanup(func() {
+			_ = f.KelosClientset.ApiV1alpha2().Sessions(f.Namespace).Delete(context.TODO(), sessionName, metav1.DeleteOptions{})
+		})
+		DeferCleanup(func() {
+			if CurrentSpecReport().Failed() {
+				collectSessionDebugInfo(f, f.Namespace, sessionName)
+			}
+		})
+
+		ready := waitForSessionPhase(f, f.Namespace, sessionName, kelos.SessionPhaseReady)
+		pod, err := f.Clientset.CoreV1().Pods(f.Namespace).Get(context.TODO(), ready.Status.PodName, metav1.GetOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		claimName := sessionWorkspaceClaimName(pod)
+		Expect(claimName).NotTo(BeEmpty())
+		waitForSessionActivity(f, f.Namespace, sessionName, metav1.ConditionFalse)
+
+		suspended := waitForSessionPhase(f, f.Namespace, sessionName, kelos.SessionPhaseSuspended)
+		Expect(ptr.Deref(suspended.Spec.Suspend, false)).To(BeFalse())
+		readyCondition := apiMeta.FindStatusCondition(suspended.Status.Conditions, kelos.SessionConditionReady)
+		Expect(readyCondition).NotTo(BeNil())
+		Expect(readyCondition.Reason).To(Equal(sessionsuspend.IdlePolicyReason))
+		waitForPodDeletion(f, f.Namespace, ready.Status.PodName)
+		_, err = f.Clientset.CoreV1().PersistentVolumeClaims(f.Namespace).Get(context.TODO(), claimName, metav1.GetOptions{})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("resuming the idle-suspended Session from a terminal connection")
+		runTerminalTurn(f.Namespace, sessionName, "after-idle-resume", ContainSubstring("agent › turn 1: after-idle-resume"))
+		_, err = f.Clientset.CoreV1().PersistentVolumeClaims(f.Namespace).Get(context.TODO(), claimName, metav1.GetOptions{})
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("does not reap an idle-policy Session while a turn is active", func() {
+		token := os.Getenv(sessionWebTokenEnv)
+		if token == "" {
+			Skip(sessionWebTokenEnv + " not set")
+		}
+
+		const sessionName = "idle-active"
+		// A generous idle TTL relative to the time it takes to open a connection and
+		// start a turn, so the Session only becomes eligible for reaping once it is
+		// idle again — not during connection setup.
+		const idleTTL = 30 * time.Second
+		configMapName := sessionName + "-provider"
+		mode := int32(0555)
+		_, err := f.Clientset.CoreV1().ConfigMaps(f.Namespace).Create(context.TODO(), &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: configMapName, Namespace: f.Namespace},
+			Data:       map[string]string{"claude": fakeClaude},
+		}, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() {
+			_ = f.Clientset.CoreV1().ConfigMaps(f.Namespace).Delete(context.TODO(), configMapName, metav1.DeleteOptions{})
+		})
+
+		createSession(f, &kelos.Session{
+			ObjectMeta: metav1.ObjectMeta{Name: sessionName},
+			Spec: kelos.SessionSpec{
+				Worker:     fakeProviderWorker(configMapName, mode),
+				IdlePolicy: &kelos.SessionIdlePolicy{DeleteAfterSeconds: ptr.To(int32(idleTTL / time.Second))},
+			},
+		})
+		DeferCleanup(func() {
+			_ = f.KelosClientset.ApiV1alpha2().Sessions(f.Namespace).Delete(context.TODO(), sessionName, metav1.DeleteOptions{})
+		})
+		DeferCleanup(func() {
+			if CurrentSpecReport().Failed() {
+				collectSessionDebugInfo(f, f.Namespace, sessionName)
+			}
+		})
+
+		waitForSessionPhase(f, f.Namespace, sessionName, kelos.SessionPhaseReady)
+
+		By("holding a turn open at a user-input request")
+		baseURL := startConsoleServerPortForward()
+		connection := connectSessionWebSocket(loginSessionWeb(baseURL, token), baseURL, f.Namespace, sessionName)
+		DeferCleanup(func() { _ = connection.Close() })
+		sendSessionRequest(connection, sessionruntime.ClientRequest{Type: "subscribe"})
+		waitForSessionEvent(connection, func(event sessionruntime.Event) bool {
+			return event.Type == sessionruntime.EventHistoryEnd
+		})
+		sendSessionRequest(connection, sessionruntime.ClientRequest{Type: "message", Text: "question"})
+		input := waitForSessionEvent(connection, func(event sessionruntime.Event) bool {
+			return event.Type == sessionruntime.EventInputRequested
+		})
+		Expect(input.Questions).To(HaveLen(1))
+		waitForSessionActivity(f, f.Namespace, sessionName, metav1.ConditionTrue)
+
+		By("keeping the active Session alive well past its idle delete policy")
+		Consistently(func() error {
+			_, err := f.KelosClientset.ApiV1alpha2().Sessions(f.Namespace).Get(context.TODO(), sessionName, metav1.GetOptions{})
+			return err
+		}, idleTTL+15*time.Second, time.Second).Should(Succeed(), "active Session %s/%s was reaped despite an in-flight turn", f.Namespace, sessionName)
+
+		By("reaping the Session after the held turn completes and it goes idle")
+		sendSessionRequest(connection, sessionruntime.ClientRequest{
+			Type:    "input",
+			InputID: input.InputID,
+			Answers: map[string][]string{input.Questions[0].ID: {"PostgreSQL"}},
+		})
+		waitForTurnCompletion(connection, "completed")
+		_ = connection.Close()
+		waitForSessionActivity(f, f.Namespace, sessionName, metav1.ConditionFalse)
+		waitForSessionDeletion(f, f.Namespace, sessionName)
+	})
 })
 
 func describeSessionProviderTests(cfg agentTestConfig) {
@@ -694,6 +954,7 @@ func describeSessionProviderTests(cfg agentTestConfig) {
 				}},
 			})
 			current := waitForSessionPhase(f, f.Namespace, "provider-session", kelos.SessionPhaseReady)
+			waitForSessionModel(f, f.Namespace, "provider-session", cfg.Model)
 			runTerminalTurn(
 				f.Namespace,
 				"provider-session",
@@ -773,6 +1034,34 @@ func updateSessionSuspend(f *framework.Framework, namespace, name string, suspen
 	}, time.Minute, time.Second).Should(Succeed(), "Session %s/%s suspended state did not update to %t", namespace, name, suspend)
 }
 
+// fakeProviderWorker builds a WorkerSpec that runs the embedded fake provider
+// mounted from the given ConfigMap, matching the credentials-free setup the other
+// Session specs use.
+func fakeProviderWorker(configMapName string, mode int32) kelos.WorkerSpec {
+	return kelos.WorkerSpec{
+		Type:        "claude-code",
+		Credentials: &kelos.Credentials{Type: kelos.CredentialTypeNone},
+		PodOverrides: &kelos.PodOverrides{
+			Env: []corev1.EnvVar{{
+				Name:  "PATH",
+				Value: "/workspace/fake-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+			}},
+			Volumes: []corev1.Volume{{
+				Name: "fake-provider",
+				VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: configMapName},
+					DefaultMode:          &mode,
+				}},
+			}},
+			VolumeMounts: []corev1.VolumeMount{{
+				Name:      "fake-provider",
+				MountPath: "/workspace/fake-bin",
+				ReadOnly:  true,
+			}},
+		},
+	}
+}
+
 func sessionTestVolumeClaimTemplate() *corev1.PersistentVolumeClaimSpec {
 	return &corev1.PersistentVolumeClaimSpec{
 		AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
@@ -793,6 +1082,13 @@ func waitForSessionPhase(f *framework.Framework, namespace, name string, phase k
 	session, err := f.KelosClientset.ApiV1alpha2().Sessions(namespace).Get(context.TODO(), name, metav1.GetOptions{})
 	Expect(err).NotTo(HaveOccurred())
 	return session
+}
+
+func waitForSessionDeletion(f *framework.Framework, namespace, name string) {
+	Eventually(func() bool {
+		_, err := f.KelosClientset.ApiV1alpha2().Sessions(namespace).Get(context.TODO(), name, metav1.GetOptions{})
+		return apierrors.IsNotFound(err)
+	}, 3*time.Minute, time.Second).Should(BeTrue(), "Session %s/%s was not reaped for idleness", namespace, name)
 }
 
 func waitForSessionWorkspaceStatus(f *framework.Framework, namespace, name, branch string, pullRequest *kelos.SessionPullRequest) {
@@ -816,6 +1112,27 @@ func waitForSessionActivity(f *framework.Framework, namespace, name string, stat
 		}
 		return condition.Status
 	}, time.Minute, time.Second).Should(Equal(status), "Session %s/%s runtime did not report Active=%s", namespace, name, status)
+}
+
+func waitForSessionActivityReason(f *framework.Framework, namespace, name string, status metav1.ConditionStatus, reason string) {
+	Eventually(func(g Gomega) {
+		session, err := f.KelosClientset.ApiV1alpha2().Sessions(namespace).Get(context.TODO(), name, metav1.GetOptions{})
+		g.Expect(err).NotTo(HaveOccurred())
+		condition := apiMeta.FindStatusCondition(session.Status.Conditions, kelos.SessionConditionActive)
+		g.Expect(condition).NotTo(BeNil())
+		g.Expect(condition.Status).To(Equal(status))
+		g.Expect(condition.Reason).To(Equal(reason))
+	}, time.Minute, time.Second).Should(Succeed(), "Session %s/%s runtime did not report Active=%s with reason %s", namespace, name, status, reason)
+}
+
+func waitForSessionModel(f *framework.Framework, namespace, name, model string) {
+	Eventually(func() string {
+		session, err := f.KelosClientset.ApiV1alpha2().Sessions(namespace).Get(context.TODO(), name, metav1.GetOptions{})
+		if err != nil {
+			return ""
+		}
+		return session.Status.Model
+	}, time.Minute, time.Second).Should(Equal(model), "Session %s/%s runtime did not report model %s", namespace, name, model)
 }
 
 func waitForSessionPodReplacement(f *framework.Framework, namespace, name string, oldUID types.UID) *kelos.Session {
@@ -860,15 +1177,13 @@ func podSessionRuntimeImage(pod *corev1.Pod) string {
 	return ""
 }
 
-func setPodSessionRuntimeImage(pod *corev1.Pod, image string) bool {
-	for i := range pod.Spec.InitContainers {
-		container := &pod.Spec.InitContainers[i]
-		if container.Name == "kelos-session-runtime" {
-			container.Image = image
-			return true
+func containerByName(containers []corev1.Container, name string) *corev1.Container {
+	for i := range containers {
+		if containers[i].Name == name {
+			return &containers[i]
 		}
 	}
-	return false
+	return nil
 }
 
 func waitForPodDeletion(f *framework.Framework, namespace, name string) {
@@ -947,9 +1262,32 @@ func runTerminalTurn(namespace, name, prompt string, outputMatcher gomegatypes.G
 	Expect(command.Wait()).To(Succeed(), "terminal output:\n%s", output.String())
 }
 
-func startSessionServerPortForward() string {
+func runTerminalAttachmentTurn(namespace, name, path, prompt string, outputMatcher gomegatypes.GomegaMatcher) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	command := exec.CommandContext(ctx, framework.KelosBin(), "session", "connect", name, "-n", namespace)
+	output := &lockedBuffer{}
+	command.Stdout = io.MultiWriter(GinkgoWriter, output)
+	command.Stderr = GinkgoWriter
+	stdin, err := command.StdinPipe()
+	Expect(err).NotTo(HaveOccurred())
+	Expect(command.Start()).To(Succeed())
+	Eventually(output.String, 30*time.Second, 100*time.Millisecond).Should(ContainSubstring("Connected. Type a message"))
+	_, err = io.WriteString(stdin, "/attach "+path+"\n")
+	Expect(err).NotTo(HaveOccurred())
+	Eventually(output.String, 3*time.Minute, 200*time.Millisecond).Should(ContainSubstring("Attached " + filepath.Base(path)))
+	_, err = io.WriteString(stdin, prompt+"\n")
+	Expect(err).NotTo(HaveOccurred())
+	Eventually(output.String, 3*time.Minute, 200*time.Millisecond).Should(outputMatcher)
+	_, err = io.WriteString(stdin, "/quit\n")
+	Expect(err).NotTo(HaveOccurred())
+	Expect(stdin.Close()).To(Succeed())
+	Expect(command.Wait()).To(Succeed(), "terminal output:\n%s", output.String())
+}
+
+func startConsoleServerPortForward() string {
 	ctx, cancel := context.WithCancel(context.Background())
-	command := exec.CommandContext(ctx, "kubectl", "--namespace", "kelos-system", "port-forward", "--address", "127.0.0.1", "service/kelos-session-server", ":80")
+	command := exec.CommandContext(ctx, "kubectl", "--namespace", "kelos-system", "port-forward", "--address", "127.0.0.1", "service/kelos-console-server", ":80")
 	output := &lockedBuffer{}
 	command.Stdout = io.MultiWriter(GinkgoWriter, output)
 	command.Stderr = io.MultiWriter(GinkgoWriter, output)
@@ -1015,6 +1353,40 @@ func resetSessionThroughWeb(client *http.Client, baseURL, namespace, name string
 	}
 	Expect(json.Unmarshal(body, &summary)).To(Succeed())
 	Expect(summary.Resetting).To(BeTrue())
+}
+
+func uploadSessionAttachment(client *http.Client, baseURL, namespace, name, filename string, data []byte) sessionruntime.Attachment {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", filename)
+	Expect(err).NotTo(HaveOccurred())
+	_, err = part.Write(data)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(writer.Close()).To(Succeed())
+
+	endpoint := fmt.Sprintf("%s/api/sessions/%s/%s/attachments", baseURL, url.PathEscape(namespace), url.PathEscape(name))
+	request, err := http.NewRequest(http.MethodPost, endpoint, &body)
+	Expect(err).NotTo(HaveOccurred())
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	response, err := client.Do(request)
+	Expect(err).NotTo(HaveOccurred())
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(response.Body)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(response.StatusCode).To(Equal(http.StatusCreated), "Session attachment upload response: %s", responseBody)
+	var attachment sessionruntime.Attachment
+	Expect(json.Unmarshal(responseBody, &attachment)).To(Succeed())
+	return attachment
+}
+
+func downloadSessionAttachment(client *http.Client, baseURL, namespace, name, id string) (int, http.Header, []byte) {
+	endpoint := fmt.Sprintf("%s/api/sessions/%s/%s/attachments/%s", baseURL, url.PathEscape(namespace), url.PathEscape(name), url.PathEscape(id))
+	response, err := client.Get(endpoint)
+	Expect(err).NotTo(HaveOccurred())
+	defer response.Body.Close()
+	data, err := io.ReadAll(response.Body)
+	Expect(err).NotTo(HaveOccurred())
+	return response.StatusCode, response.Header.Clone(), data
 }
 
 func listWebSessions(client *http.Client, baseURL, namespace string) []string {

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -65,6 +64,21 @@ type WebhookHandler struct {
 	secret           []byte
 	deliveryCache    *DeliveryCache
 	githubAPIBaseURL string
+
+	githubTokenResolver func(context.Context) (string, error)
+
+	// gatewayName is the WebhookGateway this handler serves (gateway mode only).
+	// When set, created Tasks are stamped with it so the reporting reconciler can
+	// resolve per-gateway GitHub credentials and API base URL. Empty in --source
+	// mode.
+	gatewayName string
+}
+
+// WebhookHandlerOptions contains source-specific webhook server configuration.
+type WebhookHandlerOptions struct {
+	Secret              []byte
+	GitHubAPIBaseURL    string
+	GitHubTokenResolver func(context.Context) (string, error)
 }
 
 // DeliveryCache tracks processed webhook deliveries for idempotency.
@@ -129,15 +143,10 @@ func (d *DeliveryCache) cleanup() {
 	}
 }
 
-// NewWebhookHandler creates a new webhook handler for the specified source.
-// GenericSource is currently unauthenticated, so WEBHOOK_SECRET is not required.
-func NewWebhookHandler(ctx context.Context, client client.Client, source WebhookSource, log logr.Logger) (*WebhookHandler, error) {
-	var secret []byte
-	if source != GenericSource {
-		secret = []byte(os.Getenv("WEBHOOK_SECRET"))
-		if len(secret) == 0 {
-			return nil, fmt.Errorf("WEBHOOK_SECRET environment variable is required")
-		}
+// NewWebhookHandler creates a webhook handler for one source.
+func NewWebhookHandler(ctx context.Context, client client.Client, source WebhookSource, options WebhookHandlerOptions, log logr.Logger) (*WebhookHandler, error) {
+	if source != GenericSource && len(options.Secret) == 0 {
+		return nil, fmt.Errorf("webhook secret is required for %s", source)
 	}
 
 	taskBuilder, err := taskbuilder.NewTaskBuilder(client)
@@ -146,13 +155,14 @@ func NewWebhookHandler(ctx context.Context, client client.Client, source Webhook
 	}
 
 	return &WebhookHandler{
-		client:           client,
-		source:           source,
-		log:              log,
-		taskBuilder:      taskBuilder,
-		secret:           secret,
-		deliveryCache:    NewDeliveryCache(ctx),
-		githubAPIBaseURL: os.Getenv("GITHUB_API_BASE_URL"),
+		client:              client,
+		source:              source,
+		log:                 log,
+		taskBuilder:         taskBuilder,
+		secret:              options.Secret,
+		deliveryCache:       NewDeliveryCache(ctx),
+		githubAPIBaseURL:    options.GitHubAPIBaseURL,
+		githubTokenResolver: options.GitHubTokenResolver,
 	}, nil
 }
 
@@ -196,8 +206,7 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		signature = r.Header.Get(GitHubSignatureHeader)
 		deliveryID = r.Header.Get(GitHubDeliveryHeader)
 		if deliveryID == "" {
-			sum := sha256.Sum256(body)
-			deliveryID = "github-" + hex.EncodeToString(sum[:])
+			deliveryID = githubDeliveryID(body)
 		}
 
 		log.Info("Processing GitHub webhook", "eventType", eventType, "deliveryID", deliveryID, "payloadSize", len(body))
@@ -264,7 +273,7 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Process the webhook. For generic sources, pass pre-fetched spawners
 	// to avoid a redundant List call.
-	_, err = h.processWebhook(ctx, eventType, body, deliveryID, genericSpawners)
+	_, err = h.processWebhook(ctx, eventType, body, deliveryID, genericSpawners, nil)
 	if err != nil {
 		if deliveryID != "" {
 			h.deliveryCache.Forget(deliveryID)
@@ -288,10 +297,15 @@ func linearDeliveryID(body []byte) string {
 	return "linear-" + hex.EncodeToString(sum[:])
 }
 
-// processWebhook processes a validated webhook payload. When prefetchedSpawners
-// is non-nil (generic source), it is used directly instead of listing spawners
-// again, avoiding a redundant API call.
-func (h *WebhookHandler) processWebhook(ctx context.Context, eventType string, payload []byte, deliveryID string, prefetchedSpawners []*kelos.TaskSpawner) (bool, error) {
+func githubDeliveryID(body []byte) string {
+	sum := sha256.Sum256(body)
+	return "github-" + hex.EncodeToString(sum[:])
+}
+
+// processWebhook processes a validated payload with optional
+// pre-scoped TaskSpawners and SessionSpawners. A non-nil slice, including an
+// empty one, prevents a cluster-wide list for that resource type.
+func (h *WebhookHandler) processWebhook(ctx context.Context, eventType string, payload []byte, deliveryID string, prefetchedSpawners []*kelos.TaskSpawner, prefetchedSessionSpawners []*kelos.SessionSpawner) (bool, error) {
 	log := h.log.WithValues("eventType", eventType, "deliveryID", deliveryID)
 
 	// Parse the webhook payload once up front and reuse across matching and task creation.
@@ -359,10 +373,14 @@ func (h *WebhookHandler) processWebhook(ctx context.Context, eventType string, p
 	}
 	var sessionSpawners []*kelos.SessionSpawner
 	if h.source == GitHubSource {
-		var err error
-		sessionSpawners, err = h.getMatchingSessionSpawners(ctx)
-		if err != nil {
-			return false, fmt.Errorf("failed to get matching SessionSpawners: %w", err)
+		if prefetchedSessionSpawners != nil {
+			sessionSpawners = prefetchedSessionSpawners
+		} else {
+			var err error
+			sessionSpawners, err = h.getMatchingSessionSpawners(ctx)
+			if err != nil {
+				return false, fmt.Errorf("failed to get matching SessionSpawners: %w", err)
+			}
 		}
 	}
 
@@ -377,7 +395,7 @@ func (h *WebhookHandler) processWebhook(ctx context.Context, eventType string, p
 	// requests. The GitHub issue_comment payload does not include the PR's
 	// head ref, so we fetch it from the API once per delivery.
 	if parsed.GitHub != nil && needsBranchEnrichment(parsed.GitHub) {
-		enrichGitHubIssueCommentBranch(ctx, log, parsed.GitHub)
+		h.enrichGitHubIssueCommentBranch(ctx, log, parsed.GitHub)
 	}
 
 	tasksCreated := 0
@@ -477,17 +495,20 @@ func (h *WebhookHandler) getMatchingSpawners(ctx context.Context) ([]*kelos.Task
 	for i := range spawnerList.Items {
 		spawner := &spawnerList.Items[i]
 
+		// Skip spawners bound to a WebhookGateway: those are served (and
+		// authenticated) by the gateway path, so the per-source server
+		// must not also match them, or the Task would be created twice.
 		switch h.source {
 		case GitHubSource:
-			if spawner.Spec.When.GitHubWebhook != nil {
+			if spawner.Spec.When.GitHubWebhook != nil && spawner.Spec.When.GitHubWebhook.GatewayRef == nil {
 				matching = append(matching, spawner)
 			}
 		case LinearSource:
-			if spawner.Spec.When.LinearWebhook != nil {
+			if spawner.Spec.When.LinearWebhook != nil && spawner.Spec.When.LinearWebhook.GatewayRef == nil {
 				matching = append(matching, spawner)
 			}
 		case GenericSource:
-			if spawner.Spec.When.GenericWebhook != nil {
+			if spawner.Spec.When.GenericWebhook != nil && spawner.Spec.When.GenericWebhook.GatewayRef == nil {
 				matching = append(matching, spawner)
 			}
 		}
@@ -510,7 +531,8 @@ func (h *WebhookHandler) getMatchingSessionSpawners(ctx context.Context) ([]*kel
 	}
 	matching := make([]*kelos.SessionSpawner, 0, len(spawnerList.Items))
 	for i := range spawnerList.Items {
-		if spawnerList.Items[i].Spec.When.GitHubWebhook != nil {
+		githubWebhook := spawnerList.Items[i].Spec.When.GitHubWebhook
+		if githubWebhook != nil && githubWebhook.GatewayRef == nil {
 			matching = append(matching, &spawnerList.Items[i])
 		}
 	}
@@ -535,8 +557,10 @@ func (h *WebhookHandler) matchesSpawner(ctx context.Context, spawner *kelos.Task
 		if spawner.Spec.When.GenericWebhook == nil {
 			return false, nil
 		}
-		// Check source name matches the URL path segment
-		if spawner.Spec.When.GenericWebhook.Source != eventType {
+		// In per-source mode the URL path segment selects the source, so it must
+		// match the spawner's declared source. In gateway mode the gatewayRef
+		// already scoped this spawner, so the source-name check is skipped.
+		if h.gatewayName == "" && spawner.Spec.When.GenericWebhook.Source != eventType {
 			return false, nil
 		}
 		// Extract fields for this spawner's fieldMapping
@@ -545,7 +569,15 @@ func (h *WebhookHandler) matchesSpawner(ctx context.Context, spawner *kelos.Task
 		}
 		parsed.ID = parsed.Generic.Fields["id"]
 		parsed.Title = parsed.Generic.Fields["title"]
-		return MatchesGenericFilters(spawner.Spec.When.GenericWebhook.Filters, parsed.Generic.Payload)
+		matched, err := MatchesGenericFilters(spawner.Spec.When.GenericWebhook.Filters, parsed.Generic.Payload)
+		if err != nil || !matched {
+			return false, err
+		}
+		excluded, err := MatchesGenericExcludeFilters(spawner.Spec.When.GenericWebhook.ExcludeFilters, parsed.Generic.Payload)
+		if err != nil {
+			return false, err
+		}
+		return !excluded, nil
 
 	default:
 		return false, fmt.Errorf("unsupported source: %s", h.source)
@@ -647,13 +679,17 @@ func (h *WebhookHandler) createTask(ctx context.Context, spawner *kelos.TaskSpaw
 	if err != nil {
 		return false, fmt.Errorf("failed to build task: %w", err)
 	}
+	if err := h.taskBuilder.AssignSpawnerCredential(spawner, task); err != nil {
+		return false, fmt.Errorf("assigning TaskSpawner credential: %w", err)
+	}
 
 	// Stamp reporting annotations for GitHub webhook sources when reporting is configured.
 	if h.source == GitHubSource && parsed.GitHub != nil && parsed.GitHub.Number > 0 &&
 		spawner.Spec.When.GitHubWebhook != nil &&
 		spawner.Spec.When.GitHubWebhook.Reporting != nil {
 		rep := spawner.Spec.When.GitHubWebhook.Reporting
-		if rep.Enabled || rep.Checks != nil {
+		commentReportingEnabled := rep.Enabled || rep.Comments != nil
+		if commentReportingEnabled || rep.Checks != nil {
 			if task.Annotations == nil {
 				task.Annotations = make(map[string]string)
 			}
@@ -661,9 +697,19 @@ func (h *WebhookHandler) createTask(ctx context.Context, spawner *kelos.TaskSpaw
 			task.Annotations[reporting.AnnotationSourceNumber] = strconv.Itoa(parsed.GitHub.Number)
 			task.Annotations[reporting.AnnotationSourceOwner] = parsed.GitHub.RepositoryOwner
 			task.Annotations[reporting.AnnotationSourceRepo] = parsed.GitHub.RepositoryName
+			// In gateway mode, record the serving gateway so the reporting
+			// reconciler can resolve its per-instance credentials and API base URL.
+			if h.gatewayName != "" {
+				task.Annotations[reporting.AnnotationWebhookGateway] = h.gatewayName
+			}
 		}
-		if rep.Enabled {
+		if commentReportingEnabled {
 			task.Annotations[reporting.AnnotationGitHubReporting] = "enabled"
+			commentMode := kelos.GitHubCommentModePerTask
+			if rep.Comments != nil && rep.Comments.Mode != "" {
+				commentMode = rep.Comments.Mode
+			}
+			task.Annotations[reporting.AnnotationGitHubCommentMode] = string(commentMode)
 		}
 		if rep.Checks != nil && parsed.GitHub.HeadSHA != "" {
 			task.Annotations[reporting.AnnotationGitHubChecks] = "enabled"
@@ -754,6 +800,9 @@ func (h *WebhookHandler) processSessionSpawner(ctx context.Context, spawner *kel
 	)
 	if buildErr != nil {
 		return false, h.recordSessionSpawnerFailure(ctx, spawner, "SessionBuildFailed", buildErr)
+	}
+	if credentialErr := sessionbuilder.AssignSpawnerCredential(spawner, session); credentialErr != nil {
+		return false, h.recordSessionSpawnerFailure(ctx, spawner, "SessionBuildFailed", credentialErr)
 	}
 	if createErr := h.client.Create(ctx, session); createErr != nil {
 		if apierrors.IsAlreadyExists(createErr) {
@@ -851,14 +900,14 @@ func (h *WebhookHandler) enrichPRChangedFiles(ctx context.Context, spawner *kelo
 	if eventData.Number == 0 || eventData.Repository == "" {
 		return nil, nil
 	}
-	return fetchPRChangedFiles(ctx, h.client, spawner, h.githubAPIBaseURL, eventData.RepositoryOwner, eventData.RepositoryName, eventData.Number)
+	return fetchPRChangedFiles(ctx, h.client, spawner, h.githubTokenResolver, h.githubAPIBaseURL, eventData.RepositoryOwner, eventData.RepositoryName, eventData.Number)
 }
 
 func (h *WebhookHandler) enrichSessionSpawnerPRChangedFiles(ctx context.Context, spawner *kelos.SessionSpawner, eventData *GitHubEventData) ([]string, error) {
 	if eventData.Number == 0 || eventData.Repository == "" {
 		return nil, nil
 	}
-	return fetchSessionSpawnerPRChangedFiles(ctx, h.client, spawner, h.githubAPIBaseURL, eventData.RepositoryOwner, eventData.RepositoryName, eventData.Number)
+	return fetchSessionSpawnerPRChangedFiles(ctx, h.client, spawner, h.githubTokenResolver, h.githubAPIBaseURL, eventData.RepositoryOwner, eventData.RepositoryName, eventData.Number)
 }
 
 // getGenericSpawners returns all TaskSpawners that have a generic webhook
@@ -871,7 +920,9 @@ func (h *WebhookHandler) getGenericSpawners(ctx context.Context) []*kelos.TaskSp
 
 	var spawners []*kelos.TaskSpawner
 	for i := range spawnerList.Items {
-		if spawnerList.Items[i].Spec.When.GenericWebhook != nil {
+		// Skip gateway-bound spawners; they are served by the gateway path.
+		gw := spawnerList.Items[i].Spec.When.GenericWebhook
+		if gw != nil && gw.GatewayRef == nil {
 			spawners = append(spawners, &spawnerList.Items[i])
 		}
 	}

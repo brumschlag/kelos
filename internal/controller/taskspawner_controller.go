@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -666,66 +668,41 @@ func (r *TaskSpawnerReconciler) createCronJob(ctx context.Context, ts *kelos.Tas
 	return ctrl.Result{Requeue: true}, nil
 }
 
-// updateCronJob updates the CronJob if the schedule or suspend state changed.
+// updateCronJob updates the complete CronJob spec to match the desired state.
 func (r *TaskSpawnerReconciler) updateCronJob(ctx context.Context, ts *kelos.TaskSpawner, cronJob *batchv1.CronJob, workspace *kelos.WorkspaceSpec, isGitHubApp bool, isSuspended bool) error {
 	logger := log.FromContext(ctx)
 
 	desired := r.DeploymentBuilder.BuildCronJob(ts, workspace, isGitHubApp)
-	needsUpdate := false
+	desired.Spec.Suspend = &isSuspended
+	candidate := cronJob.DeepCopy()
+	candidate.Spec = *desired.Spec.DeepCopy()
 
-	if cronJob.Spec.Schedule != desired.Spec.Schedule {
-		cronJob.Spec.Schedule = desired.Spec.Schedule
-		needsUpdate = true
-	}
-
-	if cronJob.Spec.Suspend == nil || *cronJob.Spec.Suspend != isSuspended {
-		cronJob.Spec.Suspend = &isSuspended
-		needsUpdate = true
-	}
-
-	currentPodSpec := &cronJob.Spec.JobTemplate.Spec.Template.Spec
-	desiredPodSpec := &desired.Spec.JobTemplate.Spec.Template.Spec
-
-	// Update container spec if changed (image, args, env, volumeMounts)
-	if len(currentPodSpec.Containers) > 0 {
-		current := currentPodSpec.Containers[0]
-		target := desiredPodSpec.Containers[0]
-
-		if current.Image != target.Image ||
-			!equalStringSlices(current.Args, target.Args) ||
-			!equalEnvVars(current.Env, target.Env) ||
-			!reflect.DeepEqual(current.VolumeMounts, target.VolumeMounts) ||
-			!resourceRequirementsEqual(current.Resources, target.Resources) {
-			currentPodSpec.Containers[0].Image = target.Image
-			currentPodSpec.Containers[0].Args = target.Args
-			currentPodSpec.Containers[0].Env = target.Env
-			currentPodSpec.Containers[0].VolumeMounts = target.VolumeMounts
-			currentPodSpec.Containers[0].Resources = target.Resources
-			needsUpdate = true
+	// Prefer server normalization so defaulted and admission-managed fields can
+	// be compared exactly. Some admission webhooks cannot process dry runs; in
+	// that case, compare the fields set by the desired spec and tolerate extras.
+	if err := r.Update(ctx, candidate, client.DryRunAll); err != nil {
+		if !isDryRunUnsupported(err) {
+			return fmt.Errorf("dry-run updating CronJob %q: %w", cronJob.Name, err)
 		}
-	}
-
-	// Clean up stale init containers and volumes (e.g. from removed token-refresher sidecar)
-	if !reflect.DeepEqual(currentPodSpec.InitContainers, desiredPodSpec.InitContainers) {
-		currentPodSpec.InitContainers = desiredPodSpec.InitContainers
-		needsUpdate = true
-	}
-	if !reflect.DeepEqual(currentPodSpec.Volumes, desiredPodSpec.Volumes) {
-		currentPodSpec.Volumes = desiredPodSpec.Volumes
-		needsUpdate = true
-	}
-
-	if !needsUpdate {
+		if apiequality.Semantic.DeepDerivative(desired.Spec, cronJob.Spec) {
+			return nil
+		}
+	} else if apiequality.Semantic.DeepEqual(cronJob.Spec, candidate.Spec) {
 		return nil
 	}
 
-	if err := r.Update(ctx, cronJob); err != nil {
-		return err
+	if err := r.Update(ctx, candidate); err != nil {
+		return fmt.Errorf("updating CronJob %q: %w", cronJob.Name, err)
 	}
+	*cronJob = *candidate
 
 	logger.Info("Updated CronJob", "cronJob", cronJob.Name, "schedule", cronJob.Spec.Schedule, "suspended", isSuspended)
 	r.recordEvent(ts, corev1.EventTypeNormal, "CronJobUpdated", "Updated spawner CronJob %s", cronJob.Name)
 	return nil
+}
+
+func isDryRunUnsupported(err error) bool {
+	return apierrors.IsBadRequest(err) && strings.Contains(err.Error(), "does not support dry run")
 }
 
 // deleteStaleResource deletes a resource by NamespacedName if it exists and is owned by a TaskSpawner.

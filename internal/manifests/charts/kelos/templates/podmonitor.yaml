@@ -1,0 +1,90 @@
+{{- if .Values.podMonitor.enabled }}
+---
+# PodMonitor for the Kelos control-plane pods (controller manager, webhook
+# servers, slack server). They all carry app.kubernetes.io/name: kelos and
+# expose the metrics port (8080). console-server is explicitly excluded: it
+# shares the app.kubernetes.io/name: kelos label but its 8080 port serves the
+# web app (named "http"), not Prometheus metrics.
+#
+# The controller manager always runs in the kelos-system namespace, while the
+# webhook and slack servers run in the release namespace, so target discovery
+# spans both. (Under `kelos install` these are the same namespace.)
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: kelos-controlplane
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: kelos
+    app.kubernetes.io/component: manager
+    {{- with .Values.podMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.podMonitor.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  namespaceSelector:
+    matchNames:
+      - kelos-system
+      {{- if ne .Release.Namespace "kelos-system" }}
+      - {{ .Release.Namespace }}
+      {{- end }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kelos
+    matchExpressions:
+      # Exclude the console-server web app, which shares the name label but does
+      # not expose a Prometheus metrics port.
+      - key: app.kubernetes.io/component
+        operator: NotIn
+        values:
+          - console-server
+  podMetricsEndpoints:
+    - port: metrics
+      interval: {{ .Values.podMonitor.interval }}
+      scrapeTimeout: {{ .Values.podMonitor.scrapeTimeout }}
+      honorLabels: {{ .Values.podMonitor.honorLabels }}
+{{- if .Values.podMonitor.spawners.enabled }}
+---
+# PodMonitor for long-lived spawner pods (event- and poll-based TaskSpawners run
+# as Deployments). Spawner pods use the kelos.dev/* label scheme (not
+# app.kubernetes.io/name) and run in arbitrary namespaces, so namespaceSelector
+# spans all namespaces for target discovery. Cron-based TaskSpawners run as
+# one-shot Jobs with the same labels but no metrics port; they exit immediately,
+# so port: metrics simply yields no target for them.
+#
+# This selects pod targets cluster-wide; the scraping Prometheus's service
+# account still needs RBAC to read/scrape pods in those namespaces. (This
+# PodMonitor object itself lives in the release namespace and is discovered like
+# any other, via the Prometheus podMonitorNamespaceSelector.)
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: kelos-spawners
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: kelos
+    app.kubernetes.io/component: spawner
+    {{- with .Values.podMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.podMonitor.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  namespaceSelector:
+    any: true
+  selector:
+    matchLabels:
+      kelos.dev/name: kelos
+      kelos.dev/component: spawner
+  podMetricsEndpoints:
+    - port: metrics
+      interval: {{ .Values.podMonitor.interval }}
+      scrapeTimeout: {{ .Values.podMonitor.scrapeTimeout }}
+      honorLabels: {{ .Values.podMonitor.honorLabels }}
+{{- end }}
+{{- end }}

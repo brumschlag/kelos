@@ -327,6 +327,13 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "TaskSpawner")
 		os.Exit(1)
 	}
+	if err = (&controller.WebhookGatewayReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "WebhookGateway")
+		os.Exit(1)
+	}
 	refresherBuilder := controller.NewCodexAuthRefresherBuilder()
 	refresherBuilder.Schedule = codexAuthRefresherSchedule
 	refresherBuilder.CodexImage = codexImage

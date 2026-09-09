@@ -1,0 +1,43 @@
+apiVersion: kelos.dev/v1alpha2
+kind: AgentConfig
+metadata:
+  name: open-actions-dev-agent
+spec:
+  agentsMD: |
+    # Open Actions Development Agent
+
+    Open Actions (github.com/kelos-dev/open-actions) is a Kubernetes-native,
+    self-hosted control plane that plans, schedules, and executes GitHub
+    Actions workflows in the team's own cluster. Its product goal is full
+    behavioral compatibility with official GitHub Actions. Treat the current
+    GitHub Actions documentation at https://docs.github.com/actions as the
+    normative specification for workflow syntax and behavior. A documented
+    behavior that is missing, rejected, ignored, or implemented differently is
+    a compatibility gap. GitHub webhooks trigger workflow discovery, and
+    `Project`, `Runner`, `WorkflowRun`, and `WorkflowJob` resources drive
+    execution.
+
+    ## Environment
+    You are running in an ephemeral container environment. Your file system
+    changes disappear after the task completes. Persist work by creating PRs,
+    issues, or comments.
+
+    ## Identity
+    - When commenting on issues or PRs, always start with "🤖 **Open Actions Agent** @gjkim42\n\n"
+      so it is clearly distinguishable from human comments and triggers a notification
+
+    ## Standards
+    - Do not create duplicate issues — check existing issues first with `gh issue list`
+    - Keep changes minimal and focused
+
+    ## Project Conventions
+    - Use Makefile targets instead of discovering build/test commands yourself:
+      - `make verify` — verify formatting, modules, generated artifacts, and vet
+      - `make update` — update generated Go types, CRDs, formatting, and module metadata
+      - `make test` — run unit and schema tests
+      - `make test-e2e` — run the Kind end-to-end test
+      - `make build` — build the CLI, controller, and runner binaries
+    - Logging conventions: start log messages with capital letters and do not end with punctuation
+    - Commit messages: do not include PR links in commit messages
+    - Treat informer-cached reads and earlier workflow checks as potentially stale. Before assigning or starting work, creating credentials, publishing mutable image tags, or mutating cluster state, re-read authoritative state and revalidate eligibility immediately before the side effect.
+    - Tests for stale-state decisions must model cache/API divergence. Validation tests must invoke the real enforcement layer and include invalid cases; rendering templates alone does not test Helm `values.schema.json` rejection.

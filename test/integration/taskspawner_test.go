@@ -2420,4 +2420,202 @@ var _ = Describe("TaskSpawner Controller", func() {
 			Expect(apierrors.IsInvalid(err)).To(BeTrue())
 		})
 	})
+
+	Context("When configuring multiple TaskSpawner credentials", func() {
+		It("Should accept credentials without template credentials", func() {
+			ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-taskspawner-credentials"}}
+			Expect(k8sClient.Create(ctx, ns)).Should(Succeed())
+
+			ts := &kelos.TaskSpawner{
+				ObjectMeta: metav1.ObjectMeta{Name: "multi-account", Namespace: ns.Name},
+				Spec: kelos.TaskSpawnerSpec{
+					When: kelos.When{Cron: &kelos.Cron{Schedule: "0 * * * *"}},
+					TaskTemplate: kelos.TaskTemplate{
+						Worker: &kelos.WorkerSpec{Type: "claude-code"},
+					},
+					Credentials: []kelos.SpawnerCredential{
+						{Name: "account-a", Type: kelos.CredentialTypeOAuth, SecretRef: kelos.SecretReference{Name: "secret-a"}},
+						{Name: "account-b", Type: kelos.CredentialTypeOAuth, SecretRef: kelos.SecretReference{Name: "secret-b"}},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, ts)).Should(Succeed())
+		})
+
+		It("Should reject credentials combined with template credentials", func() {
+			ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-taskspawner-credential-conflict"}}
+			Expect(k8sClient.Create(ctx, ns)).Should(Succeed())
+
+			ts := &kelos.TaskSpawner{
+				ObjectMeta: metav1.ObjectMeta{Name: "multi-account", Namespace: ns.Name},
+				Spec: kelos.TaskSpawnerSpec{
+					When: kelos.When{Cron: &kelos.Cron{Schedule: "0 * * * *"}},
+					TaskTemplate: kelos.TaskTemplate{
+						Worker: &kelos.WorkerSpec{
+							Type: "claude-code",
+							Credentials: &kelos.Credentials{
+								Type:      kelos.CredentialTypeOAuth,
+								SecretRef: &kelos.SecretReference{Name: "template-secret"},
+							},
+						},
+					},
+					Credentials: []kelos.SpawnerCredential{
+						{Name: "account-a", Type: kelos.CredentialTypeOAuth, SecretRef: kelos.SecretReference{Name: "secret-a"}},
+					},
+				},
+			}
+			err := k8sClient.Create(ctx, ts)
+			Expect(apierrors.IsInvalid(err)).To(BeTrue(), "error: %v", err)
+		})
+	})
+
+	Context("When configuring GitHub comment reporting", func() {
+		It("Should default the comment mode to PerTask", func() {
+			ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-taskspawner-comment-default"}}
+			Expect(k8sClient.Create(ctx, ns)).Should(Succeed())
+
+			ts := &kelos.TaskSpawner{
+				ObjectMeta: metav1.ObjectMeta{Name: "comment-default", Namespace: ns.Name},
+				Spec: kelos.TaskSpawnerSpec{
+					When: kelos.When{GitHubIssues: &kelos.GitHubIssues{
+						Repo: "kelos-dev/kelos",
+						Reporting: &kelos.GitHubReporting{
+							Comments: &kelos.GitHubCommentsReporting{},
+						},
+					}},
+					TaskTemplate: kelos.TaskTemplate{
+						Worker: &kelos.WorkerSpec{
+							Type: "claude-code",
+							Credentials: &kelos.Credentials{
+								Type:      kelos.CredentialTypeOAuth,
+								SecretRef: &kelos.SecretReference{Name: "claude-credentials"},
+							},
+							WorkspaceRef: &kelos.WorkspaceReference{Name: "workspace"},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, ts)).Should(Succeed())
+
+			created := &kelos.TaskSpawner{}
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(ts), created)).Should(Succeed())
+			Expect(created.Spec.When.GitHubIssues.Reporting.Comments.Mode).To(Equal(kelos.GitHubCommentModePerTask))
+		})
+
+		It("Should reject an unsupported comment mode", func() {
+			ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-taskspawner-comment-invalid"}}
+			Expect(k8sClient.Create(ctx, ns)).Should(Succeed())
+
+			ts := &kelos.TaskSpawner{
+				ObjectMeta: metav1.ObjectMeta{Name: "comment-invalid", Namespace: ns.Name},
+				Spec: kelos.TaskSpawnerSpec{
+					When: kelos.When{GitHubIssues: &kelos.GitHubIssues{
+						Repo: "kelos-dev/kelos",
+						Reporting: &kelos.GitHubReporting{
+							Comments: &kelos.GitHubCommentsReporting{Mode: "Unsupported"},
+						},
+					}},
+					TaskTemplate: kelos.TaskTemplate{
+						Worker: &kelos.WorkerSpec{
+							Type: "claude-code",
+							Credentials: &kelos.Credentials{
+								Type:      kelos.CredentialTypeOAuth,
+								SecretRef: &kelos.SecretReference{Name: "claude-credentials"},
+							},
+							WorkspaceRef: &kelos.WorkspaceReference{Name: "workspace"},
+						},
+					},
+				},
+			}
+			err := k8sClient.Create(ctx, ts)
+			Expect(apierrors.IsInvalid(err)).To(BeTrue(), "error: %v", err)
+			Expect(err.Error()).To(ContainSubstring("Unsupported"))
+		})
+	})
+
+	Context("When configuring GitHub Checks reporting for webhook events", func() {
+		It("Should accept only PR-scoped issue_comment filters", func() {
+			ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-taskspawner-checks-comments"}}
+			Expect(k8sClient.Create(ctx, ns)).Should(Succeed())
+
+			testCases := []struct {
+				name    string
+				events  []string
+				filters []kelos.GitHubWebhookFilter
+				valid   bool
+			}{
+				{
+					name:   "pull-request-event",
+					events: []string{"pull_request"},
+					valid:  true,
+				},
+				{
+					name:   "pr-comment",
+					events: []string{"issue_comment"},
+					filters: []kelos.GitHubWebhookFilter{{
+						Event:     "issue_comment",
+						CommentOn: kelos.CommentOnPullRequest,
+					}},
+					valid: true,
+				},
+				{
+					name:   "unfiltered-comment",
+					events: []string{"issue_comment"},
+				},
+				{
+					name:   "unscoped-comment",
+					events: []string{"issue_comment"},
+					filters: []kelos.GitHubWebhookFilter{{
+						Event: "issue_comment",
+					}},
+				},
+				{
+					name:   "issue-comment",
+					events: []string{"issue_comment"},
+					filters: []kelos.GitHubWebhookFilter{{
+						Event:     "issue_comment",
+						CommentOn: kelos.CommentOnIssue,
+					}},
+				},
+				{
+					name:   "mixed-comment-scopes",
+					events: []string{"issue_comment"},
+					filters: []kelos.GitHubWebhookFilter{
+						{Event: "issue_comment", CommentOn: kelos.CommentOnPullRequest, Author: "reviewer"},
+						{Event: "issue_comment", CommentOn: kelos.CommentOnIssue, Author: "triager"},
+					},
+				},
+			}
+
+			for _, tt := range testCases {
+				ts := &kelos.TaskSpawner{
+					ObjectMeta: metav1.ObjectMeta{Name: tt.name, Namespace: ns.Name},
+					Spec: kelos.TaskSpawnerSpec{
+						When: kelos.When{GitHubWebhook: &kelos.GitHubWebhook{
+							Events:  tt.events,
+							Filters: tt.filters,
+							Reporting: &kelos.GitHubReporting{
+								Checks: &kelos.GitHubChecksReporting{},
+							},
+						}},
+						TaskTemplate: kelos.TaskTemplate{
+							Worker: &kelos.WorkerSpec{
+								Type:         "codex",
+								Credentials:  &kelos.Credentials{Type: kelos.CredentialTypeNone},
+								WorkspaceRef: &kelos.WorkspaceReference{Name: "workspace"},
+							},
+						},
+					},
+				}
+
+				err := k8sClient.Create(ctx, ts)
+				if tt.valid {
+					Expect(err).NotTo(HaveOccurred(), "case %s", tt.name)
+					continue
+				}
+				Expect(apierrors.IsInvalid(err)).To(BeTrue(), "case %s: %v", tt.name, err)
+				Expect(err.Error()).To(ContainSubstring("PR-scoped issue_comment filters"))
+			}
+		})
+	})
 })

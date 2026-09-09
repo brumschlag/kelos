@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
@@ -84,9 +86,10 @@ func (c *conflictOnceClient) Update(ctx context.Context, obj client.Object, opts
 func newTestServer(t *testing.T) (*httptest.Server, *[]commentRecord) {
 	t.Helper()
 	var (
-		mu      sync.Mutex
-		records []commentRecord
-		nextID  int64 = 1000
+		mu       sync.Mutex
+		records  []commentRecord
+		nextID   int64 = 1000
+		comments       = map[int64]string{}
 	)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -97,8 +100,28 @@ func newTestServer(t *testing.T) (*httptest.Server, *[]commentRecord) {
 		json.NewDecoder(r.Body).Decode(&body)
 
 		switch r.Method {
+		case http.MethodGet:
+			if r.URL.Path == "/user" {
+				w.WriteHeader(http.StatusOK)
+				json.NewEncoder(w).Encode(githubUser{Login: "reporter"})
+				return
+			}
+			ids := make([]int64, 0, len(comments))
+			for id := range comments {
+				ids = append(ids, id)
+			}
+			sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+			response := make([]commentResponse, 0, len(ids))
+			for _, id := range ids {
+				response = append(response, commentResponse{
+					ID: id, Body: comments[id], User: githubUser{Login: "reporter"},
+				})
+			}
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(response)
 		case http.MethodPost:
 			nextID++
+			comments[nextID] = body.Body
 			records = append(records, commentRecord{
 				method: "create",
 				id:     nextID,
@@ -108,6 +131,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *[]commentRecord) {
 			json.NewEncoder(w).Encode(commentResponse{ID: nextID})
 		case http.MethodPatch:
 			id, _ := strconv.ParseInt(path.Base(r.URL.Path), 10, 64)
+			comments[id] = body.Body
 			records = append(records, commentRecord{
 				method: "update",
 				id:     id,
@@ -190,6 +214,105 @@ func TestReportTaskStatus_CreatesCommentOnPending(t *testing.T) {
 	}
 	if updated.Annotations[AnnotationGitHubCommentID] == "" {
 		t.Error("Expected comment ID to be set")
+	}
+}
+
+func TestReportTaskStatus_StickyCommentReusedAcrossTasks(t *testing.T) {
+	server, records := newTestServer(t)
+	defer server.Close()
+
+	annotations := func() map[string]string {
+		return map[string]string{
+			AnnotationGitHubReporting:   "enabled",
+			AnnotationGitHubCommentMode: string(kelos.GitHubCommentModeSticky),
+			AnnotationSourceNumber:      "42",
+			AnnotationSourceKind:        "issue",
+		}
+	}
+	first := newTaskWithAnnotations("first-task", "default", kelos.TaskPhasePending, annotations())
+	first.Labels = map[string]string{"kelos.dev/taskspawner": "reviewer"}
+	second := newTaskWithAnnotations("second-task", "default", kelos.TaskPhaseSucceeded, annotations())
+	second.Labels = map[string]string{"kelos.dev/taskspawner": "reviewer"}
+
+	cl := fake.NewClientBuilder().WithScheme(newTestScheme()).WithObjects(first, second).Build()
+	tr := &TaskReporter{
+		Client: cl,
+		Reporter: &GitHubReporter{
+			Owner: "owner", Repo: "repo", Token: "token", BaseURL: server.URL,
+		},
+	}
+
+	if err := tr.ReportTaskStatus(context.Background(), first); err != nil {
+		t.Fatalf("Reporting first task: %v", err)
+	}
+	if err := tr.ReportTaskStatus(context.Background(), second); err != nil {
+		t.Fatalf("Reporting second task: %v", err)
+	}
+
+	if len(*records) != 2 {
+		t.Fatalf("Expected one create and one update, got %d calls", len(*records))
+	}
+	if (*records)[0].method != "create" || (*records)[1].method != "update" {
+		t.Fatalf("Calls = %#v, want create then update", *records)
+	}
+	if (*records)[0].id != (*records)[1].id {
+		t.Errorf("Updated comment ID %d, want created comment ID %d", (*records)[1].id, (*records)[0].id)
+	}
+	const marker = "<!-- kelos.dev/github-status-comment:default/reviewer -->"
+	if !strings.Contains((*records)[0].body, marker) || !strings.Contains((*records)[1].body, marker) {
+		t.Errorf("Sticky marker missing from comments: %#v", *records)
+	}
+	if !strings.Contains((*records)[1].body, "second-task") {
+		t.Errorf("Updated sticky comment does not describe second task: %q", (*records)[1].body)
+	}
+}
+
+func TestReportTaskStatus_StickyCommentsScopedByTaskSpawner(t *testing.T) {
+	server, records := newTestServer(t)
+	defer server.Close()
+
+	annotations := func() map[string]string {
+		return map[string]string{
+			AnnotationGitHubReporting:   "enabled",
+			AnnotationGitHubCommentMode: string(kelos.GitHubCommentModeSticky),
+			AnnotationSourceNumber:      "42",
+			AnnotationSourceKind:        "issue",
+		}
+	}
+	first := newTaskWithAnnotations("first-task", "default", kelos.TaskPhasePending, annotations())
+	first.Labels = map[string]string{"kelos.dev/taskspawner": "first-spawner"}
+	second := newTaskWithAnnotations("second-task", "default", kelos.TaskPhasePending, annotations())
+	second.Labels = map[string]string{"kelos.dev/taskspawner": "second-spawner"}
+
+	cl := fake.NewClientBuilder().WithScheme(newTestScheme()).WithObjects(first, second).Build()
+	tr := &TaskReporter{
+		Client: cl,
+		Reporter: &GitHubReporter{
+			Owner: "owner", Repo: "repo", Token: "token", BaseURL: server.URL,
+		},
+	}
+
+	if err := tr.ReportTaskStatus(context.Background(), first); err != nil {
+		t.Fatalf("Reporting first task: %v", err)
+	}
+	if err := tr.ReportTaskStatus(context.Background(), second); err != nil {
+		t.Fatalf("Reporting second task: %v", err)
+	}
+
+	if len(*records) != 2 {
+		t.Fatalf("Expected two creates, got %d calls", len(*records))
+	}
+	if (*records)[0].method != "create" || (*records)[1].method != "create" {
+		t.Fatalf("Calls = %#v, want two creates", *records)
+	}
+	if (*records)[0].id == (*records)[1].id {
+		t.Errorf("Different TaskSpawners reused comment ID %d", (*records)[0].id)
+	}
+	if !strings.Contains((*records)[0].body, "default/first-spawner") {
+		t.Errorf("First comment has wrong marker: %q", (*records)[0].body)
+	}
+	if !strings.Contains((*records)[1].body, "default/second-spawner") {
+		t.Errorf("Second comment has wrong marker: %q", (*records)[1].body)
 	}
 }
 
@@ -2938,5 +3061,203 @@ func TestAppendActivityContext_DoesNotMutateBase(t *testing.T) {
 
 	if len(baseMsg.Blocks) != originalBlockCount {
 		t.Errorf("base message mutated: blocks went from %d to %d", originalBlockCount, len(baseMsg.Blocks))
+	}
+}
+
+func TestSlackTaskReporter_CannotReplyToMessageNotRetried(t *testing.T) {
+	task := &kelos.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-task",
+			Namespace: "default",
+			Annotations: map[string]string{
+				AnnotationSlackReporting: "enabled",
+				AnnotationSlackChannel:   "C123ABC",
+				AnnotationSlackThreadTS:  "1234567890.123456",
+			},
+		},
+		Spec: kelos.TaskSpec{
+			Type:   "claude-code",
+			Prompt: "test",
+			Credentials: &kelos.Credentials{
+				Type:      kelos.CredentialTypeOAuth,
+				SecretRef: &kelos.SecretReference{Name: "creds"},
+			},
+		},
+		Status: kelos.TaskStatus{
+			Phase:   kelos.TaskPhaseRunning,
+			PodName: "test-pod",
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(newTestScheme()).WithObjects(task).Build()
+
+	attempts := 0
+	reporter := &fakeSlackReporter{
+		postFn: func(ctx context.Context, channel, threadTS string, msg SlackMessage) (string, error) {
+			attempts++
+			// slack-go surfaces API errors as a SlackErrorResponse value.
+			return "", slack.SlackErrorResponse{Err: "cannot_reply_to_message"}
+		},
+	}
+
+	// A ProgressReader and a pod are required for the second-cycle assertion
+	// below to mean anything: without them updateProgress returns at its
+	// ProgressReader/podName guards and the post count cannot grow no matter
+	// how the permanent error is handled. Production always wires one
+	// (cmd/kelos-slack-server/main.go).
+	tr := &SlackTaskReporter{
+		Client:         cl,
+		Reporter:       reporter,
+		ProgressReader: &fakeProgressReader{text: "Reading the changed files..."},
+	}
+
+	// A permanent Slack error must not wedge the task: the phase is still
+	// marked as reported so the 30s reporting cycle stops re-posting.
+	if err := tr.ReportTaskStatus(context.Background(), task); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if attempts != 1 {
+		t.Fatalf("expected exactly 1 post attempt, got %d", attempts)
+	}
+
+	var updated kelos.Task
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(task), &updated); err != nil {
+		t.Fatalf("getting updated task: %v", err)
+	}
+	if updated.Annotations[AnnotationSlackReportPhase] != "accepted" {
+		t.Errorf("report phase = %q, want accepted so the cycle does not retry", updated.Annotations[AnnotationSlackReportPhase])
+	}
+
+	// The next cycle takes the progress path, which posts its own thread
+	// reply. It must not attempt that post either: the transition failure
+	// already proved the thread rejects every reply.
+	if err := tr.ReportTaskStatus(context.Background(), task); err != nil {
+		t.Fatalf("unexpected error on second cycle: %v", err)
+	}
+	if attempts != 1 {
+		t.Errorf("expected no additional post attempt on the next cycle, got %d total", attempts)
+	}
+}
+
+func TestSlackTaskReporter_TransientReplyErrorStillRetried(t *testing.T) {
+	task := &kelos.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-task",
+			Namespace: "default",
+			Annotations: map[string]string{
+				AnnotationSlackReporting: "enabled",
+				AnnotationSlackChannel:   "C123ABC",
+				AnnotationSlackThreadTS:  "1234567890.123456",
+			},
+		},
+		Spec: kelos.TaskSpec{
+			Type:   "claude-code",
+			Prompt: "test",
+			Credentials: &kelos.Credentials{
+				Type:      kelos.CredentialTypeOAuth,
+				SecretRef: &kelos.SecretReference{Name: "creds"},
+			},
+		},
+		Status: kelos.TaskStatus{
+			Phase: kelos.TaskPhasePending,
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(newTestScheme()).WithObjects(task).Build()
+
+	reporter := &fakeSlackReporter{
+		postFn: func(ctx context.Context, channel, threadTS string, msg SlackMessage) (string, error) {
+			return "", errors.New("network timeout")
+		},
+	}
+
+	tr := &SlackTaskReporter{Client: cl, Reporter: reporter}
+
+	if err := tr.ReportTaskStatus(context.Background(), task); err == nil {
+		t.Fatal("expected error for transient failure")
+	}
+
+	var updated kelos.Task
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(task), &updated); err != nil {
+		t.Fatalf("getting updated task: %v", err)
+	}
+	if updated.Annotations[AnnotationSlackReportPhase] != "" {
+		t.Errorf("report phase = %q, want unset so transient errors are retried", updated.Annotations[AnnotationSlackReportPhase])
+	}
+}
+
+func TestSlackTaskReporter_PermanentProgressErrorNotReattempted(t *testing.T) {
+	task := &kelos.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-task",
+			Namespace: "default",
+			UID:       "uid-124",
+			Annotations: map[string]string{
+				AnnotationSlackReporting:   "enabled",
+				AnnotationSlackChannel:     "C123ABC",
+				AnnotationSlackThreadTS:    "1234567890.123456",
+				AnnotationSlackReportPhase: "accepted",
+			},
+		},
+		Spec: kelos.TaskSpec{
+			Type:   "claude-code",
+			Prompt: "test",
+			Credentials: &kelos.Credentials{
+				Type:      kelos.CredentialTypeOAuth,
+				SecretRef: &kelos.SecretReference{Name: "creds"},
+			},
+		},
+		Status: kelos.TaskStatus{
+			Phase:   kelos.TaskPhaseRunning,
+			PodName: "test-pod",
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(newTestScheme()).WithObjects(task).Build()
+
+	attempts := 0
+	reporter := &fakeSlackReporter{
+		postFn: func(ctx context.Context, channel, threadTS string, msg SlackMessage) (string, error) {
+			attempts++
+			return "", slack.SlackErrorResponse{Err: "cannot_reply_to_message"}
+		},
+	}
+
+	progress := &fakeProgressReader{text: "Searching through release tags..."}
+	tr := &SlackTaskReporter{
+		Client:         cl,
+		Reporter:       reporter,
+		ProgressReader: progress,
+	}
+
+	// First cycle: the permanent failure is logged and progress posting is
+	// blocked for the task. Suppression comes from the progressBlocked flag,
+	// not from snapshot text deduplication — setLastProgress is not reached
+	// on the error path.
+	if err := tr.ReportTaskStatus(context.Background(), task); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("expected 1 post attempt, got %d", attempts)
+	}
+
+	// Second cycle with the same snapshot: no re-post attempt.
+	if err := tr.ReportTaskStatus(context.Background(), task); err != nil {
+		t.Fatalf("unexpected error on second cycle: %v", err)
+	}
+	if attempts != 1 {
+		t.Errorf("expected no additional post attempt on the next cycle, got %d total", attempts)
+	}
+
+	// A new, distinct snapshot must not retry either: the thread rejects
+	// every reply, not just the one that failed, so text deduplication alone
+	// would let each fresh snapshot post again.
+	progress.text = "Now running the test suite..."
+	if err := tr.ReportTaskStatus(context.Background(), task); err != nil {
+		t.Fatalf("unexpected error on third cycle: %v", err)
+	}
+	if attempts != 1 {
+		t.Errorf("expected no post attempt for a new snapshot, got %d total", attempts)
 	}
 }

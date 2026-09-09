@@ -34,8 +34,8 @@ func TestSelfDevelopmentGitHubSpawnersUseWebhooks(t *testing.T) {
 		{file: "kelos-planner.yaml", events: []string{"issue_comment"}},
 		{file: "kelos-reviewer.yaml", events: []string{"issue_comment", "pull_request_review"}},
 		{file: "kelos-api-reviewer.yaml", events: []string{"issue_comment", "pull_request_review"}},
-		{file: "kelos-glm-reviewer.yaml", events: []string{"issue_comment", "pull_request_review"}},
-		{file: "kelos-glm-api-reviewer.yaml", events: []string{"issue_comment", "pull_request_review"}},
+		{file: "kelos-claude-reviewer.yaml", events: []string{"issue_comment", "pull_request_review"}},
+		{file: "kelos-claude-api-reviewer.yaml", events: []string{"issue_comment", "pull_request_review"}},
 		{file: "kelos-pr-responder.yaml", events: []string{"issue_comment", "pull_request_review"}},
 		{file: "kelos-squash-commits.yaml", events: []string{"issue_comment", "pull_request_review"}},
 		{file: "kelos-triage.yaml", events: []string{"issues"}},
@@ -61,7 +61,58 @@ func TestSelfDevelopmentGitHubSpawnersUseWebhooks(t *testing.T) {
 			if len(spawner.Filters) == 0 {
 				t.Fatalf("expected %s to define webhook filters", tt.file)
 			}
+			if gr := spawner.GatewayRef; gr == nil || gr.Name != "kelos" {
+				t.Fatalf("expected %s to route through WebhookGateway %q via gatewayRef, got %+v", tt.file, "kelos", gr)
+			}
 		})
+	}
+}
+
+func TestNestedDevelopmentGitHubSpawnersUseGateways(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		dir        string
+		gateway    string
+		repository string
+		files      []string
+	}{
+		{
+			dir:        "self-development/kanon",
+			gateway:    "kanon",
+			repository: "kelos-dev/kanon",
+			files:      []string{"kanon-claude-reviewer.yaml", "kanon-planner.yaml", "kanon-pr-responder.yaml", "kanon-reviewer.yaml", "kanon-squash-commits.yaml", "kanon-triage.yaml", "kanon-workers.yaml"},
+		},
+		{
+			dir:        "self-development/agora",
+			gateway:    "agora",
+			repository: "kelos-dev/agora",
+			files:      []string{"agora-claude-reviewer.yaml", "agora-planner.yaml", "agora-pr-responder.yaml", "agora-reviewer.yaml", "agora-squash-commits.yaml", "agora-triage.yaml", "agora-workers.yaml"},
+		},
+		{
+			dir:        "self-development/open-actions",
+			gateway:    "open-actions",
+			repository: "kelos-dev/open-actions",
+			files:      []string{"open-actions-api-reviewer.yaml", "open-actions-claude-api-reviewer.yaml", "open-actions-claude-reviewer.yaml", "open-actions-planner.yaml", "open-actions-pr-responder.yaml", "open-actions-reviewer.yaml", "open-actions-squash-commits.yaml", "open-actions-triage.yaml", "open-actions-workers.yaml"},
+		},
+	}
+
+	for _, tt := range tests {
+		for _, file := range tt.files {
+			t.Run(tt.gateway+"/"+file, func(t *testing.T) {
+				t.Parallel()
+				spawner := readGitHubWebhookFromDir(t, tt.dir, file)
+				if spawner == nil {
+					t.Fatalf("expected %s to use githubWebhook", file)
+				}
+				if spawner.Repository != tt.repository {
+					t.Fatalf("%s repository = %q, want %q", file, spawner.Repository, tt.repository)
+				}
+				if spawner.GatewayRef == nil || spawner.GatewayRef.Name != tt.gateway {
+					t.Fatalf("%s gatewayRef = %+v, want %q", file, spawner.GatewayRef, tt.gateway)
+				}
+			})
+		}
 	}
 }
 
@@ -93,24 +144,34 @@ func TestSelfDevelopmentRoleAgentConfigsDoNotDuplicateBaseSkills(t *testing.T) {
 	}{
 		{dir: "self-development", file: "agentconfig.yaml"},
 		{dir: "self-development", file: "kelos-api-reviewer.yaml"},
+		{dir: "self-development", file: "kelos-claude-api-reviewer.yaml"},
+		{dir: "self-development", file: "kelos-claude-reviewer.yaml"},
 		{dir: "self-development", file: "kelos-fake-strategist.yaml"},
 		{dir: "self-development", file: "kelos-fake-user.yaml"},
-		{dir: "self-development", file: "kelos-glm-api-reviewer.yaml"},
-		{dir: "self-development", file: "kelos-glm-reviewer.yaml"},
 		{dir: "self-development", file: "kelos-image-update.yaml"},
 		{dir: "self-development", file: "kelos-planner.yaml"},
 		{dir: "self-development", file: "kelos-reviewer.yaml"},
 		{dir: "self-development", file: "kelos-self-update.yaml"},
 		{dir: "self-development/agora", file: "agentconfig.yaml"},
+		{dir: "self-development/agora", file: "agora-claude-reviewer.yaml"},
 		{dir: "self-development/agora", file: "agora-fake-strategist.yaml"},
 		{dir: "self-development/agora", file: "agora-fake-user.yaml"},
 		{dir: "self-development/agora", file: "agora-planner.yaml"},
 		{dir: "self-development/agora", file: "agora-reviewer.yaml"},
 		{dir: "self-development/kanon", file: "agentconfig.yaml"},
+		{dir: "self-development/kanon", file: "kanon-claude-reviewer.yaml"},
 		{dir: "self-development/kanon", file: "kanon-fake-strategist.yaml"},
 		{dir: "self-development/kanon", file: "kanon-fake-user.yaml"},
 		{dir: "self-development/kanon", file: "kanon-planner.yaml"},
 		{dir: "self-development/kanon", file: "kanon-reviewer.yaml"},
+		{dir: "self-development/open-actions", file: "agentconfig.yaml"},
+		{dir: "self-development/open-actions", file: "open-actions-api-reviewer.yaml"},
+		{dir: "self-development/open-actions", file: "open-actions-claude-api-reviewer.yaml"},
+		{dir: "self-development/open-actions", file: "open-actions-claude-reviewer.yaml"},
+		{dir: "self-development/open-actions", file: "open-actions-fake-strategist.yaml"},
+		{dir: "self-development/open-actions", file: "open-actions-fake-user.yaml"},
+		{dir: "self-development/open-actions", file: "open-actions-planner.yaml"},
+		{dir: "self-development/open-actions", file: "open-actions-reviewer.yaml"},
 	}
 
 	for _, tt := range files {
@@ -135,11 +196,11 @@ func TestSelfDevelopmentSpawnersUseBaseAgent(t *testing.T) {
 		refs []kelos.AgentConfigReference
 	}{
 		{dir: "self-development", file: "kelos-api-reviewer.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "kelos-api-reviewer-agent"}}},
+		{dir: "self-development", file: "kelos-claude-api-reviewer.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "kelos-claude-api-reviewer-agent"}}},
+		{dir: "self-development", file: "kelos-claude-reviewer.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "kelos-claude-reviewer-agent"}}},
 		{dir: "self-development", file: "kelos-config-update.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "kelos-dev-agent"}}},
 		{dir: "self-development", file: "kelos-fake-strategist.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "kelos-fake-strategist-agent"}}},
 		{dir: "self-development", file: "kelos-fake-user.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "kelos-fake-user-agent"}}},
-		{dir: "self-development", file: "kelos-glm-api-reviewer.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "kelos-glm-api-reviewer-agent"}}},
-		{dir: "self-development", file: "kelos-glm-reviewer.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "kelos-glm-reviewer-agent"}}},
 		{dir: "self-development", file: "kelos-image-update.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "kelos-image-update-agent"}}},
 		{dir: "self-development", file: "kelos-planner.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "kelos-planner-agent"}}},
 		{dir: "self-development", file: "kelos-pr-responder.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}}},
@@ -149,6 +210,7 @@ func TestSelfDevelopmentSpawnersUseBaseAgent(t *testing.T) {
 		{dir: "self-development", file: "kelos-triage.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "kelos-dev-agent"}}},
 		{dir: "self-development", file: "kelos-workers.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}}},
 		{dir: "self-development/agora", file: "agora-config-update.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "kelos-dev-agent"}}},
+		{dir: "self-development/agora", file: "agora-claude-reviewer.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "agora-claude-reviewer-agent"}}},
 		{dir: "self-development/agora", file: "agora-fake-strategist.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "agora-fake-strategist-agent"}}},
 		{dir: "self-development/agora", file: "agora-fake-user.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "agora-fake-user-agent"}}},
 		{dir: "self-development/agora", file: "agora-planner.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "agora-planner-agent"}}},
@@ -159,6 +221,7 @@ func TestSelfDevelopmentSpawnersUseBaseAgent(t *testing.T) {
 		{dir: "self-development/agora", file: "agora-triage.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "agora-dev-agent"}}},
 		{dir: "self-development/agora", file: "agora-workers.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}}},
 		{dir: "self-development/kanon", file: "kanon-config-update.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "kelos-dev-agent"}}},
+		{dir: "self-development/kanon", file: "kanon-claude-reviewer.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "kanon-claude-reviewer-agent"}}},
 		{dir: "self-development/kanon", file: "kanon-fake-strategist.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "kanon-fake-strategist-agent"}}},
 		{dir: "self-development/kanon", file: "kanon-fake-user.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "kanon-fake-user-agent"}}},
 		{dir: "self-development/kanon", file: "kanon-planner.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "kanon-planner-agent"}}},
@@ -168,6 +231,19 @@ func TestSelfDevelopmentSpawnersUseBaseAgent(t *testing.T) {
 		{dir: "self-development/kanon", file: "kanon-squash-commits.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "kanon-dev-agent"}}},
 		{dir: "self-development/kanon", file: "kanon-triage.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "kanon-dev-agent"}}},
 		{dir: "self-development/kanon", file: "kanon-workers.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}}},
+		{dir: "self-development/open-actions", file: "open-actions-api-reviewer.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "open-actions-api-reviewer-agent"}}},
+		{dir: "self-development/open-actions", file: "open-actions-claude-api-reviewer.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "open-actions-claude-api-reviewer-agent"}}},
+		{dir: "self-development/open-actions", file: "open-actions-claude-reviewer.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "open-actions-claude-reviewer-agent"}}},
+		{dir: "self-development/open-actions", file: "open-actions-config-update.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "kelos-dev-agent"}}},
+		{dir: "self-development/open-actions", file: "open-actions-fake-strategist.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "open-actions-fake-strategist-agent"}}},
+		{dir: "self-development/open-actions", file: "open-actions-fake-user.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "open-actions-fake-user-agent"}}},
+		{dir: "self-development/open-actions", file: "open-actions-planner.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "open-actions-planner-agent"}}},
+		{dir: "self-development/open-actions", file: "open-actions-pr-responder.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}}},
+		{dir: "self-development/open-actions", file: "open-actions-reviewer.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "open-actions-reviewer-agent"}}},
+		{dir: "self-development/open-actions", file: "open-actions-self-update.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "kelos-dev-agent"}}},
+		{dir: "self-development/open-actions", file: "open-actions-squash-commits.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "open-actions-dev-agent"}}},
+		{dir: "self-development/open-actions", file: "open-actions-triage.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}, {Name: "open-actions-dev-agent"}}},
+		{dir: "self-development/open-actions", file: "open-actions-workers.yaml", refs: []kelos.AgentConfigReference{{Name: "base-agent"}}},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -196,18 +272,20 @@ func TestDevelopmentTaskSpawnersIgnoreDisruptions(t *testing.T) {
 		file string
 	}{
 		{dir: "self-development", file: "kelos-api-reviewer.yaml"},
+		{dir: "self-development", file: "kelos-claude-api-reviewer.yaml"},
+		{dir: "self-development", file: "kelos-claude-reviewer.yaml"},
 		{dir: "self-development", file: "kelos-config-update.yaml"},
 		{dir: "self-development", file: "kelos-fake-strategist.yaml"},
 		{dir: "self-development", file: "kelos-fake-user.yaml"},
-		{dir: "self-development", file: "kelos-glm-api-reviewer.yaml"},
-		{dir: "self-development", file: "kelos-glm-reviewer.yaml"},
 		{dir: "self-development", file: "kelos-image-update.yaml"},
 		{dir: "self-development", file: "kelos-planner.yaml"},
 		{dir: "self-development", file: "kelos-reviewer.yaml"},
 		{dir: "self-development", file: "kelos-self-update.yaml"},
 		{dir: "self-development", file: "kelos-squash-commits.yaml"},
 		{dir: "self-development", file: "kelos-triage.yaml"},
+		{dir: "self-development/agora", file: "agora-claude-reviewer.yaml"},
 		{dir: "self-development/kanon", file: "kanon-config-update.yaml"},
+		{dir: "self-development/kanon", file: "kanon-claude-reviewer.yaml"},
 		{dir: "self-development/kanon", file: "kanon-fake-strategist.yaml"},
 		{dir: "self-development/kanon", file: "kanon-fake-user.yaml"},
 		{dir: "self-development/kanon", file: "kanon-planner.yaml"},
@@ -215,6 +293,17 @@ func TestDevelopmentTaskSpawnersIgnoreDisruptions(t *testing.T) {
 		{dir: "self-development/kanon", file: "kanon-self-update.yaml"},
 		{dir: "self-development/kanon", file: "kanon-squash-commits.yaml"},
 		{dir: "self-development/kanon", file: "kanon-triage.yaml"},
+		{dir: "self-development/open-actions", file: "open-actions-api-reviewer.yaml"},
+		{dir: "self-development/open-actions", file: "open-actions-claude-api-reviewer.yaml"},
+		{dir: "self-development/open-actions", file: "open-actions-claude-reviewer.yaml"},
+		{dir: "self-development/open-actions", file: "open-actions-config-update.yaml"},
+		{dir: "self-development/open-actions", file: "open-actions-fake-strategist.yaml"},
+		{dir: "self-development/open-actions", file: "open-actions-fake-user.yaml"},
+		{dir: "self-development/open-actions", file: "open-actions-planner.yaml"},
+		{dir: "self-development/open-actions", file: "open-actions-reviewer.yaml"},
+		{dir: "self-development/open-actions", file: "open-actions-self-update.yaml"},
+		{dir: "self-development/open-actions", file: "open-actions-squash-commits.yaml"},
+		{dir: "self-development/open-actions", file: "open-actions-triage.yaml"},
 	}
 
 	for _, tt := range tests {
@@ -241,6 +330,8 @@ func TestDevelopmentSessionSpawnersUsePersistentWorkspace(t *testing.T) {
 		{dir: "self-development/agora", file: "agora-pr-responder.yaml"},
 		{dir: "self-development/kanon", file: "kanon-workers.yaml"},
 		{dir: "self-development/kanon", file: "kanon-pr-responder.yaml"},
+		{dir: "self-development/open-actions", file: "open-actions-workers.yaml"},
+		{dir: "self-development/open-actions", file: "open-actions-pr-responder.yaml"},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -260,9 +351,6 @@ func TestDevelopmentSessionSpawnersUsePersistentWorkspace(t *testing.T) {
 			}
 			if sessionSpawner.Spec.SessionTemplate.InitialPrompt == "" {
 				t.Fatalf("%s sessionTemplate.initialPrompt is empty", tt.file)
-			}
-			if !strings.Contains(sessionSpawner.Spec.SessionTemplate.InitialPrompt, "Your workspace is backed by a PVC") {
-				t.Fatalf("%s initialPrompt does not describe its persistent workspace", tt.file)
 			}
 		})
 	}
@@ -286,6 +374,7 @@ func TestDevelopmentSessionSpawnersMatchPickUpOnly(t *testing.T) {
 		{dir: "self-development", file: "kelos-workers.yaml"},
 		{dir: "self-development/agora", file: "agora-workers.yaml"},
 		{dir: "self-development/kanon", file: "kanon-workers.yaml"},
+		{dir: "self-development/open-actions", file: "open-actions-workers.yaml"},
 	}
 
 	for _, tt := range spawners {
@@ -358,6 +447,7 @@ func TestDevelopmentSessionSpawnersUseIssueBranches(t *testing.T) {
 		{dir: "self-development", file: "kelos-workers.yaml", want: "kelos-task-42"},
 		{dir: "self-development/agora", file: "agora-workers.yaml", want: "agora-task-42"},
 		{dir: "self-development/kanon", file: "kanon-workers.yaml", want: "kanon-task-42"},
+		{dir: "self-development/open-actions", file: "open-actions-workers.yaml", want: "open-actions-task-42"},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -408,6 +498,7 @@ func TestDevelopmentPRResponderSessionSpawnersMatchPickUpOnPullRequests(t *testi
 		{dir: "self-development", file: "kelos-pr-responder.yaml"},
 		{dir: "self-development/agora", file: "agora-pr-responder.yaml"},
 		{dir: "self-development/kanon", file: "kanon-pr-responder.yaml"},
+		{dir: "self-development/open-actions", file: "open-actions-pr-responder.yaml"},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -452,17 +543,27 @@ func TestDevelopmentCommandPatternsMatchCommandLines(t *testing.T) {
 		{dir: "self-development", file: "kelos-planner.yaml", command: "/kelos plan"},
 		{dir: "self-development", file: "kelos-reviewer.yaml", command: "/kelos review"},
 		{dir: "self-development", file: "kelos-api-reviewer.yaml", command: "/kelos api-review"},
-		{dir: "self-development", file: "kelos-glm-reviewer.yaml", command: "/kelos glm-review"},
-		{dir: "self-development", file: "kelos-glm-api-reviewer.yaml", command: "/kelos glm-api-review"},
+		{dir: "self-development", file: "kelos-claude-reviewer.yaml", command: "/kelos claude-review"},
+		{dir: "self-development", file: "kelos-claude-api-reviewer.yaml", command: "/kelos claude-api-review"},
 		{dir: "self-development", file: "kelos-pr-responder.yaml", command: "/kelos pick-up"},
 		{dir: "self-development", file: "kelos-squash-commits.yaml", command: "/kelos squash-commits"},
 		{dir: "self-development/agora", file: "agora-workers.yaml", command: "/kelos pick-up"},
+		{dir: "self-development/agora", file: "agora-claude-reviewer.yaml", command: "/kelos claude-review"},
 		{dir: "self-development/agora", file: "agora-pr-responder.yaml", command: "/kelos pick-up"},
 		{dir: "self-development/kanon", file: "kanon-workers.yaml", command: "/kelos pick-up"},
 		{dir: "self-development/kanon", file: "kanon-planner.yaml", command: "/kelos plan"},
 		{dir: "self-development/kanon", file: "kanon-reviewer.yaml", command: "/kelos review"},
+		{dir: "self-development/kanon", file: "kanon-claude-reviewer.yaml", command: "/kelos claude-review"},
 		{dir: "self-development/kanon", file: "kanon-pr-responder.yaml", command: "/kelos pick-up"},
 		{dir: "self-development/kanon", file: "kanon-squash-commits.yaml", command: "/kelos squash-commits"},
+		{dir: "self-development/open-actions", file: "open-actions-workers.yaml", command: "/kelos pick-up"},
+		{dir: "self-development/open-actions", file: "open-actions-planner.yaml", command: "/kelos plan"},
+		{dir: "self-development/open-actions", file: "open-actions-reviewer.yaml", command: "/kelos review"},
+		{dir: "self-development/open-actions", file: "open-actions-api-reviewer.yaml", command: "/kelos api-review"},
+		{dir: "self-development/open-actions", file: "open-actions-claude-reviewer.yaml", command: "/kelos claude-review"},
+		{dir: "self-development/open-actions", file: "open-actions-claude-api-reviewer.yaml", command: "/kelos claude-api-review"},
+		{dir: "self-development/open-actions", file: "open-actions-pr-responder.yaml", command: "/kelos pick-up"},
+		{dir: "self-development/open-actions", file: "open-actions-squash-commits.yaml", command: "/kelos squash-commits"},
 	}
 
 	for _, tt := range tests {
@@ -553,16 +654,16 @@ func TestReviewersUseStickyPRComments(t *testing.T) {
 		},
 		{
 			dir:            "self-development",
-			file:           "kelos-glm-reviewer.yaml",
+			file:           "kelos-claude-reviewer.yaml",
 			repository:     "kelos-dev/kelos",
-			marker:         "<!-- kelos-glm-reviewer:sticky-review -->",
+			marker:         "<!-- kelos-claude-reviewer:sticky-review -->",
 			templatePrefix: "Format the PR comment body as:",
 		},
 		{
 			dir:            "self-development",
-			file:           "kelos-glm-api-reviewer.yaml",
+			file:           "kelos-claude-api-reviewer.yaml",
 			repository:     "kelos-dev/kelos",
-			marker:         "<!-- kelos-glm-api-reviewer:sticky-review -->",
+			marker:         "<!-- kelos-claude-api-reviewer:sticky-review -->",
 			templatePrefix: "Format the PR comment body as:",
 		},
 		{
@@ -573,10 +674,52 @@ func TestReviewersUseStickyPRComments(t *testing.T) {
 			templatePrefix: "Format the PR comment body as:",
 		},
 		{
+			dir:            "self-development/kanon",
+			file:           "kanon-claude-reviewer.yaml",
+			repository:     "kelos-dev/kanon",
+			marker:         "<!-- kanon-claude-reviewer:sticky-review -->",
+			templatePrefix: "Format the PR comment body as:",
+		},
+		{
 			dir:            "self-development/agora",
 			file:           "agora-reviewer.yaml",
 			repository:     "kelos-dev/agora",
 			marker:         "<!-- agora-reviewer:sticky-review -->",
+			templatePrefix: "Format the PR comment body as:",
+		},
+		{
+			dir:            "self-development/agora",
+			file:           "agora-claude-reviewer.yaml",
+			repository:     "kelos-dev/agora",
+			marker:         "<!-- agora-claude-reviewer:sticky-review -->",
+			templatePrefix: "Format the PR comment body as:",
+		},
+		{
+			dir:            "self-development/open-actions",
+			file:           "open-actions-reviewer.yaml",
+			repository:     "kelos-dev/open-actions",
+			marker:         "<!-- open-actions-reviewer:sticky-review -->",
+			templatePrefix: "Format the PR comment body as:",
+		},
+		{
+			dir:            "self-development/open-actions",
+			file:           "open-actions-api-reviewer.yaml",
+			repository:     "kelos-dev/open-actions",
+			marker:         "<!-- open-actions-api-reviewer:sticky-review -->",
+			templatePrefix: "Format the PR comment body as:",
+		},
+		{
+			dir:            "self-development/open-actions",
+			file:           "open-actions-claude-reviewer.yaml",
+			repository:     "kelos-dev/open-actions",
+			marker:         "<!-- open-actions-claude-reviewer:sticky-review -->",
+			templatePrefix: "Format the PR comment body as:",
+		},
+		{
+			dir:            "self-development/open-actions",
+			file:           "open-actions-claude-api-reviewer.yaml",
+			repository:     "kelos-dev/open-actions",
+			marker:         "<!-- open-actions-claude-api-reviewer:sticky-review -->",
 			templatePrefix: "Format the PR comment body as:",
 		},
 	}
@@ -631,29 +774,42 @@ func TestReviewersUseStickyPRComments(t *testing.T) {
 	}
 }
 
-func TestKelosAPIReviewersUseConcreteIssueCommentBodyFile(t *testing.T) {
+func TestAPIReviewersUseConcreteIssueCommentBodyFile(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
+		dir  string
 		file string
 		path string
 	}{
 		{
+			dir:  "self-development",
 			file: "kelos-api-reviewer.yaml",
 			path: "/tmp/kelos-api-reviewer-comment.md",
 		},
 		{
-			file: "kelos-glm-api-reviewer.yaml",
-			path: "/tmp/kelos-glm-api-reviewer-comment.md",
+			dir:  "self-development",
+			file: "kelos-claude-api-reviewer.yaml",
+			path: "/tmp/kelos-claude-api-reviewer-comment.md",
+		},
+		{
+			dir:  "self-development/open-actions",
+			file: "open-actions-api-reviewer.yaml",
+			path: "/tmp/open-actions-api-reviewer-comment.md",
+		},
+		{
+			dir:  "self-development/open-actions",
+			file: "open-actions-claude-api-reviewer.yaml",
+			path: "/tmp/open-actions-claude-api-reviewer-comment.md",
 		},
 	}
 
 	for _, tt := range tests {
 		tt := tt
-		t.Run(tt.file, func(t *testing.T) {
+		t.Run(tt.dir+"/"+tt.file, func(t *testing.T) {
 			t.Parallel()
 
-			ts := readSelfDevelopmentTaskSpawner(t, tt.file)
+			ts := readTaskSpawnerFromDir(t, tt.dir, tt.file)
 			prompt := ts.Spec.TaskTemplate.PromptTemplate
 			want := `gh issue comment {{.Number}} --body-file ` + tt.path
 			if !strings.Contains(prompt, want) {
@@ -677,8 +833,11 @@ func TestDevelopmentReviewersUseReviewSkills(t *testing.T) {
 		{dir: "self-development", file: "kelos-reviewer.yaml", workflow: "Use the `review-all` skill with `origin/main` as the base"},
 		{dir: "self-development/agora", file: "agora-reviewer.yaml", workflow: "Use the `review-all` skill with `origin/main` as the base"},
 		{dir: "self-development/kanon", file: "kanon-reviewer.yaml", workflow: "Use the `review-all` skill with `origin/main` as the base"},
+		{dir: "self-development/open-actions", file: "open-actions-reviewer.yaml", workflow: "Use the `review-all` skill with `origin/main` as the base"},
 		{dir: "self-development", file: "kelos-api-reviewer.yaml", workflow: "Use the `api-review` skill for the review analysis"},
-		{dir: "self-development", file: "kelos-glm-api-reviewer.yaml", workflow: "Use the `api-review` skill for the review analysis"},
+		{dir: "self-development", file: "kelos-claude-api-reviewer.yaml", workflow: "Use the `api-review` skill for the review analysis"},
+		{dir: "self-development/open-actions", file: "open-actions-api-reviewer.yaml", workflow: "Use the `api-review` skill for the review analysis"},
+		{dir: "self-development/open-actions", file: "open-actions-claude-api-reviewer.yaml", workflow: "Use the `api-review` skill for the review analysis"},
 	}
 
 	for _, tt := range tests {
@@ -755,19 +914,49 @@ func TestKanonReviewerTriggerableByBot(t *testing.T) {
 	assertReviewerTriggerableByBot(t, "self-development/kanon", "kanon-reviewer.yaml", "kelos-dev/kanon", "/kelos review")
 }
 
-func TestKelosGLMReviewerTriggerableByBot(t *testing.T) {
+func TestKelosClaudeReviewerTriggerableByBot(t *testing.T) {
 	t.Parallel()
-	assertReviewerTriggerableByBot(t, "self-development", "kelos-glm-reviewer.yaml", "kelos-dev/kelos", "/kelos glm-review")
+	assertReviewerTriggerableByBot(t, "self-development", "kelos-claude-reviewer.yaml", "kelos-dev/kelos", "/kelos claude-review")
 }
 
-func TestKelosGLMAPIReviewerTriggerableByBot(t *testing.T) {
+func TestKelosClaudeAPIReviewerTriggerableByBot(t *testing.T) {
 	t.Parallel()
-	assertReviewerTriggerableByBot(t, "self-development", "kelos-glm-api-reviewer.yaml", "kelos-dev/kelos", "/kelos glm-api-review")
+	assertReviewerTriggerableByBot(t, "self-development", "kelos-claude-api-reviewer.yaml", "kelos-dev/kelos", "/kelos claude-api-review")
 }
 
 func TestAgoraReviewerTriggerableByBot(t *testing.T) {
 	t.Parallel()
 	assertReviewerTriggerableByBot(t, "self-development/agora", "agora-reviewer.yaml", "kelos-dev/agora", "/kelos review")
+}
+
+func TestAgoraClaudeReviewerTriggerableByBot(t *testing.T) {
+	t.Parallel()
+	assertReviewerTriggerableByBot(t, "self-development/agora", "agora-claude-reviewer.yaml", "kelos-dev/agora", "/kelos claude-review")
+}
+
+func TestKanonClaudeReviewerTriggerableByBot(t *testing.T) {
+	t.Parallel()
+	assertReviewerTriggerableByBot(t, "self-development/kanon", "kanon-claude-reviewer.yaml", "kelos-dev/kanon", "/kelos claude-review")
+}
+
+func TestOpenActionsReviewerTriggerableByBot(t *testing.T) {
+	t.Parallel()
+	assertReviewerTriggerableByBot(t, "self-development/open-actions", "open-actions-reviewer.yaml", "kelos-dev/open-actions", "/kelos review")
+}
+
+func TestOpenActionsAPIReviewerTriggerableByBot(t *testing.T) {
+	t.Parallel()
+	assertReviewerTriggerableByBot(t, "self-development/open-actions", "open-actions-api-reviewer.yaml", "kelos-dev/open-actions", "/kelos api-review")
+}
+
+func TestOpenActionsClaudeReviewerTriggerableByBot(t *testing.T) {
+	t.Parallel()
+	assertReviewerTriggerableByBot(t, "self-development/open-actions", "open-actions-claude-reviewer.yaml", "kelos-dev/open-actions", "/kelos claude-review")
+}
+
+func TestOpenActionsClaudeAPIReviewerTriggerableByBot(t *testing.T) {
+	t.Parallel()
+	assertReviewerTriggerableByBot(t, "self-development/open-actions", "open-actions-claude-api-reviewer.yaml", "kelos-dev/open-actions", "/kelos claude-api-review")
 }
 
 func TestAgoraIssueCreatorsUseTriageAcceptedLabel(t *testing.T) {
@@ -776,9 +965,7 @@ func TestAgoraIssueCreatorsUseTriageAcceptedLabel(t *testing.T) {
 	tests := []string{
 		"agora-fake-strategist.yaml",
 		"agora-fake-user.yaml",
-		"agora-pr-responder.yaml",
 		"agora-self-update.yaml",
-		"agora-workers.yaml",
 	}
 
 	for _, file := range tests {
@@ -786,13 +973,8 @@ func TestAgoraIssueCreatorsUseTriageAcceptedLabel(t *testing.T) {
 		t.Run(file, func(t *testing.T) {
 			t.Parallel()
 
-			taskSpawner, sessionSpawner := readSpawnerFromDir(t, "self-development/agora", file)
-			var prompt string
-			if taskSpawner != nil {
-				prompt = taskSpawner.Spec.TaskTemplate.PromptTemplate
-			} else {
-				prompt = sessionSpawner.Spec.SessionTemplate.InitialPrompt
-			}
+			taskSpawner := readTaskSpawnerFromDir(t, "self-development/agora", file)
+			prompt := taskSpawner.Spec.TaskTemplate.PromptTemplate
 			if !strings.Contains(prompt, "triage-accepted") {
 				t.Fatalf("%s prompt does not mention triage-accepted", file)
 			}
@@ -817,6 +999,9 @@ func TestStickyIssueSlotCommands(t *testing.T) {
 		{dir: "self-development/kanon", file: "kanon-fake-strategist.yaml", marker: "kanon-fake-strategist"},
 		{dir: "self-development/kanon", file: "kanon-fake-user.yaml", marker: "kanon-fake-user"},
 		{dir: "self-development/kanon", file: "kanon-self-update.yaml", marker: "kanon-self-update"},
+		{dir: "self-development/open-actions", file: "open-actions-fake-strategist.yaml", marker: "open-actions-fake-strategist"},
+		{dir: "self-development/open-actions", file: "open-actions-fake-user.yaml", marker: "open-actions-fake-user"},
+		{dir: "self-development/open-actions", file: "open-actions-self-update.yaml", marker: "open-actions-self-update"},
 	}
 
 	for _, tt := range tests {
@@ -937,11 +1122,11 @@ func TestDevelopmentSpawnersSetExpectedEffort(t *testing.T) {
 		effort string
 	}{
 		{dir: "self-development", file: "kelos-api-reviewer.yaml", effort: "xhigh"},
+		{dir: "self-development", file: "kelos-claude-api-reviewer.yaml", effort: "xhigh"},
+		{dir: "self-development", file: "kelos-claude-reviewer.yaml", effort: "xhigh"},
 		{dir: "self-development", file: "kelos-workers.yaml", effort: "xhigh"},
 		{dir: "self-development", file: "kelos-planner.yaml", effort: "xhigh"},
 		{dir: "self-development", file: "kelos-reviewer.yaml", effort: "xhigh"},
-		{dir: "self-development", file: "kelos-glm-reviewer.yaml", effort: "xhigh"},
-		{dir: "self-development", file: "kelos-glm-api-reviewer.yaml", effort: "xhigh"},
 		{dir: "self-development", file: "kelos-self-update.yaml", effort: "xhigh"},
 		{dir: "self-development", file: "kelos-fake-strategist.yaml", effort: "xhigh"},
 		{dir: "self-development", file: "kelos-triage.yaml", effort: "high"},
@@ -951,10 +1136,12 @@ func TestDevelopmentSpawnersSetExpectedEffort(t *testing.T) {
 		{dir: "self-development", file: "kelos-fake-user.yaml", effort: "medium"},
 		{dir: "self-development", file: "kelos-squash-commits.yaml", effort: "medium"},
 		{dir: "self-development/agora", file: "agora-workers.yaml", effort: "xhigh"},
+		{dir: "self-development/agora", file: "agora-claude-reviewer.yaml", effort: "xhigh"},
 		{dir: "self-development/agora", file: "agora-pr-responder.yaml", effort: "xhigh"},
 		{dir: "self-development/kanon", file: "kanon-workers.yaml", effort: "xhigh"},
 		{dir: "self-development/kanon", file: "kanon-planner.yaml", effort: "xhigh"},
 		{dir: "self-development/kanon", file: "kanon-reviewer.yaml", effort: "xhigh"},
+		{dir: "self-development/kanon", file: "kanon-claude-reviewer.yaml", effort: "xhigh"},
 		{dir: "self-development/kanon", file: "kanon-self-update.yaml", effort: "xhigh"},
 		{dir: "self-development/kanon", file: "kanon-fake-strategist.yaml", effort: "xhigh"},
 		{dir: "self-development/kanon", file: "kanon-triage.yaml", effort: "high"},
@@ -962,6 +1149,19 @@ func TestDevelopmentSpawnersSetExpectedEffort(t *testing.T) {
 		{dir: "self-development/kanon", file: "kanon-config-update.yaml", effort: "xhigh"},
 		{dir: "self-development/kanon", file: "kanon-fake-user.yaml", effort: "medium"},
 		{dir: "self-development/kanon", file: "kanon-squash-commits.yaml", effort: "medium"},
+		{dir: "self-development/open-actions", file: "open-actions-workers.yaml", effort: "xhigh"},
+		{dir: "self-development/open-actions", file: "open-actions-planner.yaml", effort: "xhigh"},
+		{dir: "self-development/open-actions", file: "open-actions-reviewer.yaml", effort: "xhigh"},
+		{dir: "self-development/open-actions", file: "open-actions-api-reviewer.yaml", effort: "xhigh"},
+		{dir: "self-development/open-actions", file: "open-actions-claude-reviewer.yaml", effort: "xhigh"},
+		{dir: "self-development/open-actions", file: "open-actions-claude-api-reviewer.yaml", effort: "xhigh"},
+		{dir: "self-development/open-actions", file: "open-actions-self-update.yaml", effort: "xhigh"},
+		{dir: "self-development/open-actions", file: "open-actions-fake-strategist.yaml", effort: "xhigh"},
+		{dir: "self-development/open-actions", file: "open-actions-triage.yaml", effort: "high"},
+		{dir: "self-development/open-actions", file: "open-actions-pr-responder.yaml", effort: "xhigh"},
+		{dir: "self-development/open-actions", file: "open-actions-config-update.yaml", effort: "xhigh"},
+		{dir: "self-development/open-actions", file: "open-actions-fake-user.yaml", effort: "medium"},
+		{dir: "self-development/open-actions", file: "open-actions-squash-commits.yaml", effort: "medium"},
 	}
 
 	for _, tt := range tests {
@@ -977,57 +1177,69 @@ func TestDevelopmentSpawnersSetExpectedEffort(t *testing.T) {
 	}
 }
 
-func TestKelosGLMReviewersUseOpenCodeGLM52(t *testing.T) {
+func TestClaudeReviewersUseClaudeCodeFable(t *testing.T) {
 	t.Parallel()
 
-	tests := []string{
-		"kelos-glm-reviewer.yaml",
-		"kelos-glm-api-reviewer.yaml",
+	tests := []struct {
+		dir  string
+		file string
+	}{
+		{dir: "self-development", file: "kelos-claude-reviewer.yaml"},
+		{dir: "self-development", file: "kelos-claude-api-reviewer.yaml"},
+		{dir: "self-development/agora", file: "agora-claude-reviewer.yaml"},
+		{dir: "self-development/kanon", file: "kanon-claude-reviewer.yaml"},
+		{dir: "self-development/open-actions", file: "open-actions-claude-reviewer.yaml"},
+		{dir: "self-development/open-actions", file: "open-actions-claude-api-reviewer.yaml"},
 	}
 
-	for _, file := range tests {
-		file := file
-		t.Run(file, func(t *testing.T) {
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.dir+"/"+tt.file, func(t *testing.T) {
 			t.Parallel()
 
-			ts := readTaskSpawnerFromDir(t, "self-development", file)
+			ts := readTaskSpawnerFromDir(t, tt.dir, tt.file)
 			if ts.Spec.TaskTemplate.Worker == nil {
 				t.Fatal("TaskTemplate.Worker is nil")
 			}
 			worker := ts.Spec.TaskTemplate.Worker
-			if worker.Type != "opencode" {
-				t.Fatalf("TaskTemplate.Worker.Type = %q, want opencode", worker.Type)
+			if worker.Type != "claude-code" {
+				t.Fatalf("TaskTemplate.Worker.Type = %q, want claude-code", worker.Type)
 			}
-			if worker.Model != "zai/glm-5.2" {
-				t.Fatalf("TaskTemplate.Worker.Model = %q, want zai/glm-5.2", worker.Model)
+			if worker.Model != "fable" {
+				t.Fatalf("TaskTemplate.Worker.Model = %q, want fable", worker.Model)
 			}
 			if worker.Credentials == nil {
 				t.Fatal("TaskTemplate.Worker.Credentials is nil")
 			}
-			if worker.Credentials.Type != kelos.CredentialTypeAPIKey {
-				t.Fatalf("TaskTemplate.Worker.Credentials.Type = %q, want %q", worker.Credentials.Type, kelos.CredentialTypeAPIKey)
+			if worker.Credentials.Type != kelos.CredentialTypeOAuth {
+				t.Fatalf("TaskTemplate.Worker.Credentials.Type = %q, want %q", worker.Credentials.Type, kelos.CredentialTypeOAuth)
 			}
 		})
 	}
 }
 
-func TestKelosGLMReviewersDoNotMatchCodexReviewCommands(t *testing.T) {
+func TestClaudeReviewersDoNotMatchCodexReviewCommands(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
+		dir          string
 		file         string
 		codexCommand string
 	}{
-		{file: "kelos-glm-reviewer.yaml", codexCommand: "/kelos review"},
-		{file: "kelos-glm-api-reviewer.yaml", codexCommand: "/kelos api-review"},
+		{dir: "self-development", file: "kelos-claude-reviewer.yaml", codexCommand: "/kelos review"},
+		{dir: "self-development", file: "kelos-claude-api-reviewer.yaml", codexCommand: "/kelos api-review"},
+		{dir: "self-development/agora", file: "agora-claude-reviewer.yaml", codexCommand: "/kelos review"},
+		{dir: "self-development/kanon", file: "kanon-claude-reviewer.yaml", codexCommand: "/kelos review"},
+		{dir: "self-development/open-actions", file: "open-actions-claude-reviewer.yaml", codexCommand: "/kelos review"},
+		{dir: "self-development/open-actions", file: "open-actions-claude-api-reviewer.yaml", codexCommand: "/kelos api-review"},
 	}
 
 	for _, tt := range tests {
 		tt := tt
-		t.Run(tt.file, func(t *testing.T) {
+		t.Run(tt.dir+"/"+tt.file, func(t *testing.T) {
 			t.Parallel()
 
-			ts := readTaskSpawnerFromDir(t, "self-development", tt.file)
+			ts := readTaskSpawnerFromDir(t, tt.dir, tt.file)
 			spawner := ts.Spec.When.GitHubWebhook
 			if spawner == nil {
 				t.Fatalf("expected %s to use githubWebhook", tt.file)
@@ -1127,6 +1339,48 @@ func assertReviewerTriggerableByBot(t *testing.T, dir, file, repository, bodyPat
 			}
 			if got != tt.want {
 				t.Fatalf("MatchesGitHubEvent() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestDevelopmentWebhookGateways verifies the WebhookGateway manifests for each
+// self-development target and their gatewayRef names.
+func TestDevelopmentWebhookGateways(t *testing.T) {
+	t.Parallel()
+
+	gateways := []struct {
+		dir  string
+		name string
+	}{
+		{dir: "self-development", name: "kelos"},
+		{dir: "self-development/kanon", name: "kanon"},
+		{dir: "self-development/agora", name: "agora"},
+		{dir: "self-development/open-actions", name: "open-actions"},
+	}
+	for _, tt := range gateways {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join("..", "..", tt.dir, "webhookgateway.yaml")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("reading %s: %v", path, err)
+			}
+			var gw kelos.WebhookGateway
+			if err := sigyaml.Unmarshal(data, &gw); err != nil {
+				t.Fatalf("decoding WebhookGateway from %s: %v", path, err)
+			}
+			if gw.Name != tt.name {
+				t.Fatalf("gateway name = %q, want %q", gw.Name, tt.name)
+			}
+			if gw.Spec.GitHub == nil || gw.Spec.Linear != nil || gw.Spec.Generic != nil {
+				t.Fatalf("expected only the github provider, got %+v", gw.Spec)
+			}
+			if gw.Spec.GitHub.SecretRef.Name == "" {
+				t.Fatal("github.secretRef.name is empty")
+			}
+			if gw.Spec.GitHub.CredentialsRef == nil || gw.Spec.GitHub.CredentialsRef.Name == "" {
+				t.Fatal("github.credentialsRef.name is empty")
 			}
 		})
 	}

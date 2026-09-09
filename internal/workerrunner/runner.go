@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	kelos "github.com/kelos-dev/kelos/api/v1alpha2"
@@ -274,6 +275,7 @@ func (r *Runner) executeTask(ctx context.Context, taskName string) error {
 // all agent tooling are directly available on the filesystem.
 func (r *Runner) runAgent(ctx context.Context, task *kelos.Task) error {
 	cmd := exec.CommandContext(ctx, "/kelos_entrypoint.sh", task.Spec.Prompt)
+	configureTaskProcessGroupCancellation(cmd)
 	cmd.Dir = "/workspace/repo"
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -284,7 +286,17 @@ func (r *Runner) runAgent(ctx context.Context, task *kelos.Task) error {
 		return err
 	}
 
-	if err := cmd.Run(); err != nil {
+	err := cmd.Run()
+	if ctx.Err() != nil {
+		// The process group is gone by now, but agent tooling that put itself
+		// in a new session or process group survives that signal. Sweep them
+		// before the runner picks up the next task.
+		killSurvivingTaskProcesses()
+	}
+	// An agent failure short-circuits postCommands: a transfer step that ran
+	// against a failed agent would be indistinguishable from one that ran
+	// against a clean result.
+	if err != nil {
 		return err
 	}
 
@@ -330,6 +342,137 @@ func runHookCommands(
 		}
 	}
 	return nil
+}
+
+// configureTaskProcessGroupCancellation prevents a cancelled task from
+// leaving agent descendants behind in the long-lived worker pod. Without a
+// separate process group, CommandContext kills only /kelos_entrypoint.sh;
+// session drivers and agent CLIs are re-parented to PID 1 and keep consuming
+// resources while the runner starts the next task.
+func configureTaskProcessGroupCancellation(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
+			if errors.Is(err, syscall.ESRCH) {
+				return os.ErrProcessDone
+			}
+			return err
+		}
+		return nil
+	}
+}
+
+// procRoot is the procfs mount the surviving-process sweep enumerates. It is
+// a variable so tests can point it at a fixture directory.
+var procRoot = "/proc"
+
+const (
+	// taskSweepTimeout bounds how long the runner keeps re-sweeping after a
+	// cancelled task before giving up and starting the next task.
+	taskSweepTimeout      = 10 * time.Second
+	taskSweepPollInterval = 50 * time.Millisecond
+)
+
+// killSurvivingTaskProcesses SIGKILLs and reaps every process left in the
+// runner's PID namespace after a cancelled task's process group was killed.
+//
+// Killing the task's process group does not reach descendants that call
+// setsid or setpgid: they leave the group, and once their intermediate parent
+// exits they are re-parented to PID 1, so their ancestry no longer links them
+// to the task either. A namespace-wide sweep is what actually bounds a task
+// to its own lifetime.
+//
+// The sweep repeats kill-and-reap passes until nothing but the runner remains
+// or the deadline expires: a survivor can fork between one enumeration and
+// its own SIGKILL, and exited descendants the runner adopted as PID 1 must be
+// reaped or they stay zombies (holding PIDs and /proc entries) for the life
+// of the worker.
+//
+// The sweep only runs when the runner is PID 1, meaning it owns the PID
+// namespace and every other process in it belongs to the task it just ran.
+// That is the worker pod topology: the agent container's command is the
+// worker runner, and no Kelos pod shares its process namespace. Anywhere else
+// (a developer machine, a test binary) the runner is not PID 1 and cleanup
+// stays limited to the task's process group, so the sweep can never kill
+// unrelated processes.
+func killSurvivingTaskProcesses() {
+	sweepSurvivingTaskProcesses(os.Getpid(), procRoot, syscall.Kill, reapAdoptedChildren, taskSweepTimeout)
+}
+
+func sweepSurvivingTaskProcesses(self int, procRoot string, kill func(pid int, sig syscall.Signal) error, reap func(), timeout time.Duration) {
+	if self != 1 {
+		return
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		// Reap before enumerating: killing the task's process group already
+		// re-parented its exited members to the runner, and unreaped zombies
+		// keep their /proc entries, which would stop the sweep from converging.
+		reap()
+		remaining, err := killProcessesExcept(procRoot, self, kill)
+		if err != nil {
+			log.Printf("Error sweeping surviving task processes: %v", err)
+			return
+		}
+		if remaining == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			log.Printf("Giving up on surviving task process sweep with %d processes remaining after %s", remaining, timeout)
+			return
+		}
+		time.Sleep(taskSweepPollInterval)
+	}
+}
+
+// reapAdoptedChildren drains every exited child the runner has adopted as
+// PID 1. cmd.Run reaps only the entrypoint itself; descendants orphaned by
+// the process-group kill are re-parented to the runner and stay zombies until
+// waited on. The runner runs one task at a time and has already waited on the
+// entrypoint before the sweep starts, so a wildcard wait cannot race os/exec
+// for another command's exit status.
+func reapAdoptedChildren() {
+	for {
+		pid, err := syscall.Wait4(-1, nil, syscall.WNOHANG, nil)
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		if err != nil || pid <= 0 {
+			return
+		}
+	}
+}
+
+// killProcessesExcept SIGKILLs every process listed under procRoot other than
+// self and returns how many were still present. Processes that exited between
+// listing and signalling are neither counted nor an error.
+func killProcessesExcept(procRoot string, self int, kill func(pid int, sig syscall.Signal) error) (int, error) {
+	entries, err := os.ReadDir(procRoot)
+	if err != nil {
+		return 0, fmt.Errorf("reading %s: %w", procRoot, err)
+	}
+
+	remaining := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid <= 0 || pid == self {
+			continue
+		}
+		if err := kill(pid, syscall.SIGKILL); err != nil {
+			if errors.Is(err, syscall.ESRCH) {
+				continue
+			}
+			log.Printf("Error killing surviving task process %d: %v", pid, err)
+		}
+		remaining++
+	}
+	return remaining, nil
 }
 
 func taskAgentEnv(base []string, task *kelos.Task) []string {

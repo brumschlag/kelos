@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["DOM", "DOM.Iterable", "ES2022"],
+    "module": "ES2022",
+    "strict": true,
+    "noImplicitAny": false,
+    "noEmitOnError": true,
+    "rootDir": ".",
+    "outDir": "../web",
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "files": ["app.ts", "login.ts"]
+}

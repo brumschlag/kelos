@@ -120,7 +120,7 @@ jobs:
           kind load docker-image ghcr.io/kelos-dev/kelos-spawner:e2e
           kind load docker-image ghcr.io/kelos-dev/kelos-worker-runner:e2e
           kind load docker-image ghcr.io/kelos-dev/kelos-session-runtime:e2e
-          kind load docker-image ghcr.io/kelos-dev/kelos-session-server:e2e
+          kind load docker-image ghcr.io/kelos-dev/kelos-console-server:e2e
           kind load docker-image ghcr.io/kelos-dev/kelos-webhook-server:e2e
           kind load docker-image ghcr.io/kelos-dev/ghproxy:e2e
           kind load docker-image ghcr.io/kelos-dev/claude-code:e2e
@@ -144,7 +144,7 @@ jobs:
       - name: Deploy controller
         run: |
           kubectl create namespace kelos-system
-          kubectl create secret generic kelos-session-e2e-auth \
+          kubectl create secret generic kelos-console-e2e-auth \
             --namespace kelos-system \
             --from-literal=token=kelos-e2e-token
           kubectl create secret generic kelos-webhook-e2e \
@@ -154,13 +154,13 @@ jobs:
             --version e2e \
             --image-pull-policy Never \
             --disable-heartbeat \
-            --set sessionServer.enabled=true \
-            --set-string sessionServer.secretName=kelos-session-e2e-auth \
-            --set-string sessionServer.defaultNamespace=default \
+            --set consoleServer.enabled=true \
+            --set-string consoleServer.secretName=kelos-console-e2e-auth \
+            --set-string consoleServer.defaultNamespace=default \
             --set webhookServer.sources.github.enabled=true \
             --set-string webhookServer.sources.github.secretName=kelos-webhook-e2e
           kubectl wait --for=condition=available deployment/kelos-controller-manager -n kelos-system --timeout=120s
-          kubectl wait --for=condition=available deployment/kelos-session-server -n kelos-system --timeout=120s
+          kubectl wait --for=condition=available deployment/kelos-console-server -n kelos-system --timeout=120s
           kubectl wait --for=condition=available deployment/kelos-webhook-github -n kelos-system --timeout=120s
 
       - name: Check private skills auth

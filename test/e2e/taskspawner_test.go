@@ -6,6 +6,9 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	kelos "github.com/kelos-dev/kelos/api/v1alpha2"
@@ -212,6 +215,126 @@ var _ = Describe("Cron TaskSpawner", func() {
 		Eventually(func() []string {
 			return f.ListTaskNames("kelos.dev/taskspawner=cron-spawner")
 		}, 3*time.Minute, 2*time.Second).ShouldNot(BeEmpty())
+	})
+
+	It("should reconcile the complete CronJob spec", func() {
+		By("creating a cron TaskSpawner")
+		f.CreateTaskSpawner(&kelos.TaskSpawner{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "cron-spec-sync",
+			},
+			Spec: kelos.TaskSpawnerSpec{
+				When: kelos.When{
+					Cron: &kelos.Cron{
+						Schedule: "0 0 1 1 *",
+					},
+				},
+				TaskTemplate: kelos.TaskTemplate{
+					Worker: &kelos.WorkerSpec{
+						Type:        "claude-code",
+						Credentials: &kelos.Credentials{Type: kelos.CredentialTypeNone},
+					},
+				},
+			},
+		})
+
+		By("waiting for the CronJob to be created")
+		f.WaitForCronJobCreated("cron-spec-sync")
+
+		By("introducing drift across the CronJob, Job, and Pod specs")
+		cronJob, err := f.Clientset.BatchV1().CronJobs(f.Namespace).Get(context.TODO(), "cron-spec-sync", metav1.GetOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		wantSpec := cronJob.Spec.DeepCopy()
+		cronJob.Spec.ConcurrencyPolicy = batchv1.AllowConcurrent
+		failedJobsHistoryLimit := int32(9)
+		cronJob.Spec.FailedJobsHistoryLimit = &failedJobsHistoryLimit
+		backoffLimit := int32(4)
+		cronJob.Spec.JobTemplate.Spec.BackoffLimit = &backoffLimit
+		container := &cronJob.Spec.JobTemplate.Spec.Template.Spec.Containers[0]
+		container.ImagePullPolicy = corev1.PullAlways
+		if wantSpec.JobTemplate.Spec.Template.Spec.Containers[0].ImagePullPolicy == corev1.PullAlways {
+			container.ImagePullPolicy = corev1.PullNever
+		}
+		_, err = f.Clientset.BatchV1().CronJobs(f.Namespace).Update(context.TODO(), cronJob, metav1.UpdateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("waiting for the complete desired spec to be restored")
+		Eventually(func(g Gomega) {
+			updated, getErr := f.Clientset.BatchV1().CronJobs(f.Namespace).Get(context.TODO(), "cron-spec-sync", metav1.GetOptions{})
+			g.Expect(getErr).NotTo(HaveOccurred())
+			g.Expect(apiequality.Semantic.DeepEqual(updated.Spec, *wantSpec)).To(BeTrue())
+		}, time.Minute, time.Second).Should(Succeed())
+	})
+
+	It("should run a cron Task with one of multiple credentials", func() {
+		By("creating two OAuth credential secrets")
+		f.CreateSecret("claude-credentials-a",
+			"CLAUDE_CODE_OAUTH_TOKEN="+oauthToken)
+		f.CreateSecret("claude-credentials-b",
+			"CLAUDE_CODE_OAUTH_TOKEN="+oauthToken)
+
+		maxTotalTasks := int32(1)
+		By("creating a cron TaskSpawner with multiple credentials")
+		f.CreateTaskSpawner(&kelos.TaskSpawner{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "cron-credentials",
+			},
+			Spec: kelos.TaskSpawnerSpec{
+				When: kelos.When{
+					Cron: &kelos.Cron{
+						Schedule: "* * * * *",
+					},
+				},
+				TaskTemplate: kelos.TaskTemplate{
+					Worker: &kelos.WorkerSpec{
+						Type:  "claude-code",
+						Model: claudeCodeModel,
+					},
+					PromptTemplate: "Reply exactly: cron credential pool works",
+				},
+				Credentials: []kelos.SpawnerCredential{
+					{
+						Name:      "account-a",
+						Type:      kelos.CredentialTypeOAuth,
+						SecretRef: kelos.SecretReference{Name: "claude-credentials-a"},
+					},
+					{
+						Name:      "account-b",
+						Type:      kelos.CredentialTypeOAuth,
+						SecretRef: kelos.SecretReference{Name: "claude-credentials-b"},
+					},
+				},
+				MaxTotalTasks: &maxTotalTasks,
+			},
+		})
+
+		By("waiting for a cron Task to be created")
+		var task kelos.Task
+		Eventually(func(g Gomega) {
+			tasks, err := f.KelosClientset.ApiV1alpha2().Tasks(f.Namespace).List(context.TODO(), metav1.ListOptions{
+				LabelSelector: "kelos.dev/taskspawner=cron-credentials",
+			})
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(tasks.Items).To(HaveLen(1))
+			task = tasks.Items[0]
+		}, 3*time.Minute, 2*time.Second).Should(Succeed())
+
+		By("verifying the selected credential is pinned to the Task")
+		credentialSecrets := map[string]string{
+			"account-a": "claude-credentials-a",
+			"account-b": "claude-credentials-b",
+		}
+		selectedCredential, assigned := task.Labels["kelos.dev/spawner-credential"]
+		Expect(assigned).To(BeTrue())
+		Expect(credentialSecrets).To(HaveKey(selectedCredential))
+		Expect(task.Spec.Worker).NotTo(BeNil())
+		Expect(task.Spec.Worker.Credentials).NotTo(BeNil())
+		Expect(task.Spec.Worker.Credentials.Type).To(Equal(kelos.CredentialTypeOAuth))
+		Expect(task.Spec.Worker.Credentials.SecretRef).NotTo(BeNil())
+		Expect(task.Spec.Worker.Credentials.SecretRef.Name).To(Equal(credentialSecrets[selectedCredential]))
+
+		By("waiting for the Task to succeed with the selected credential")
+		f.WaitForTaskPhase(task.Name, string(kelos.TaskPhaseSucceeded))
 	})
 
 	It("should deduplicate Tasks across cron ticks when nameTemplate is deterministic", func() {

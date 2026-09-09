@@ -5,6 +5,8 @@ metadata:
 spec:
   when:
     githubWebhook:
+      gatewayRef:
+        name: kelos
       repository: kelos-dev/kelos
       events:
         - issues
@@ -22,13 +24,14 @@ spec:
             - triage-accepted
           state: open
       reporting:
-        enabled: true
+        comments:
+          mode: Sticky
   maxConcurrency: 8
   taskTemplate:
     worker:
       workspaceRef:
         name: kelos-agent
-      model: gpt-5.6-sol
+      model: gpt-6-astra
       effort: high
       type: codex
       credentials:
@@ -40,9 +43,9 @@ spec:
           requests:
             cpu: "250m"
             memory: "512Mi"
-            ephemeral-storage: "2Gi"
+            ephemeral-storage: "10Gi"
           limits:
-            ephemeral-storage: "2Gi"
+            ephemeral-storage: "10Gi"
       agentConfigRefs:
         - name: base-agent
         - name: kelos-dev-agent

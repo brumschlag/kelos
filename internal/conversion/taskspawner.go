@@ -2,6 +2,7 @@ package conversion
 
 import (
 	"context"
+	"encoding/json"
 
 	v1alpha1 "github.com/kelos-dev/kelos/api/v1alpha1"
 	v1alpha2 "github.com/kelos-dev/kelos/api/v1alpha2"
@@ -12,6 +13,45 @@ import (
 // writes the object through v1alpha1 does not silently drop it. v1alpha1 does
 // not gain the capability — the value only survives in this annotation.
 const preservedNameTemplateAnnotation = "kelos.dev/v1alpha2-name-template"
+
+// preservedContextGitHubAppAuthAnnotation carries the githubAppAuth blocks of
+// taskTemplate.contextSources (a v1alpha2-only field) across a v1alpha1
+// round-trip, keyed by context source name. Without it a client that reads and
+// writes the object through v1alpha1 would silently drop GitHub App
+// authentication from a stored v1alpha2 TaskSpawner.
+const preservedContextGitHubAppAuthAnnotation = "kelos.dev/v1alpha2-context-github-app-auth"
+
+// preservedTaskSpawnerCredentialsAnnotation carries spec.credentials across a
+// v1alpha1 round-trip. v1alpha1 receives one credential as a valid fallback,
+// while the complete set remains in this annotation for restoration.
+const preservedTaskSpawnerCredentialsAnnotation = "kelos.dev/v1alpha2-taskspawner-credentials"
+
+// preservedGitHubCommentsReportingAnnotation carries v1alpha2 comment
+// reporting configuration across a v1alpha1 round-trip. v1alpha1 receives
+// enabled: true as a functional fallback while the complete configuration is
+// restored when the object returns to v1alpha2.
+const preservedGitHubCommentsReportingAnnotation = "kelos.dev/v1alpha2-github-comments-reporting"
+
+// preservedWebhookGatewayRefsAnnotation carries v1alpha2 gateway references
+// across a v1alpha1 round-trip without exposing the capability in v1alpha1.
+const preservedWebhookGatewayRefsAnnotation = "kelos.dev/v1alpha2-webhook-gateway-refs"
+
+type preservedWebhookGatewayRefs struct {
+	GitHub  *v1alpha2.GatewayReference `json:"github,omitempty"`
+	Linear  *v1alpha2.GatewayReference `json:"linear,omitempty"`
+	Generic *v1alpha2.GatewayReference `json:"generic,omitempty"`
+}
+
+type preservedGitHubCommentsReporting struct {
+	GitHubIssues       *preservedGitHubCommentsSource `json:"githubIssues,omitempty"`
+	GitHubPullRequests *preservedGitHubCommentsSource `json:"githubPullRequests,omitempty"`
+	GitHubWebhook      *preservedGitHubCommentsSource `json:"githubWebhook,omitempty"`
+}
+
+type preservedGitHubCommentsSource struct {
+	Enabled  bool                             `json:"enabled,omitempty"`
+	Comments v1alpha2.GitHubCommentsReporting `json:"comments"`
+}
 
 func taskSpawnerToHub(_ context.Context, src *v1alpha1.TaskSpawner, dst *v1alpha2.TaskSpawner) error {
 	src.ObjectMeta.DeepCopyInto(&dst.ObjectMeta)
@@ -24,6 +64,18 @@ func taskSpawnerToHub(_ context.Context, src *v1alpha1.TaskSpawner, dst *v1alpha
 	foldTaskSpawnerForward(&src.Spec, &dst.Spec)
 	restorePreservedNameTemplate(src.Annotations, &dst.Spec.TaskTemplate)
 	deleteAnnotation(dst.Annotations, preservedNameTemplateAnnotation)
+	if err := restorePreservedContextGitHubAppAuth(src.Annotations, &dst.Spec.TaskTemplate); err != nil {
+		return err
+	}
+	deleteAnnotation(dst.Annotations, preservedContextGitHubAppAuthAnnotation)
+	if err := restorePreservedTaskSpawnerCredentials(src.Annotations, &dst.Spec); err != nil {
+		return err
+	}
+	deleteAnnotation(dst.Annotations, preservedTaskSpawnerCredentialsAnnotation)
+	restorePreservedGitHubCommentsReporting(src.Annotations, &dst.Spec.When)
+	deleteAnnotation(dst.Annotations, preservedGitHubCommentsReportingAnnotation)
+	restorePreservedWebhookGatewayRefs(src.Annotations, &dst.Spec.When)
+	deleteAnnotation(dst.Annotations, preservedWebhookGatewayRefsAnnotation)
 	return nil
 }
 
@@ -37,7 +89,65 @@ func taskSpawnerFromHub(_ context.Context, src *v1alpha2.TaskSpawner, dst *v1alp
 	}
 	backfillTaskSpawnerLegacy(&dst.Spec)
 	setPreservedNameTemplateAnnotation(dst, src.Spec.TaskTemplate.NameTemplate)
+	if err := setPreservedContextGitHubAppAuth(dst, src.Spec.TaskTemplate); err != nil {
+		return err
+	}
+	if err := setPreservedTaskSpawnerCredentials(dst, src.Spec.Credentials); err != nil {
+		return err
+	}
+	if err := setPreservedGitHubCommentsReporting(dst, src.Spec.When); err != nil {
+		return err
+	}
+	if err := setPreservedWebhookGatewayRefs(dst, src.Spec.When); err != nil {
+		return err
+	}
 	return convertViaJSON(&src.Status, &dst.Status)
+}
+
+func setPreservedWebhookGatewayRefs(dst *v1alpha1.TaskSpawner, when v1alpha2.When) error {
+	preserved := preservedWebhookGatewayRefs{}
+	if when.GitHubWebhook != nil {
+		preserved.GitHub = when.GitHubWebhook.GatewayRef
+	}
+	if when.LinearWebhook != nil {
+		preserved.Linear = when.LinearWebhook.GatewayRef
+	}
+	if when.GenericWebhook != nil {
+		preserved.Generic = when.GenericWebhook.GatewayRef
+	}
+	if preserved.GitHub == nil && preserved.Linear == nil && preserved.Generic == nil {
+		deleteAnnotation(dst.Annotations, preservedWebhookGatewayRefsAnnotation)
+		return nil
+	}
+	data, err := json.Marshal(preserved)
+	if err != nil {
+		return err
+	}
+	if dst.Annotations == nil {
+		dst.Annotations = map[string]string{}
+	}
+	dst.Annotations[preservedWebhookGatewayRefsAnnotation] = string(data)
+	return nil
+}
+
+func restorePreservedWebhookGatewayRefs(annotations map[string]string, when *v1alpha2.When) {
+	raw, ok := annotations[preservedWebhookGatewayRefsAnnotation]
+	if !ok || raw == "" {
+		return
+	}
+	var preserved preservedWebhookGatewayRefs
+	if err := json.Unmarshal([]byte(raw), &preserved); err != nil {
+		return
+	}
+	if when.GitHubWebhook != nil && when.GitHubWebhook.GatewayRef == nil {
+		when.GitHubWebhook.GatewayRef = preserved.GitHub
+	}
+	if when.LinearWebhook != nil && when.LinearWebhook.GatewayRef == nil {
+		when.LinearWebhook.GatewayRef = preserved.Linear
+	}
+	if when.GenericWebhook != nil && when.GenericWebhook.GatewayRef == nil {
+		when.GenericWebhook.GatewayRef = preserved.Generic
+	}
 }
 
 func setPreservedNameTemplateAnnotation(dst *v1alpha1.TaskSpawner, nameTemplate string) {
@@ -58,6 +168,206 @@ func restorePreservedNameTemplate(annotations map[string]string, dst *v1alpha2.T
 	if v, ok := annotations[preservedNameTemplateAnnotation]; ok {
 		dst.NameTemplate = v
 	}
+}
+
+// setPreservedContextGitHubAppAuth records the githubAppAuth block of each
+// context source (keyed by source name) into an annotation on the v1alpha1
+// object so it survives a v1alpha1 round-trip. The annotation is cleared when
+// no context source uses GitHub App auth.
+func setPreservedContextGitHubAppAuth(dst *v1alpha1.TaskSpawner, template v1alpha2.TaskTemplate) error {
+	preserved := map[string]v1alpha2.GitHubAppContextAuth{}
+	for _, cs := range template.ContextSources {
+		if cs.HTTP != nil && cs.HTTP.GitHubAppAuth != nil {
+			preserved[cs.Name] = *cs.HTTP.GitHubAppAuth
+		}
+	}
+	if len(preserved) == 0 {
+		deleteAnnotation(dst.Annotations, preservedContextGitHubAppAuthAnnotation)
+		return nil
+	}
+	data, err := json.Marshal(preserved)
+	if err != nil {
+		return err
+	}
+	if dst.Annotations == nil {
+		dst.Annotations = map[string]string{}
+	}
+	dst.Annotations[preservedContextGitHubAppAuthAnnotation] = string(data)
+	return nil
+}
+
+// restorePreservedContextGitHubAppAuth restores githubAppAuth blocks dropped by
+// a v1alpha1 round-trip onto the matching context sources (by name), unless the
+// source already carries the field.
+func restorePreservedContextGitHubAppAuth(annotations map[string]string, dst *v1alpha2.TaskTemplate) error {
+	raw, ok := annotations[preservedContextGitHubAppAuthAnnotation]
+	if !ok || raw == "" {
+		return nil
+	}
+	preserved := map[string]v1alpha2.GitHubAppContextAuth{}
+	if err := json.Unmarshal([]byte(raw), &preserved); err != nil {
+		// The annotation is best-effort preservation data and can be set by
+		// users; malformed data must not block API version conversion.
+		return nil
+	}
+	for i := range dst.ContextSources {
+		cs := &dst.ContextSources[i]
+		if cs.HTTP == nil || cs.HTTP.GitHubAppAuth != nil {
+			continue
+		}
+		if auth, ok := preserved[cs.Name]; ok {
+			restored := auth
+			cs.HTTP.GitHubAppAuth = &restored
+		}
+	}
+	return nil
+}
+
+func setPreservedTaskSpawnerCredentials(dst *v1alpha1.TaskSpawner, credentials []v1alpha2.SpawnerCredential) error {
+	if len(credentials) == 0 {
+		deleteAnnotation(dst.Annotations, preservedTaskSpawnerCredentialsAnnotation)
+		return nil
+	}
+	data, err := json.Marshal(credentials)
+	if err != nil {
+		return err
+	}
+	if dst.Annotations == nil {
+		dst.Annotations = map[string]string{}
+	}
+	dst.Annotations[preservedTaskSpawnerCredentialsAnnotation] = string(data)
+
+	fallback := taskSpawnerCredentialFallback(credentials)
+	dst.Spec.TaskTemplate.Credentials = v1alpha1.Credentials{
+		Type: v1alpha1.CredentialType(fallback.Type),
+		SecretRef: &v1alpha1.SecretReference{
+			Name: fallback.SecretRef.Name,
+		},
+	}
+	return nil
+}
+
+func restorePreservedTaskSpawnerCredentials(annotations map[string]string, dst *v1alpha2.TaskSpawnerSpec) error {
+	raw, ok := annotations[preservedTaskSpawnerCredentialsAnnotation]
+	if !ok || raw == "" {
+		return nil
+	}
+	var credentials []v1alpha2.SpawnerCredential
+	if err := json.Unmarshal([]byte(raw), &credentials); err != nil || len(credentials) == 0 {
+		return nil
+	}
+	if !matchesProjectedSpawnerCredential(dst.TaskTemplate.Credentials, taskSpawnerCredentialFallback(credentials)) {
+		return nil
+	}
+	dst.Credentials = credentials
+	dst.TaskTemplate.Credentials = nil
+	if dst.TaskTemplate.Worker != nil {
+		dst.TaskTemplate.Worker.Credentials = nil
+	}
+	return nil
+}
+
+func setPreservedGitHubCommentsReporting(dst *v1alpha1.TaskSpawner, when v1alpha2.When) error {
+	preserved := preservedGitHubCommentsReporting{
+		GitHubIssues:       preservedCommentsSource(gitHubIssuesReporting(when)),
+		GitHubPullRequests: preservedCommentsSource(gitHubPullRequestsReporting(when)),
+		GitHubWebhook:      preservedCommentsSource(gitHubWebhookReporting(when)),
+	}
+	if preserved.GitHubIssues == nil && preserved.GitHubPullRequests == nil && preserved.GitHubWebhook == nil {
+		deleteAnnotation(dst.Annotations, preservedGitHubCommentsReportingAnnotation)
+		return nil
+	}
+
+	data, err := json.Marshal(preserved)
+	if err != nil {
+		return err
+	}
+	if dst.Annotations == nil {
+		dst.Annotations = map[string]string{}
+	}
+	dst.Annotations[preservedGitHubCommentsReportingAnnotation] = string(data)
+
+	if preserved.GitHubIssues != nil {
+		dst.Spec.When.GitHubIssues.Reporting.Enabled = true
+	}
+	if preserved.GitHubPullRequests != nil {
+		dst.Spec.When.GitHubPullRequests.Reporting.Enabled = true
+	}
+	if preserved.GitHubWebhook != nil {
+		dst.Spec.When.GitHubWebhook.Reporting.Enabled = true
+	}
+	return nil
+}
+
+func restorePreservedGitHubCommentsReporting(annotations map[string]string, when *v1alpha2.When) {
+	raw, ok := annotations[preservedGitHubCommentsReportingAnnotation]
+	if !ok || raw == "" {
+		return
+	}
+	var preserved preservedGitHubCommentsReporting
+	if err := json.Unmarshal([]byte(raw), &preserved); err != nil {
+		return
+	}
+	restoreCommentsSource(preserved.GitHubIssues, gitHubIssuesReporting(*when))
+	restoreCommentsSource(preserved.GitHubPullRequests, gitHubPullRequestsReporting(*when))
+	restoreCommentsSource(preserved.GitHubWebhook, gitHubWebhookReporting(*when))
+}
+
+func preservedCommentsSource(reporting *v1alpha2.GitHubReporting) *preservedGitHubCommentsSource {
+	if reporting == nil || reporting.Comments == nil {
+		return nil
+	}
+	return &preservedGitHubCommentsSource{
+		Enabled:  reporting.Enabled,
+		Comments: *reporting.Comments,
+	}
+}
+
+func restoreCommentsSource(preserved *preservedGitHubCommentsSource, reporting *v1alpha2.GitHubReporting) {
+	if preserved == nil || reporting == nil || !reporting.Enabled {
+		return
+	}
+	comments := preserved.Comments
+	reporting.Comments = &comments
+	reporting.Enabled = preserved.Enabled
+}
+
+func gitHubIssuesReporting(when v1alpha2.When) *v1alpha2.GitHubReporting {
+	if when.GitHubIssues == nil {
+		return nil
+	}
+	return when.GitHubIssues.Reporting
+}
+
+func gitHubPullRequestsReporting(when v1alpha2.When) *v1alpha2.GitHubReporting {
+	if when.GitHubPullRequests == nil {
+		return nil
+	}
+	return when.GitHubPullRequests.Reporting
+}
+
+func gitHubWebhookReporting(when v1alpha2.When) *v1alpha2.GitHubReporting {
+	if when.GitHubWebhook == nil {
+		return nil
+	}
+	return when.GitHubWebhook.Reporting
+}
+
+func taskSpawnerCredentialFallback(credentials []v1alpha2.SpawnerCredential) v1alpha2.SpawnerCredential {
+	fallback := credentials[0]
+	for _, credential := range credentials[1:] {
+		if credential.Name < fallback.Name {
+			fallback = credential
+		}
+	}
+	return fallback
+}
+
+func matchesProjectedSpawnerCredential(credentials *v1alpha2.Credentials, projected v1alpha2.SpawnerCredential) bool {
+	return credentials != nil &&
+		credentials.Type == projected.Type &&
+		credentials.SecretRef != nil &&
+		credentials.SecretRef.Name == projected.SecretRef.Name
 }
 
 func foldTaskSpawnerForward(src *v1alpha1.TaskSpawnerSpec, dst *v1alpha2.TaskSpawnerSpec) {

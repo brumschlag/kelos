@@ -56,6 +56,42 @@ spec:
           spec:
             description: SessionSpec defines the desired state of a Session.
             properties:
+              idlePolicy:
+                description: |-
+                  IdlePolicy configures automatic lifecycle actions taken after a Session has
+                  been continuously idle. A Session is idle when it has no active turn and
+                  reports no activity; idleness is measured from the later of the last
+                  reported activity time and the Session creation time, and renewed activity
+                  resets the idle period.
+                properties:
+                  deleteAfterSeconds:
+                    description: |-
+                      DeleteAfterSeconds deletes the Session once it has been continuously idle
+                      for the given number of seconds. Deleting the Session removes its workspace
+                      storage, so any uncommitted workspace changes are lost. If this field is
+                      unset, the Session is never deleted for idleness. If it is set to zero, the
+                      Session is eligible for deletion as soon as it goes idle.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  suspendAfterSeconds:
+                    description: |-
+                      SuspendAfterSeconds stops the Session runtime once it has been continuously
+                      idle for the given number of seconds without changing Session.spec.suspend.
+                      Selecting the Session in the web interface or starting a terminal connection
+                      resumes it. If this field is unset, the Session is never suspended for
+                      idleness. If it is set to zero, the Session is eligible for suspension as
+                      soon as it goes idle. When DeleteAfterSeconds is also set,
+                      SuspendAfterSeconds must be less than DeleteAfterSeconds.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                type: object
+                x-kubernetes-validations:
+                - message: suspendAfterSeconds must be less than deleteAfterSeconds
+                    when both are set
+                  rule: '!has(self.suspendAfterSeconds) || !has(self.deleteAfterSeconds)
+                    || self.suspendAfterSeconds < self.deleteAfterSeconds'
               initialBranch:
                 description: |-
                   InitialBranch is the git branch to check out when initializing the Session
@@ -7162,14 +7198,36 @@ spec:
             - worker
             type: object
             x-kubernetes-validations:
-            - message: worker is immutable
-              rule: self.worker == oldSelf.worker
+            - message: worker.credentials is required
+              rule: has(self.worker.credentials)
+            - message: worker.type is immutable
+              rule: has(self.worker.type) == has(oldSelf.worker.type) && (!has(self.worker.type)
+                || self.worker.type == oldSelf.worker.type)
+            - message: worker.effort is immutable
+              rule: '(!has(self.worker.effort) ? '''' : self.worker.effort) == (!has(oldSelf.worker.effort)
+                ? '''' : oldSelf.worker.effort)'
+            - message: worker.image is immutable
+              rule: '(!has(self.worker.image) ? '''' : self.worker.image) == (!has(oldSelf.worker.image)
+                ? '''' : oldSelf.worker.image)'
+            - message: worker.workspaceRef is immutable
+              rule: has(self.worker.workspaceRef) == has(oldSelf.worker.workspaceRef)
+                && (!has(self.worker.workspaceRef) || self.worker.workspaceRef ==
+                oldSelf.worker.workspaceRef)
+            - message: worker.agentConfigRefs is immutable
+              rule: has(self.worker.agentConfigRefs) == has(oldSelf.worker.agentConfigRefs)
+                && (!has(self.worker.agentConfigRefs) || self.worker.agentConfigRefs
+                == oldSelf.worker.agentConfigRefs)
+            - message: worker.podOverrides.serviceAccountName is immutable
+              rule: '(has(self.worker.podOverrides) && has(self.worker.podOverrides.serviceAccountName)
+                ? self.worker.podOverrides.serviceAccountName : '''') == (has(oldSelf.worker.podOverrides)
+                && has(oldSelf.worker.podOverrides.serviceAccountName) ? oldSelf.worker.podOverrides.serviceAccountName
+                : '''')'
             - message: initialBranch is immutable
-              rule: has(self.initialBranch) == has(oldSelf.initialBranch) && (!has(self.initialBranch)
-                || self.initialBranch == oldSelf.initialBranch)
+              rule: '(!has(self.initialBranch) ? '''' : self.initialBranch) == (!has(oldSelf.initialBranch)
+                ? '''' : oldSelf.initialBranch)'
             - message: initialPrompt is immutable
-              rule: has(self.initialPrompt) == has(oldSelf.initialPrompt) && (!has(self.initialPrompt)
-                || self.initialPrompt == oldSelf.initialPrompt)
+              rule: '(!has(self.initialPrompt) ? '''' : self.initialPrompt) == (!has(oldSelf.initialPrompt)
+                ? '''' : oldSelf.initialPrompt)'
             - message: volumeClaimTemplate is immutable
               rule: has(self.volumeClaimTemplate) == has(oldSelf.volumeClaimTemplate)
                 && (!has(self.volumeClaimTemplate) || self.volumeClaimTemplate ==
@@ -7177,8 +7235,6 @@ spec:
             - message: worker.type must be claude-code, codex, or opencode
               rule: has(self.worker.type) && self.worker.type in ['claude-code', 'codex',
                 'opencode']
-            - message: worker.credentials is required
-              rule: has(self.worker.credentials)
             - message: worker.workspaceRef is required when initialBranch is set
               rule: '!has(self.initialBranch) || size(self.initialBranch) == 0 ||
                 has(self.worker.workspaceRef)'
@@ -7259,6 +7315,9 @@ spec:
                 description: Message provides additional information about the current
                   phase.
                 type: string
+              model:
+                description: Model is the model reported by the Session runtime.
+                type: string
               observedGeneration:
                 description: ObservedGeneration is the most recent generation observed
                   by the controller.
@@ -7280,11 +7339,38 @@ spec:
                 description: PullRequest describes the pull request associated with
                   Branch, when one exists.
                 properties:
+                  checks:
+                    description: Checks summarizes the GitHub checks for the pull
+                      request or its merge queue entry.
+                    properties:
+                      completed:
+                        description: Completed is the number of checks that have completed.
+                        format: int32
+                        minimum: 0
+                        type: integer
+                      state:
+                        description: State is the aggregate state of the checks.
+                        enum:
+                        - Pending
+                        - Success
+                        - Failure
+                        type: string
+                      total:
+                        description: Total is the total number of checks.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                    required:
+                    - completed
+                    - state
+                    - total
+                    type: object
                   state:
-                    description: State is the pull request lifecycle state.
+                    description: State is the observed pull request state.
                     enum:
                     - Draft
                     - Open
+                    - Queued
                     - Merged
                     - Closed
                     type: string

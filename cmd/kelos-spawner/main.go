@@ -122,11 +122,16 @@ func main() {
 	httpClient := &http.Client{Transport: source.NewMetricsTransport(http.DefaultTransport)}
 
 	tokenResolver := newGitHubTokenResolver(githubToken, githubAppID, githubAppInstallationID, githubAppPrivateKey, githubAPIBaseURL)
+	reportingGitHubAppID := ""
+	if githubToken == "" && githubAppID != "" && githubAppInstallationID != "" && githubAppPrivateKey != "" {
+		reportingGitHubAppID = githubAppID
+	}
 
 	cfgArgs := spawnerRuntimeConfig{
 		GitHubOwner:      githubOwner,
 		GitHubRepo:       githubRepo,
 		GitHubAPIBaseURL: githubAPIBaseURL,
+		GitHubAppID:      reportingGitHubAppID,
 		GHProxyURL:       ghProxyURL,
 		TokenResolver:    tokenResolver,
 		JiraBaseURL:      jiraBaseURL,
@@ -433,6 +438,11 @@ func runCycleWithSourceCore(ctx context.Context, cl client.Client, key types.Nam
 			createErrs = append(createErrs, fmt.Errorf("item %s: building task: %w", item.ID, err))
 			continue
 		}
+		if err := tb.AssignSpawnerCredential(&ts, task); err != nil {
+			log.Error(err, "Assigning TaskSpawner credential", "item", item.ID)
+			createErrs = append(createErrs, fmt.Errorf("item %s: assigning TaskSpawner credential: %w", item.ID, err))
+			continue
+		}
 
 		// Apply source-specific annotations (GitHub reporting metadata)
 		srcAnnotations := sourceAnnotations(&ts, item)
@@ -623,6 +633,7 @@ func sourceAnnotations(ts *kelos.TaskSpawner, item source.WorkItem) map[string]s
 
 	if reportingEnabled(ts) {
 		annotations[reporting.AnnotationGitHubReporting] = "enabled"
+		annotations[reporting.AnnotationGitHubCommentMode] = string(resolvedCommentMode(ts))
 	}
 
 	if checksReportingEnabled(ts) {
@@ -644,12 +655,29 @@ func sourceAnnotations(ts *kelos.TaskSpawner, item source.WorkItem) map[string]s
 // and its handler.
 func reportingEnabled(ts *kelos.TaskSpawner) bool {
 	if ts.Spec.When.GitHubIssues != nil && ts.Spec.When.GitHubIssues.Reporting != nil {
-		return ts.Spec.When.GitHubIssues.Reporting.Enabled
+		rep := ts.Spec.When.GitHubIssues.Reporting
+		return rep.Enabled || rep.Comments != nil
 	}
 	if ts.Spec.When.GitHubPullRequests != nil && ts.Spec.When.GitHubPullRequests.Reporting != nil {
-		return ts.Spec.When.GitHubPullRequests.Reporting.Enabled
+		rep := ts.Spec.When.GitHubPullRequests.Reporting
+		return rep.Enabled || rep.Comments != nil
 	}
 	return false
+}
+
+// resolvedCommentMode returns the configured comment mode. The deprecated
+// Enabled field and an empty Comments configuration retain PerTask behavior.
+func resolvedCommentMode(ts *kelos.TaskSpawner) kelos.GitHubCommentMode {
+	var rep *kelos.GitHubReporting
+	if ts.Spec.When.GitHubIssues != nil {
+		rep = ts.Spec.When.GitHubIssues.Reporting
+	} else if ts.Spec.When.GitHubPullRequests != nil {
+		rep = ts.Spec.When.GitHubPullRequests.Reporting
+	}
+	if rep != nil && rep.Comments != nil && rep.Comments.Mode != "" {
+		return rep.Comments.Mode
+	}
+	return kelos.GitHubCommentModePerTask
 }
 
 // checksReportingEnabled returns true when GitHub Checks API reporting is

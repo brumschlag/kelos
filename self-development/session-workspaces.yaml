@@ -1,0 +1,39 @@
+apiVersion: kelos.dev/v1alpha2
+kind: Workspace
+metadata:
+  name: kelos-session-agent
+spec:
+  repo: https://github.com/kelos-dev/kelos.git
+  ref: main
+  secretRef:
+    name: personal-github-token
+---
+apiVersion: kelos.dev/v1alpha2
+kind: Workspace
+metadata:
+  name: agora-session-agent
+spec:
+  repo: https://github.com/kelos-dev/agora.git
+  ref: main
+  secretRef:
+    name: personal-github-token
+---
+apiVersion: kelos.dev/v1alpha2
+kind: Workspace
+metadata:
+  name: kanon-session-agent
+spec:
+  repo: https://github.com/kelos-dev/kanon.git
+  ref: main
+  secretRef:
+    name: personal-github-token
+---
+apiVersion: kelos.dev/v1alpha2
+kind: Workspace
+metadata:
+  name: open-actions-session-agent
+spec:
+  repo: https://github.com/kelos-dev/open-actions.git
+  ref: main
+  secretRef:
+    name: personal-github-token

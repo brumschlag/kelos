@@ -21,6 +21,7 @@ jobs:
     env:
       KELOS_NAMESPACE: ${{ vars.KELOS_NAMESPACE || 'default' }}
       KELOS_API_HOSTNAME: dev-cluster.kelos.dev
+      KELOS_SESSION_VERSION: ${{ github.event.workflow_run.head_sha || github.sha }}
       CLOUDFLARED_VERSION: 2026.7.1
       CLOUDFLARED_DEB_SHA256: 79f790b45e6a9152c6cf63f60f4901e3d8a029f7f4be1345a24cd2373aba8e7d
     steps:
@@ -121,39 +122,53 @@ jobs:
             fi
           done
 
-          # Apply the full github-webhook-secret from repo secrets so the
-          # workflow is self-sufficient and the secret state is portable to
-          # other clusters. Holds both the HMAC WEBHOOK_SECRET and the
-          # GitHub App credentials the webhook server uses to resolve
-          # .Branch for issue_comment events on pull requests.
+          # Apply github-webhook-secret in the spawner namespace so the
+          # WebhookGateway (self-development/webhookgateway.yaml) can resolve it:
+          #   - webhook-secret: HMAC secret for github.secretRef (inbound verify)
+          #   - appID/installationID/privateKey: GitHub App credentials for
+          #     github.credentialsRef (PR-file enrichment + status reporting,
+          #     and resolving .Branch for issue_comment events on PRs)
           KEY_FILE=$(mktemp)
           trap 'rm -f "$KEY_FILE"' EXIT
           printf '%s' "$KELOS_GITHUB_APP_PRIVATE_KEY" > "$KEY_FILE"
           kubectl create secret generic github-webhook-secret \
-            --namespace kelos-system \
-            --from-literal=WEBHOOK_SECRET="$KELOS_WEBHOOK_SECRET" \
+            --namespace "${KELOS_NAMESPACE}" \
+            --from-literal=webhook-secret="$KELOS_WEBHOOK_SECRET" \
             --from-literal=appID="$KELOS_GITHUB_APP_ID" \
             --from-literal=installationID="$KELOS_GITHUB_APP_INSTALLATION_ID" \
             --from-file=privateKey="$KEY_FILE" \
             --dry-run=client -o yaml \
             | kubectl apply -f -
 
-      - name: Apply Session server authentication secret
+      - name: Apply Console server authentication secret
         env:
-          KELOS_SESSION_TOKEN: ${{ secrets.KELOS_SESSION_TOKEN }}
+          KELOS_CONSOLE_TOKEN: ${{ secrets.KELOS_CONSOLE_TOKEN }}
         run: |
-          if [ -z "${KELOS_SESSION_TOKEN}" ]; then
-            echo "KELOS_SESSION_TOKEN is required" >&2
+          if [ -z "${KELOS_CONSOLE_TOKEN}" ]; then
+            echo "KELOS_CONSOLE_TOKEN is required" >&2
             exit 1
           fi
-          kubectl create secret generic kelos-session-server-auth \
+          kubectl create secret generic kelos-console-server-auth \
             --namespace kelos-system \
-            --from-literal=token="${KELOS_SESSION_TOKEN}" \
+            --from-literal=token="${KELOS_CONSOLE_TOKEN}" \
             --dry-run=client -o yaml \
             | kubectl apply -f -
 
       - name: Install kelos
         run: |
+          # FIXME: Remove after the dev cluster has migrated to the Console server.
+          kubectl delete \
+            deployment/kelos-session-server \
+            service/kelos-session-server \
+            serviceaccount/kelos-session-server \
+            secret/kelos-session-server-auth \
+            --namespace kelos-system \
+            --ignore-not-found
+          kubectl delete \
+            clusterrole/kelos-session-server-role \
+            clusterrolebinding/kelos-session-server-rolebinding \
+            --ignore-not-found
+
           cat > /tmp/kelos-dev-values.yaml <<'EOF'
           image:
             tag: main
@@ -165,48 +180,58 @@ jobs:
             resources:
               requests:
                 cpu: 10m
-                memory: 64Mi
+                memory: 128Mi
               limits:
                 cpu: 500m
-                memory: 128Mi
-          sessionServer:
+                memory: 256Mi
+          consoleServer:
             enabled: true
-            secretName: kelos-session-server-auth
+            secretName: kelos-console-server-auth
             secureCookie: true
             service:
               type: NodePort
+          # NOTE: webhookServer.gateway is intentionally left at its disabled
+          # default. The dev cluster's kelos-webhook-gateway Gateway and
+          # kelos-webhook-route HTTPRoute are managed out of band, so enabling
+          # the chart-managed resources would create an ownership conflict.
+          #
+          # Required external configuration: the HTTPRoute routes the /webhook/
+          # prefix to the kelos-webhook-gateway-server Service, and the
+          # kelos-dev/kelos repository webhook URL uses the 'kelos'
+          # WebhookGateway's /webhook/<KELOS_NAMESPACE>/kelos status.path.
+          #
+          # gatewayServer runs the gateway-mode webhook server: it routes by
+          # per-gateway path using WebhookGateway resources (the self-development
+          # spawners reference the 'kelos' gateway via gatewayRef) and resolves
+          # each gateway's HMAC secret and API credentials.
           webhookServer:
-            sources:
-              github:
-                enabled: true
-                secretName: github-webhook-secret
-                githubSecretName: github-webhook-secret
-                service:
-                  type: NodePort
+            gatewayServer:
+              enabled: true
+              service:
+                type: NodePort
             resources:
               requests:
                 cpu: 100m
                 memory: 128Mi
           EOF
           bin/kelos install -f /tmp/kelos-dev-values.yaml \
-            --set-string sessionServer.defaultNamespace="${KELOS_NAMESPACE}"
-          kubectl patch service kelos-session-server -n kelos-system --type=merge \
+            --set-string consoleServer.defaultNamespace="${KELOS_NAMESPACE}"
+          kubectl patch service kelos-console-server -n kelos-system --type=merge \
             --patch '{"spec":{"ports":[{"name":"http","nodePort":30080,"port":80,"protocol":"TCP","targetPort":"http"}]}}'
-          kubectl patch service kelos-webhook-github -n kelos-system --type=merge \
-            --patch '{"spec":{"ports":[{"name":"webhook","nodePort":30081,"port":8443,"protocol":"TCP","targetPort":"webhook"}]}}'
           kubectl rollout restart deployment/kelos-controller-manager -n kelos-system
           kubectl rollout status deployment/kelos-controller-manager -n kelos-system --timeout=300s
-          kubectl get statefulset --all-namespaces -l kelos.dev/component=session \
+          kubectl get session --all-namespaces \
             -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' | \
             while read -r namespace name; do
-              kubectl rollout restart "statefulset/${name}" -n "${namespace}"
+              kubectl patch "session/${name}" -n "${namespace}" --type=merge \
+                --patch "{\"spec\":{\"worker\":{\"podOverrides\":{\"labels\":{\"app.kubernetes.io/version\":\"${KELOS_SESSION_VERSION}\"}}}}}"
             done
-          kubectl rollout restart deployment/kelos-session-server -n kelos-system
+          kubectl rollout restart deployment/kelos-console-server -n kelos-system
           kubectl rollout restart deployment -l kelos.dev/component=spawner -n "${KELOS_NAMESPACE}"
-          kubectl rollout restart deployment/kelos-webhook-github -n kelos-system
-          kubectl rollout status deployment/kelos-session-server -n kelos-system --timeout=300s
+          kubectl rollout restart deployment/kelos-webhook-gateway-server -n kelos-system
+          kubectl rollout status deployment/kelos-console-server -n kelos-system --timeout=300s
           kubectl rollout status deployment -l kelos.dev/component=spawner -n "${KELOS_NAMESPACE}" --timeout=300s
-          kubectl rollout status deployment/kelos-webhook-github -n kelos-system --timeout=300s
+          kubectl rollout status deployment/kelos-webhook-gateway-server -n kelos-system --timeout=300s
 
       - name: Apply self-development resources
         run: kubectl apply -f self-development/ -n "${KELOS_NAMESPACE}"
@@ -216,6 +241,9 @@ jobs:
 
       - name: Apply kanon self-development resources
         run: kubectl apply -f self-development/kanon/ -n "${KELOS_NAMESPACE}"
+
+      - name: Apply Open Actions self-development resources
+        run: kubectl apply -f self-development/open-actions/ -n "${KELOS_NAMESPACE}"
 
       - name: Show Cloudflare Access logs
         if: failure()

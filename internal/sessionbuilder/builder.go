@@ -9,6 +9,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	kelos "github.com/kelos-dev/kelos/api/v1alpha2"
+	"github.com/kelos-dev/kelos/internal/spawnercredentials"
 )
 
 const (
@@ -71,6 +72,25 @@ func Build(
 		},
 		Spec: *spec,
 	}, nil
+}
+
+// AssignSpawnerCredential randomly selects a configured SessionSpawner
+// credential and pins it to session.
+func AssignSpawnerCredential(spawner *kelos.SessionSpawner, session *kelos.Session) error {
+	if len(spawner.Spec.Credentials) == 0 {
+		return nil
+	}
+	if session.Spec.Worker.Credentials != nil {
+		return fmt.Errorf("SessionSpawner credentials cannot be combined with sessionTemplate.worker.credentials")
+	}
+
+	selected := spawnercredentials.Select(spawner.Spec.Credentials)
+	session.Spec.Worker.Credentials = spawnercredentials.Materialize(selected)
+	if session.Labels == nil {
+		session.Labels = make(map[string]string)
+	}
+	session.Labels[spawnercredentials.AssignmentLabel] = selected.Name
+	return nil
 }
 
 // Render executes a SessionSpawner text template with strict missing-key handling.

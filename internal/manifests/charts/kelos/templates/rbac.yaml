@@ -105,6 +105,7 @@ rules:
   - agentconfigs
   - sessionspawners
   - taskbudgets
+  - webhookgateways
   - workspaces
   verbs:
   - get
@@ -115,6 +116,7 @@ rules:
   resources:
   - sessions
   verbs:
+  - delete
   - get
   - list
   - patch
@@ -127,6 +129,7 @@ rules:
   - taskbudgets/status
   - tasks/status
   - taskspawners/status
+  - webhookgateways/status
   - workerpools/status
   verbs:
   - get
@@ -258,13 +261,28 @@ subjects:
   - kind: ServiceAccount
     name: kelos-controller
     namespace: kelos-system
-{{- if .Values.sessionServer.enabled }}
+{{- if .Values.consoleServer.enabled }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: kelos-session-server-role
+  name: kelos-console-server-role
 rules:
+  - apiGroups:
+      - kelos.dev
+    resources:
+      - agentconfigs
+      - sessions
+      - sessionspawners
+      - taskbudgets
+      - taskrecords
+      - tasks
+      - taskspawners
+      - workerpools
+      - workspaces
+    verbs:
+      - get
+      - list
   - apiGroups:
       - kelos.dev
     resources:
@@ -272,21 +290,18 @@ rules:
     verbs:
       - create
       - delete
-      - get
-      - list
       - patch
       - watch
-  - apiGroups:
-      - kelos.dev
-    resources:
-      - agentconfigs
-      - workspaces
-    verbs:
-      - list
   - apiGroups:
       - ""
     resources:
       - pods
+    verbs:
+      - get
+  - apiGroups:
+      - ""
+    resources:
+      - pods/log
     verbs:
       - get
   - apiGroups:
@@ -299,14 +314,14 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: kelos-session-server-rolebinding
+  name: kelos-console-server-rolebinding
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: kelos-session-server-role
+  name: kelos-console-server-role
 subjects:
   - kind: ServiceAccount
-    name: kelos-session-server
+    name: kelos-console-server
     namespace: {{ .Release.Namespace }}
 {{- end }}
 ---
@@ -361,7 +376,10 @@ subjects:
   - kind: ServiceAccount
     name: kelos-controller
     namespace: kelos-system
-{{- if or .Values.webhookServer.sources.github.enabled .Values.webhookServer.sources.linear.enabled .Values.webhookServer.sources.generic.enabled }}
+{{- $sourceWebhooksEnabled := or .Values.webhookServer.sources.github.enabled .Values.webhookServer.sources.linear.enabled .Values.webhookServer.sources.generic.enabled }}
+{{- $gatewayServerEnabled := .Values.webhookServer.gatewayServer.enabled }}
+{{- $gatewayServiceAccountName := .Values.webhookServer.gatewayServer.serviceAccountName }}
+{{- if or $sourceWebhooksEnabled $gatewayServerEnabled }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -372,6 +390,14 @@ rules:
       - ""
     resources:
       - secrets
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - kelos.dev
+    resources:
+      - webhookgateways
     verbs:
       - get
       - list
@@ -429,9 +455,16 @@ roleRef:
   kind: ClusterRole
   name: kelos-webhook-role
 subjects:
+  {{- if or $sourceWebhooksEnabled (and $gatewayServerEnabled (eq $gatewayServiceAccountName "kelos-webhook")) }}
   - kind: ServiceAccount
     name: kelos-webhook
     namespace: {{ .Release.Namespace }}
+  {{- end }}
+  {{- if and $gatewayServerEnabled (ne $gatewayServiceAccountName "kelos-webhook") }}
+  - kind: ServiceAccount
+    name: {{ $gatewayServiceAccountName }}
+    namespace: {{ .Release.Namespace }}
+  {{- end }}
 {{- end }}
 {{- if .Values.slackServer.enabled }}
 ---

@@ -28,33 +28,40 @@ type githubFile struct {
 
 // fetchPRChangedFiles fetches the list of changed files for a pull request
 // from the GitHub API. It resolves the GitHub token from the workspace's
-// secretRef, falling back to the global token resolver when the workspace
-// does not provide one.
-func fetchPRChangedFiles(ctx context.Context, cl client.Client, spawner *kelos.TaskSpawner, apiBaseURL, owner, repo string, number int) ([]string, error) {
+// secretRef, then uses the handler's token resolver when the workspace does
+// not provide one.
+func fetchPRChangedFiles(ctx context.Context, cl client.Client, spawner *kelos.TaskSpawner, tokenResolver func(context.Context) (string, error), apiBaseURL, owner, repo string, number int) ([]string, error) {
 	token, err := resolveGitHubTokenFromWorkspace(ctx, cl, spawner, apiBaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("resolving GitHub token for PR files: %w", err)
 	}
-	return fetchPRChangedFilesWithToken(ctx, token, apiBaseURL, owner, repo, number)
-}
-
-func fetchSessionSpawnerPRChangedFiles(ctx context.Context, cl client.Client, spawner *kelos.SessionSpawner, apiBaseURL, owner, repo string, number int) ([]string, error) {
-	token, err := resolveGitHubTokenFromWorkspaceRef(ctx, cl, spawner.Namespace, spawner.Spec.SessionTemplate.Worker.WorkspaceRef, apiBaseURL)
+	token, err = resolveFallbackGitHubToken(ctx, token, tokenResolver)
 	if err != nil {
 		return nil, fmt.Errorf("resolving GitHub token for PR files: %w", err)
 	}
 	return fetchPRChangedFilesWithToken(ctx, token, apiBaseURL, owner, repo, number)
 }
 
-func fetchPRChangedFilesWithToken(ctx context.Context, token, apiBaseURL, owner, repo string, number int) ([]string, error) {
-	var err error
-	if token == "" && githubTokenResolver != nil {
-		token, err = githubTokenResolver(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("resolving GitHub token for PR files: %w", err)
-		}
+func fetchSessionSpawnerPRChangedFiles(ctx context.Context, cl client.Client, spawner *kelos.SessionSpawner, tokenResolver func(context.Context) (string, error), apiBaseURL, owner, repo string, number int) ([]string, error) {
+	token, err := resolveGitHubTokenFromWorkspaceRef(ctx, cl, spawner.Namespace, spawner.Spec.SessionTemplate.Worker.WorkspaceRef, apiBaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("resolving GitHub token for PR files: %w", err)
 	}
+	token, err = resolveFallbackGitHubToken(ctx, token, tokenResolver)
+	if err != nil {
+		return nil, fmt.Errorf("resolving GitHub token for PR files: %w", err)
+	}
+	return fetchPRChangedFilesWithToken(ctx, token, apiBaseURL, owner, repo, number)
+}
 
+func resolveFallbackGitHubToken(ctx context.Context, token string, tokenResolver func(context.Context) (string, error)) (string, error) {
+	if token != "" || tokenResolver == nil {
+		return token, nil
+	}
+	return tokenResolver(ctx)
+}
+
+func fetchPRChangedFilesWithToken(ctx context.Context, token, apiBaseURL, owner, repo string, number int) ([]string, error) {
 	if apiBaseURL == "" {
 		apiBaseURL = "https://api.github.com"
 	}

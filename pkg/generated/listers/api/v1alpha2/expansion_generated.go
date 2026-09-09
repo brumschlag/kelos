@@ -74,6 +74,14 @@ type TaskSpawnerListerExpansion interface{}
 // TaskSpawnerNamespaceLister.
 type TaskSpawnerNamespaceListerExpansion interface{}
 
+// WebhookGatewayListerExpansion allows custom methods to be added to
+// WebhookGatewayLister.
+type WebhookGatewayListerExpansion interface{}
+
+// WebhookGatewayNamespaceListerExpansion allows custom methods to be added to
+// WebhookGatewayNamespaceLister.
+type WebhookGatewayNamespaceListerExpansion interface{}
+
 // WorkerPoolListerExpansion allows custom methods to be added to
 // WorkerPoolLister.
 type WorkerPoolListerExpansion interface{}

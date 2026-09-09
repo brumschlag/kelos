@@ -13,6 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kelos "github.com/kelos-dev/kelos/api/v1alpha2"
+	"github.com/kelos-dev/kelos/internal/spawnercredentials"
 )
 
 // SpawnerLabel is set on Tasks created by a TaskSpawner and names the owning
@@ -38,6 +39,37 @@ func NewTaskBuilder(client client.Client) (*TaskBuilder, error) {
 	return &TaskBuilder{
 		client: client,
 	}, nil
+}
+
+// AssignSpawnerCredential randomly selects a configured TaskSpawner credential
+// and pins it to task.
+func (tb *TaskBuilder) AssignSpawnerCredential(spawner *kelos.TaskSpawner, task *kelos.Task) error {
+	if len(spawner.Spec.Credentials) == 0 {
+		return nil
+	}
+	if task.Spec.WorkerPoolRef != nil {
+		return fmt.Errorf("TaskSpawner credentials cannot be used with workerPoolRef")
+	}
+	if task.Spec.Worker != nil && task.Spec.Worker.Credentials != nil {
+		return fmt.Errorf("TaskSpawner credentials cannot be combined with taskTemplate.worker.credentials")
+	}
+	if task.Spec.Credentials != nil {
+		return fmt.Errorf("TaskSpawner credentials cannot be combined with taskTemplate.credentials")
+	}
+
+	selected := spawnercredentials.Select(spawner.Spec.Credentials)
+	assigned := spawnercredentials.Materialize(selected)
+	if task.Spec.Worker != nil {
+		task.Spec.Worker = task.Spec.Worker.DeepCopy()
+		task.Spec.Worker.Credentials = assigned
+	} else {
+		task.Spec.Credentials = assigned
+	}
+	if task.Labels == nil {
+		task.Labels = make(map[string]string)
+	}
+	task.Labels[spawnercredentials.AssignmentLabel] = selected.Name
+	return nil
 }
 
 // BuildTask creates a Task from a template and template variables.

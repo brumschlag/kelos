@@ -62,6 +62,17 @@ type openCodePart struct {
 		Output string `json:"output"`
 		Error  string `json:"error"`
 	} `json:"state"`
+	Tokens *openCodePartTokens `json:"tokens"`
+}
+
+type openCodePartTokens struct {
+	Input     int64 `json:"input"`
+	Output    int64 `json:"output"`
+	Reasoning int64 `json:"reasoning"`
+	Cache     struct {
+		Read  int64 `json:"read"`
+		Write int64 `json:"write"`
+	} `json:"cache"`
 }
 
 // OpenCodeProvider owns one OpenCode server session and its event stream.
@@ -78,6 +89,14 @@ type OpenCodeProvider struct {
 	doneOnce      sync.Once
 	errMu         sync.Mutex
 	terminalErr   error
+
+	statusMu sync.Mutex
+	model    string
+	usage    *RuntimeUsage
+	// countedSteps holds step-finish part IDs whose usage was already added to
+	// the totals, since a part can be republished on later updates.
+	countedSteps   map[string]struct{}
+	contextWindows map[string]int64
 
 	sessionMu sync.RWMutex
 	sessionID string
@@ -178,7 +197,45 @@ func (p *OpenCodeProvider) initialize(ctx context.Context) error {
 	if err := p.startEventStream(ctx); err != nil {
 		return err
 	}
-	return p.openSession(ctx)
+	if err := p.openSession(ctx); err != nil {
+		return err
+	}
+	// Context windows only enrich the runtime status display, so a failed
+	// lookup must not block the session.
+	p.loadContextWindows(ctx)
+	return nil
+}
+
+// loadContextWindows caches each available model's context limit so runtime
+// status can report context use as a fraction of the window.
+func (p *OpenCodeProvider) loadContextWindows(ctx context.Context) {
+	var config struct {
+		Providers []struct {
+			ID     string `json:"id"`
+			Models map[string]struct {
+				Limit struct {
+					Context int64 `json:"context"`
+				} `json:"limit"`
+			} `json:"models"`
+		} `json:"providers"`
+	}
+	if p.client.doJSON(ctx, http.MethodGet, "/config/providers", true, nil, &config) != nil {
+		return
+	}
+	windows := map[string]int64{}
+	for _, provider := range config.Providers {
+		for id, model := range provider.Models {
+			if model.Limit.Context > 0 {
+				windows[provider.ID+"/"+id] = model.Limit.Context
+			}
+		}
+	}
+	if len(windows) == 0 {
+		return
+	}
+	p.statusMu.Lock()
+	p.contextWindows = windows
+	p.statusMu.Unlock()
 }
 
 func (p *OpenCodeProvider) waitForHealth(ctx context.Context) error {
@@ -323,7 +380,7 @@ func openCodeVariant(provider, effort string) string {
 }
 
 // RunTurn submits one prompt to the persistent OpenCode session.
-func (p *OpenCodeProvider) RunTurn(ctx context.Context, prompt string, sink EventSink) error {
+func (p *OpenCodeProvider) RunTurn(ctx context.Context, input TurnInput, sink EventSink) error {
 	p.turnMu.Lock()
 	defer p.turnMu.Unlock()
 
@@ -347,6 +404,7 @@ func (p *OpenCodeProvider) RunTurn(ctx context.Context, prompt string, sink Even
 	p.questions = map[string]struct{}{}
 	p.permissions = map[string]struct{}{}
 	p.activeMu.Unlock()
+	p.emitRuntimeStatus(sink)
 	defer func() {
 		interactionCancel()
 		p.activeMu.Lock()
@@ -369,8 +427,17 @@ func (p *OpenCodeProvider) RunTurn(ctx context.Context, prompt string, sink Even
 		p.activeMu.Unlock()
 	}()
 
+	parts := []map[string]string{{"type": "text", "text": attachmentPrompt(input)}}
+	for _, attachment := range input.Attachments {
+		parts = append(parts, map[string]string{
+			"type":     "file",
+			"mime":     attachment.MediaType,
+			"filename": attachment.Name,
+			"url":      (&url.URL{Scheme: "file", Path: attachment.Path}).String(),
+		})
+	}
 	request := map[string]any{
-		"parts": []map[string]string{{"type": "text", "text": prompt}},
+		"parts": parts,
 	}
 	if err := p.client.doJSON(ctx, http.MethodPost, "/session/"+url.PathEscape(p.currentSessionID())+"/prompt_async", true, request, nil); err != nil {
 		return fmt.Errorf("starting OpenCode turn: %w", err)
@@ -396,6 +463,20 @@ func (p *OpenCodeProvider) RunTurn(ctx context.Context, prompt string, sink Even
 		}
 		return errors.New("OpenCode server stopped")
 	}
+}
+
+func (p *OpenCodeProvider) recordShellCommand(ctx context.Context, record shellCommandRecord) error {
+	request := map[string]any{
+		"noReply": true,
+		"parts": []map[string]string{{
+			"type": "text",
+			"text": formatShellCommandRecord(record),
+		}},
+	}
+	if err := p.client.doJSON(ctx, http.MethodPost, "/session/"+url.PathEscape(p.currentSessionID())+"/message", true, request, nil); err != nil {
+		return fmt.Errorf("recording shell command in OpenCode context: %w", err)
+	}
+	return nil
 }
 
 // Interrupt stops the active OpenCode turn without deleting its session.
@@ -506,23 +587,48 @@ func (p *OpenCodeProvider) handleEvent(data []byte) {
 func (p *OpenCodeProvider) handleMessageUpdated(raw json.RawMessage) {
 	var properties struct {
 		Info struct {
-			ID        string          `json:"id"`
-			SessionID string          `json:"sessionID"`
-			Role      string          `json:"role"`
-			Error     json.RawMessage `json:"error"`
+			ID         string          `json:"id"`
+			SessionID  string          `json:"sessionID"`
+			Role       string          `json:"role"`
+			ProviderID string          `json:"providerID"`
+			ModelID    string          `json:"modelID"`
+			Error      json.RawMessage `json:"error"`
 		} `json:"info"`
 	}
 	if json.Unmarshal(raw, &properties) != nil || properties.Info.SessionID != p.currentSessionID() {
 		return
 	}
 	p.activeMu.Lock()
-	defer p.activeMu.Unlock()
-	if p.activeSink == nil {
+	sink := p.activeSink
+	if sink == nil {
+		p.activeMu.Unlock()
 		return
 	}
 	p.messageRoles[properties.Info.ID] = properties.Info.Role
 	if message := openCodeErrorText(properties.Info.Error); message != "" {
 		p.activeError = message
+	}
+	p.activeMu.Unlock()
+	if properties.Info.Role == "assistant" {
+		p.updateOpenCodeModel(properties.Info.ProviderID, properties.Info.ModelID, sink)
+	}
+}
+
+// updateOpenCodeModel records the model reported on an assistant message.
+func (p *OpenCodeProvider) updateOpenCodeModel(providerID, modelID string, sink EventSink) {
+	if modelID == "" {
+		return
+	}
+	model := modelID
+	if providerID != "" {
+		model = providerID + "/" + modelID
+	}
+	p.statusMu.Lock()
+	changed := p.model != model
+	p.model = model
+	p.statusMu.Unlock()
+	if changed {
+		p.emitRuntimeStatus(sink)
 	}
 }
 
@@ -564,6 +670,68 @@ func (p *OpenCodeProvider) handlePartUpdated(raw json.RawMessage) {
 	for _, event := range toolEvents {
 		sink.Emit(event)
 	}
+	if part.Type == "step-finish" || part.Type == "step_finish" {
+		p.recordOpenCodeStepUsage(part.ID, part.Tokens, sink)
+	}
+}
+
+// recordOpenCodeStepUsage accumulates token usage from one step-finish part.
+// OpenCode reports each step's usage separately, so the step totals sum to the
+// session totals and the latest step reflects current context use. Its input
+// field excludes cache tokens and its output field excludes reasoning tokens,
+// so both are added back to count all tokens the model read and generated.
+func (p *OpenCodeProvider) recordOpenCodeStepUsage(partID string, tokens *openCodePartTokens, sink EventSink) {
+	if tokens == nil {
+		return
+	}
+	input := tokens.Input + tokens.Cache.Read + tokens.Cache.Write
+	output := tokens.Output + tokens.Reasoning
+	changed := false
+	p.statusMu.Lock()
+	if p.usage == nil {
+		p.usage = &RuntimeUsage{}
+	}
+	if partID != "" {
+		if _, counted := p.countedSteps[partID]; !counted {
+			if p.countedSteps == nil {
+				p.countedSteps = map[string]struct{}{}
+			}
+			p.countedSteps[partID] = struct{}{}
+			p.usage.InputTokens += input
+			p.usage.OutputTokens += output
+			p.usage.TotalTokens += input + output
+			changed = true
+		}
+	}
+	if context := input + output; p.usage.ContextTokens != context {
+		p.usage.ContextTokens = context
+		changed = true
+	}
+	p.statusMu.Unlock()
+	if changed {
+		p.emitRuntimeStatus(sink)
+	}
+}
+
+func (p *OpenCodeProvider) emitRuntimeStatus(sink EventSink) {
+	status := p.runtimeStatusSnapshot()
+	if !status.empty() {
+		sink.Emit(Event{Type: EventRuntimeStatus, Runtime: &status})
+	}
+}
+
+func (p *OpenCodeProvider) runtimeStatusSnapshot() RuntimeStatus {
+	p.statusMu.Lock()
+	defer p.statusMu.Unlock()
+	status := RuntimeStatus{Model: p.model, Effort: p.config.Effort}
+	if p.usage != nil {
+		usage := *p.usage
+		if window, ok := p.contextWindows[p.model]; ok {
+			usage.ContextWindow = window
+		}
+		status.Usage = &usage
+	}
+	return status
 }
 
 func (p *OpenCodeProvider) handlePartDelta(raw json.RawMessage) {

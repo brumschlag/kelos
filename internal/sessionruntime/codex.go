@@ -30,6 +30,21 @@ type codexTurnResult struct {
 	error  string
 }
 
+type codexInteractionKind string
+
+const (
+	codexInteractionMessage codexInteractionKind = "message"
+	codexInteractionGoal    codexInteractionKind = "goal"
+)
+
+type codexGoalResponse struct {
+	Goal *Goal `json:"goal"`
+}
+
+type codexGoalClearResponse struct {
+	Cleared bool `json:"cleared"`
+}
+
 type codexToolResult struct {
 	Content []json.RawMessage `json:"content"`
 }
@@ -74,9 +89,13 @@ type CodexProvider struct {
 	turnDone          chan codexTurnResult
 	activeTurn        string
 	activeReady       chan struct{}
+	interactionKind   codexInteractionKind
 	interactionCtx    context.Context
 	interactionCancel context.CancelFunc
 	turnMu            sync.Mutex
+	goalCommandMu     sync.Mutex
+	goalMu            sync.Mutex
+	goal              *Goal
 
 	statusMu    sync.Mutex
 	model       string
@@ -142,6 +161,10 @@ func NewCodexProvider(ctx context.Context, config ProviderConfig) (*CodexProvide
 		provider.Close()
 		return nil, err
 	}
+	if err := provider.loadGoal(initCtx); err != nil {
+		provider.Close()
+		return nil, err
+	}
 	rateLimitCtx, rateLimitCancel := context.WithTimeout(ctx, 5*time.Second)
 	if result, err := provider.request(rateLimitCtx, "account/rateLimits/read", nil); err == nil {
 		if limit := codexWeeklyRateLimit(result); limit != nil {
@@ -152,6 +175,19 @@ func NewCodexProvider(ctx context.Context, config ProviderConfig) (*CodexProvide
 	}
 	rateLimitCancel()
 	return provider, nil
+}
+
+func (p *CodexProvider) loadGoal(ctx context.Context) error {
+	result, err := p.request(ctx, "thread/goal/get", map[string]string{"threadId": p.threadID})
+	if err != nil {
+		return fmt.Errorf("reading Codex goal: %w", err)
+	}
+	goal, err := decodeCodexGoal(result)
+	if err != nil {
+		return fmt.Errorf("reading Codex goal: %w", err)
+	}
+	p.setGoal(goal)
+	return nil
 }
 
 func (p *CodexProvider) openThread(ctx context.Context) error {
@@ -271,7 +307,73 @@ func codexTurnID(result json.RawMessage) string {
 }
 
 // RunTurn starts one Codex turn and waits for its completion notification.
-func (p *CodexProvider) RunTurn(ctx context.Context, prompt string, sink EventSink) error {
+func (p *CodexProvider) RunTurn(ctx context.Context, input TurnInput, sink EventSink) error {
+	return p.runInteraction(ctx, sink, codexInteractionMessage, func() (bool, error) {
+		params := map[string]any{
+			"threadId": p.threadID,
+			"input":    codexTurnInputItems(input),
+		}
+		if p.config.Model != "" {
+			params["model"] = p.config.Model
+		}
+		if p.config.Effort != "" {
+			params["effort"] = p.config.Effort
+		}
+		result, err := p.request(ctx, "turn/start", params)
+		if err != nil {
+			return false, fmt.Errorf("starting Codex turn: %w", err)
+		}
+		turnID := codexTurnID(result)
+		if turnID == "" {
+			return false, errors.New("starting Codex turn: response did not include a turn ID")
+		}
+		p.setActiveTurn(turnID)
+		return true, nil
+	})
+}
+
+func (p *CodexProvider) recordShellCommand(ctx context.Context, record shellCommandRecord) error {
+	item := map[string]any{
+		"type": "message",
+		"role": "user",
+		"content": []map[string]string{{
+			"type": "input_text",
+			"text": formatShellCommandRecord(record),
+		}},
+	}
+	_, err := p.request(ctx, "thread/inject_items", map[string]any{
+		"threadId": p.threadID,
+		"items":    []any{item},
+	})
+	if err != nil {
+		return fmt.Errorf("recording shell command in Codex context: %w", err)
+	}
+	return nil
+}
+
+func (p *CodexProvider) RunGoal(ctx context.Context, command goalCommand, sink EventSink) error {
+	return p.runInteraction(ctx, sink, codexInteractionGoal, func() (bool, error) {
+		if err := p.applyGoalCommand(ctx, command, sink); err != nil {
+			return false, err
+		}
+		return command.action != goalCommandShow && p.goalIsActive(), nil
+	})
+}
+
+func (p *CodexProvider) ControlGoal(ctx context.Context, command goalCommand, sink EventSink) error {
+	return p.applyGoalCommand(ctx, command, sink)
+}
+
+func (p *CodexProvider) ActiveGoal() *Goal {
+	p.goalMu.Lock()
+	defer p.goalMu.Unlock()
+	if p.goal == nil || p.goal.Status != "active" {
+		return nil
+	}
+	return cloneGoal(p.goal)
+}
+
+func (p *CodexProvider) runInteraction(ctx context.Context, sink EventSink, kind codexInteractionKind, start func() (bool, error)) error {
 	p.turnMu.Lock()
 	defer p.turnMu.Unlock()
 
@@ -282,8 +384,12 @@ func (p *CodexProvider) RunTurn(ctx context.Context, prompt string, sink EventSi
 	p.activeSink = sink
 	p.turnDone = done
 	p.activeReady = ready
+	p.interactionKind = kind
 	p.interactionCtx = interactionCtx
 	p.interactionCancel = interactionCancel
+	if p.activeTurn != "" {
+		close(ready)
+	}
 	p.activeMu.Unlock()
 	p.emitRuntimeStatus(sink)
 	defer func() {
@@ -298,37 +404,16 @@ func (p *CodexProvider) RunTurn(ctx context.Context, prompt string, sink EventSi
 		p.turnDone = nil
 		p.activeTurn = ""
 		p.activeReady = nil
+		p.interactionKind = ""
 		p.interactionCtx = nil
 		p.interactionCancel = nil
 		p.activeMu.Unlock()
 	}()
 
-	params := map[string]any{
-		"threadId": p.threadID,
-		"input": []map[string]any{{
-			"type": "text",
-			"text": prompt,
-		}},
+	wait, err := start()
+	if err != nil || !wait {
+		return err
 	}
-	if p.config.Model != "" {
-		params["model"] = p.config.Model
-	}
-	if p.config.Effort != "" {
-		params["effort"] = p.config.Effort
-	}
-	result, err := p.request(ctx, "turn/start", params)
-	if err != nil {
-		return fmt.Errorf("starting Codex turn: %w", err)
-	}
-	turnID := codexTurnID(result)
-	if turnID == "" {
-		return errors.New("starting Codex turn: response did not include a turn ID")
-	}
-	p.activeMu.Lock()
-	p.activeTurn = turnID
-	close(ready)
-	p.activeMu.Unlock()
-
 	select {
 	case result := <-done:
 		if result.status == "interrupted" {
@@ -351,14 +436,215 @@ func (p *CodexProvider) RunTurn(ctx context.Context, prompt string, sink EventSi
 	}
 }
 
+func (p *CodexProvider) setActiveTurn(turnID string) {
+	p.activeMu.Lock()
+	p.activeTurn = turnID
+	if p.activeReady != nil {
+		select {
+		case <-p.activeReady:
+		default:
+			close(p.activeReady)
+		}
+	}
+	p.activeMu.Unlock()
+}
+
+func codexTurnInputItems(input TurnInput) []map[string]any {
+	items := []map[string]any{{
+		"type": "text",
+		"text": attachmentPrompt(input),
+	}}
+	for _, attachment := range input.Attachments {
+		if nativeImageAttachment(attachment.MediaType) {
+			items = append(items, map[string]any{"type": "localImage", "path": attachment.Path})
+		}
+	}
+	return items
+}
+
+func (p *CodexProvider) applyGoalCommand(ctx context.Context, command goalCommand, sink EventSink) error {
+	p.goalCommandMu.Lock()
+	defer p.goalCommandMu.Unlock()
+
+	existing, err := p.readGoal(ctx)
+	if err != nil {
+		return err
+	}
+	switch command.action {
+	case goalCommandShow:
+		p.emitGoal(sink, existing, goalEventStatus(existing, "empty"))
+		return nil
+	case goalCommandCreate:
+		if existing != nil && existing.Status != "complete" {
+			return errors.New("a goal is already set; use /goal edit <objective> or /goal clear")
+		}
+		return p.setCodexGoal(ctx, sink, map[string]any{
+			"threadId":  p.threadID,
+			"objective": command.objective,
+			"status":    "active",
+		})
+	case goalCommandEdit:
+		if existing == nil {
+			return errors.New("no goal is currently set")
+		}
+		return p.setCodexGoal(ctx, sink, map[string]any{
+			"threadId":  p.threadID,
+			"objective": command.objective,
+		})
+	case goalCommandPause:
+		if existing == nil {
+			return errors.New("no goal is currently set")
+		}
+		return p.setCodexGoal(ctx, sink, map[string]any{
+			"threadId": p.threadID,
+			"status":   "paused",
+		})
+	case goalCommandResume:
+		if existing == nil {
+			return errors.New("no goal is currently set")
+		}
+		return p.setCodexGoal(ctx, sink, map[string]any{
+			"threadId": p.threadID,
+			"status":   "active",
+		})
+	case goalCommandClear:
+		result, err := p.request(ctx, "thread/goal/clear", map[string]string{"threadId": p.threadID})
+		if err != nil {
+			return fmt.Errorf("clearing Codex goal: %w", err)
+		}
+		var response codexGoalClearResponse
+		if err := json.Unmarshal(result, &response); err != nil {
+			return fmt.Errorf("decoding cleared Codex goal: %w", err)
+		}
+		p.setGoal(nil)
+		if response.Cleared {
+			p.emitGoal(sink, nil, "cleared")
+		} else {
+			p.emitGoal(sink, nil, "empty")
+		}
+		p.finishInteractionIfGoalStopped()
+		return nil
+	default:
+		return errors.New(goalUsage)
+	}
+}
+
+func (p *CodexProvider) readGoal(ctx context.Context) (*Goal, error) {
+	result, err := p.request(ctx, "thread/goal/get", map[string]string{"threadId": p.threadID})
+	if err != nil {
+		return nil, fmt.Errorf("reading Codex goal: %w", err)
+	}
+	goal, err := decodeCodexGoal(result)
+	if err != nil {
+		return nil, fmt.Errorf("decoding Codex goal: %w", err)
+	}
+	p.setGoal(goal)
+	return goal, nil
+}
+
+func (p *CodexProvider) setCodexGoal(ctx context.Context, sink EventSink, params map[string]any) error {
+	result, err := p.request(ctx, "thread/goal/set", params)
+	if err != nil {
+		return fmt.Errorf("updating Codex goal: %w", err)
+	}
+	goal, err := decodeCodexGoal(result)
+	if err != nil {
+		return fmt.Errorf("decoding updated Codex goal: %w", err)
+	}
+	if goal == nil {
+		return errors.New("updating Codex goal: response did not include a goal")
+	}
+	p.setGoal(goal)
+	p.emitGoal(sink, goal, goal.Status)
+	p.finishInteractionIfGoalStopped()
+	return nil
+}
+
+func decodeCodexGoal(data json.RawMessage) (*Goal, error) {
+	var response codexGoalResponse
+	if err := json.Unmarshal(data, &response); err != nil {
+		return nil, err
+	}
+	return cloneGoal(response.Goal), nil
+}
+
+func cloneGoal(goal *Goal) *Goal {
+	if goal == nil {
+		return nil
+	}
+	cloned := *goal
+	if goal.TokenBudget != nil {
+		budget := *goal.TokenBudget
+		cloned.TokenBudget = &budget
+	}
+	return &cloned
+}
+
+func (p *CodexProvider) setGoal(goal *Goal) bool {
+	p.goalMu.Lock()
+	changed := !goalsEqual(p.goal, goal)
+	p.goal = cloneGoal(goal)
+	p.goalMu.Unlock()
+	return changed
+}
+
+func goalsEqual(left, right *Goal) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	if left.Objective != right.Objective || left.Status != right.Status || left.TokensUsed != right.TokensUsed || left.TimeUsedSeconds != right.TimeUsedSeconds {
+		return false
+	}
+	if left.TokenBudget == nil || right.TokenBudget == nil {
+		return left.TokenBudget == nil && right.TokenBudget == nil
+	}
+	return *left.TokenBudget == *right.TokenBudget
+}
+
+func (p *CodexProvider) goalIsActive() bool {
+	p.goalMu.Lock()
+	defer p.goalMu.Unlock()
+	return p.goal != nil && p.goal.Status == "active"
+}
+
+func (p *CodexProvider) emitGoal(sink EventSink, goal *Goal, status string) {
+	if sink == nil {
+		return
+	}
+	sink.Emit(Event{Type: EventGoalUpdated, Goal: cloneGoal(goal), Status: status})
+}
+
+func goalEventStatus(goal *Goal, empty string) string {
+	if goal == nil {
+		return empty
+	}
+	return goal.Status
+}
+
 // Interrupt stops the active Codex turn without closing its thread.
 func (p *CodexProvider) Interrupt(ctx context.Context) error {
 	p.activeMu.Lock()
 	turnID := p.activeTurn
 	ready := p.activeReady
+	kind := p.interactionKind
+	sink := p.activeSink
 	p.activeMu.Unlock()
-	if turnID == "" && ready == nil {
+	if kind == "" || ready == nil {
 		return ErrNoActiveTurn
+	}
+	goalPaused := false
+	pauseGoal := func() error {
+		if kind != codexInteractionGoal || !p.goalIsActive() {
+			return nil
+		}
+		if err := p.applyGoalCommand(ctx, goalCommand{action: goalCommandPause}, sink); err != nil {
+			return fmt.Errorf("pausing Codex goal: %w", err)
+		}
+		goalPaused = true
+		return nil
+	}
+	if err := pauseGoal(); err != nil {
+		return err
 	}
 	if turnID == "" {
 		select {
@@ -371,7 +657,15 @@ func (p *CodexProvider) Interrupt(ctx context.Context) error {
 		p.activeMu.Lock()
 		turnID = p.activeTurn
 		p.activeMu.Unlock()
+		if !goalPaused {
+			if err := pauseGoal(); err != nil {
+				return err
+			}
+		}
 		if turnID == "" {
+			if goalPaused {
+				return nil
+			}
 			return ErrNoActiveTurn
 		}
 	}
@@ -486,9 +780,27 @@ func (p *CodexProvider) handleNotification(method string, params json.RawMessage
 	p.activeMu.Lock()
 	sink := p.activeSink
 	done := p.turnDone
+	kind := p.interactionKind
 	p.activeMu.Unlock()
 
 	switch method {
+	case "thread/goal/updated":
+		goal, err := decodeCodexGoal(params)
+		if err == nil && goal != nil {
+			changed := p.setGoal(goal)
+			if changed && sink != nil {
+				p.emitGoal(sink, goal, goal.Status)
+			}
+			p.finishInteractionIfGoalStopped()
+		}
+		return
+	case "thread/goal/cleared":
+		changed := p.setGoal(nil)
+		if changed && sink != nil {
+			p.emitGoal(sink, nil, "cleared")
+		}
+		p.finishInteractionIfGoalStopped()
+		return
 	case "thread/tokenUsage/updated":
 		if usage := codexRuntimeUsage(params); usage != nil {
 			p.statusMu.Lock()
@@ -508,6 +820,37 @@ func (p *CodexProvider) handleNotification(method string, params json.RawMessage
 				sink.Emit(Event{Type: EventRuntimeStatus, Runtime: &RuntimeStatus{WeeklyLimit: limit}})
 			}
 		}
+		return
+	}
+	if method == "turn/started" {
+		if turnID := codexNotificationTurnID(params); turnID != "" {
+			p.setActiveTurn(turnID)
+		}
+		return
+	}
+	if method == "turn/completed" {
+		var value struct {
+			Turn struct {
+				Status string          `json:"status"`
+				Error  json.RawMessage `json:"error"`
+			} `json:"turn"`
+		}
+		if json.Unmarshal(params, &value) == nil {
+			result := codexTurnResult{status: value.Turn.Status}
+			if len(value.Turn.Error) > 0 && string(value.Turn.Error) != "null" {
+				result.error = string(value.Turn.Error)
+			}
+			p.activeMu.Lock()
+			p.activeTurn = ""
+			p.activeMu.Unlock()
+			if done != nil && (result.status == "failed" || result.status == "interrupted" || kind != codexInteractionGoal || !p.goalIsActive()) {
+				select {
+				case done <- result:
+				default:
+				}
+			}
+		}
+		p.clearCodexCommandOutputs()
 		return
 	}
 	if sink == nil {
@@ -539,26 +882,38 @@ func (p *CodexProvider) handleNotification(method string, params json.RawMessage
 		if json.Unmarshal(params, &value) == nil && value.Diff != "" {
 			sink.Emit(Event{Type: EventFileDiff, Diff: value.Diff})
 		}
-	case "turn/completed":
-		var value struct {
-			Turn struct {
-				Status string          `json:"status"`
-				Error  json.RawMessage `json:"error"`
-			} `json:"turn"`
-		}
-		if json.Unmarshal(params, &value) == nil && done != nil {
-			result := codexTurnResult{status: value.Turn.Status}
-			if len(value.Turn.Error) > 0 && string(value.Turn.Error) != "null" {
-				result.error = string(value.Turn.Error)
-			}
-			select {
-			case done <- result:
-			default:
-			}
-		}
-		p.clearCodexCommandOutputs()
 	case "error":
 		sink.Emit(Event{Type: EventError, Text: string(params)})
+	}
+}
+
+func codexNotificationTurnID(params json.RawMessage) string {
+	var value struct {
+		Turn struct {
+			ID string `json:"id"`
+		} `json:"turn"`
+	}
+	if json.Unmarshal(params, &value) != nil {
+		return ""
+	}
+	return value.Turn.ID
+}
+
+func (p *CodexProvider) finishInteractionIfGoalStopped() {
+	if p.goalIsActive() {
+		return
+	}
+	p.activeMu.Lock()
+	done := p.turnDone
+	turnID := p.activeTurn
+	kind := p.interactionKind
+	p.activeMu.Unlock()
+	if done == nil || turnID != "" || kind != codexInteractionGoal {
+		return
+	}
+	select {
+	case done <- codexTurnResult{status: "completed"}:
+	default:
 	}
 }
 

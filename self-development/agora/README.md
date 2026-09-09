@@ -15,20 +15,21 @@ Every spawner references the root [`base-agent`](../base-agent.yaml) for shared
 instructions and skills. The issue and PR pick-up SessionSpawners reference
 only `base-agent`. The remaining TaskSpawners add repository- or role-specific
 instructions where needed: triage and squash-commits share `agentconfig.yaml`
-(`agora-dev-agent`), while planner, reviewer, fake-user, and fake-strategist
+(`agora-dev-agent`), while planner, the two reviewers, fake-user, and fake-strategist
 define their own AgentConfig inline.
 
 Autonomous discovery agents that publish GitHub issues maintain at most one
-open `generated-by-kelos` issue slot per TaskSpawner. The issue body includes a
-`kelos-taskspawner=<name>` marker so later runs can find it. A run may update
-the unassigned slot when it finds a clearly more impactful or important
-candidate, but it exits without changes when the slot has assignees. Assigned
-issues and PRs are treated as ongoing human or agent work and are not updated by
-autonomous discovery jobs. This cap does not apply to follow-up issues created
-while a worker or PR responder is handling an explicitly requested issue or PR.
+open `generated-by-kelos` issue slot per TaskSpawner. Its title starts with the
+TaskSpawner name in brackets, and its body includes both a
+`kelos-taskspawner=<name>` marker and one replaceable `Latest verdict` section.
+Each run checks whether an unassigned slot is still valid against the current
+repository before retaining, replacing, or closing it. Assigned issues and PRs
+are treated as ongoing human or agent work and are not updated by autonomous
+discovery jobs.
 
-Eight spawners operate directly on the Agora repository through the
-`agora-agent` Workspace. The two meta-maintenance spawners
+The two SessionSpawners operate on the Agora repository through the
+`agora-session-agent` Workspace, which uses the personal Session token. Six
+Seven TaskSpawners use the `agora-agent` Workspace. The two meta-maintenance spawners
 (`agora-config-update`, `agora-self-update`) are different: the files they
 maintain (`self-development/agora/*`) live in *this* repository, so they use the
 `kelos-agent` Workspace and the `kelos-dev-agent` role AgentConfig from
@@ -39,10 +40,11 @@ maintain (`self-development/agora/*`) live in *this* repository, so they use the
 
 | Spawner | Trigger | Agent | Description |
 |---|---|---|---|
-| **agora-workers** | Webhook: issue comment `/kelos pick-up` | Codex | Creates durable Sessions for issue work, including PR creation or updates |
+| **agora-workers** | Webhook: issue comment `/kelos pick-up` | Codex | Creates a durable Session with the open issue URL and a dedicated issue branch |
 | **agora-planner** | Webhook: issue comment `/kelos plan` | Codex | Investigates an issue and posts a structured implementation plan — advisory only, no code changes |
 | **agora-reviewer** | Webhook: PR comment `/kelos review` | Codex | Reviews PRs on demand — analyzes code, checks conventions, and updates a sticky review comment |
-| **agora-pr-responder** | Webhook: PR review/comment with `/kelos pick-up` | Codex | Creates durable Sessions for PR review feedback on the existing branch |
+| **agora-claude-reviewer** | Webhook: PR comment `/kelos claude-review` | Claude Fable | Runs an independent review path through Claude Code and updates a Claude-specific sticky review comment |
+| **agora-pr-responder** | Webhook: PR review/comment with `/kelos pick-up` | Codex | Creates a durable Session with the open PR URL on its existing branch |
 | **agora-triage** | Webhook: issue opened/reopened (untriaged) | Codex | Classifies issues by kind/priority, detects duplicates, and recommends an actor |
 | **agora-fake-user** | Cron (daily 09:00 UTC) | Codex | Tests DX as a new user and maintains one unassigned issue slot for the highest-impact problem found |
 | **agora-fake-strategist** | Cron (every 12 hours) | Codex | Explores new use cases, integrations, and API/UI/deployment capabilities while maintaining one unassigned strategic issue slot |
@@ -50,15 +52,18 @@ maintain (`self-development/agora/*`) live in *this* repository, so they use the
 | **agora-self-update** | Cron (daily 06:00 UTC) | Codex | Reviews and tunes the `self-development/agora/` prompts, configs, and README while maintaining one unassigned improvement issue slot |
 | **agora-squash-commits** | Webhook: PR comment `/kelos squash-commits` | Codex | Rebases and squashes PR branch commits into a single clean commit |
 
-> **Not ported from `self-development/`:** `kelos-api-reviewer` (Agora has no
+> **Not ported from `self-development/`:** the Kelos API reviewers (Agora has no
 > Kubernetes CRDs to review) and `kelos-image-update` (it updates
 > coding-agent image versions, not service base images).
 
-Apply the root `base-agent` first, then the whole directory. The directory
-includes `agentconfig.yaml`, which defines the `agora-dev-agent` role
-instructions referenced by the triage and squash-commits spawners:
+Apply the shared Workspaces and root `base-agent` first, then the whole
+directory. The directory includes `agentconfig.yaml`, which defines the
+`agora-dev-agent` role instructions referenced by the triage and
+squash-commits spawners:
 
 ```bash
+kubectl apply -f self-development/workspaces.yaml
+kubectl apply -f self-development/session-workspaces.yaml
 kubectl apply -f self-development/base-agent.yaml
 kubectl apply -f self-development/agora/
 ```
@@ -69,7 +74,8 @@ individual spawner after `base-agent` is installed.
 ### agora-workers.yaml
 
 Picks up open GitHub issues when a maintainer posts `/kelos pick-up` and
-creates a durable Session to fix them.
+creates a durable Session. The initial prompt supplies the issue URL and asks
+the agent to find the best way to address it.
 
 | | |
 |---|---|
@@ -78,14 +84,11 @@ creates a durable Session to fix them.
 | **Storage** | 10 Gi PVC |
 
 **Key features:**
-- Automatically checks for existing PRs and updates them incrementally
-- Self-reviews PRs before requesting human review
-- Ensures CI passes before completion
+- Lets the agent choose how to address the linked issue
+- Uses `agora-task-<number>` for the issue branch
 - Requires a `/kelos pick-up` comment to pick up an issue (maintainer approval gate)
 - Keeps the workspace across Session follow-ups and pod restarts
 - Supports routine follow-ups through the Session's web or terminal clients
-- May create separate follow-up issues for out-of-scope discoveries; those
-  follow-ups are exempt from autonomous discovery issue slot caps
 
 **Deploy:**
 ```bash
@@ -113,11 +116,12 @@ kubectl apply -f self-development/agora/agora-planner.yaml
 
 ### agora-reviewer.yaml
 
-Reviews open pull requests on demand when a maintainer posts `/kelos review` or when an Agora worker posts `/kelos review` after pushing a generated PR and confirming CI passes.
+Reviews open pull requests on demand when a maintainer or `kelos-bot[bot]`
+posts `/kelos review`.
 
 | | |
 |---|---|
-| **Trigger** | GitHub PR comment webhook with `/kelos review` from a maintainer or Agora worker handoff |
+| **Trigger** | GitHub PR comment webhook with `/kelos review` from a maintainer or `kelos-bot[bot]` |
 | **Agent** | Codex |
 | **Concurrency** | 3 |
 
@@ -131,18 +135,43 @@ Reviews open pull requests on demand when a maintainer posts `/kelos review` or 
 - Read-only agent — does not push code, modify files, or run local validation
 
 **Handoff flow:**
-1. `/kelos review` — maintainer requests a code review on the PR
-2. `/kelos review` — worker hands off a generated PR for review after pushing changes and confirming CI passes
-3. `/kelos review` — maintainer can retrigger review after changes are pushed
+1. `/kelos review` — a maintainer or `kelos-bot[bot]` requests a code review
+2. `/kelos review` — a maintainer can retrigger review after changes are pushed
 
 **Deploy:**
 ```bash
 kubectl apply -f self-development/agora/agora-reviewer.yaml
 ```
 
+### agora-claude-reviewer.yaml
+
+Runs a Claude Fable review when a maintainer or `kelos-bot[bot]` posts
+`/kelos claude-review`.
+
+| | |
+|---|---|
+| **Trigger** | GitHub PR comment or review webhook with `/kelos claude-review` from a maintainer or `kelos-bot[bot]` |
+| **Agent** | Claude Fable via Claude Code |
+| **Concurrency** | 3 |
+
+**Key features:**
+
+- Uses the same repository-specific checklist and sticky comment format as `agora-reviewer`
+- Pays special attention to public-contract changes
+- Creates or updates a Claude-specific sticky PR comment
+- Read-only agent — does not push code, modify files, or run local validation
+
+**Deploy:**
+
+```bash
+kubectl apply -f self-development/agora/agora-claude-reviewer.yaml
+```
+
 ### agora-pr-responder.yaml
 
-Picks up open GitHub pull requests when a reviewer requests changes with `/kelos pick-up`.
+Picks up open GitHub pull requests when a reviewer requests changes with
+`/kelos pick-up`. The initial prompt supplies the PR URL and asks the agent to
+find the best way to address it.
 
 | | |
 |---|---|
@@ -151,14 +180,12 @@ Picks up open GitHub pull requests when a reviewer requests changes with `/kelos
 | **Storage** | 10 Gi PVC |
 
 **Key features:**
-- Reuses the existing PR branch instead of starting over
-- Reads review comments and PR conversation before making incremental changes
+- Starts the Session on the existing PR branch
+- Lets the agent choose how to address the linked PR
 - Lets the maintainer stay on the PR page for the common review-feedback loop
 - Requires a `/kelos pick-up` PR comment or review body to be picked up
 - Keeps the workspace across Session follow-ups and pod restarts
 - Supports routine follow-ups through the Session's web or terminal clients
-- May create separate follow-up issues for out-of-scope discoveries; those
-  follow-ups are exempt from autonomous discovery issue slot caps
 
 **Deploy:**
 ```bash
@@ -309,27 +336,23 @@ Before deploying them, set up the following.
 
 ### 1. Workspaces
 
-Two Workspaces are referenced:
+Three Workspaces are referenced:
 
-- **`agora-agent`** — points at the Agora repository (used by all spawners except the two meta-maintenance ones):
+- **`agora-session-agent`** — points at the Agora repository and is used only
+  by `agora-workers` and `agora-pr-responder`. It is defined in
+  [`session-workspaces.yaml`](../session-workspaces.yaml) and references the
+  `personal-github-token` Secret.
 
-  ```yaml
-  apiVersion: kelos.dev/v1alpha2
-  kind: Workspace
-  metadata:
-    name: agora-agent
-  spec:
-    repo: https://github.com/kelos-dev/agora.git
-    ref: main
-    secretRef:
-      name: github-token  # For pushing branches and creating PRs
-  ```
+- **`agora-agent`** — points at the Agora repository and is used by the seven
+  TaskSpawners that operate directly on Agora. It is defined in
+  [`workspaces.yaml`](../workspaces.yaml) and references the
+  `kelos-agent-credentials` Secret.
 
 - **`kelos-agent`** — points at this repository (`kelos-dev/kelos`). Used by
   `agora-config-update` and `agora-self-update`, which edit the
-  `self-development/agora/` files that live here. This is the same Workspace
-  `self-development/` already uses, so if you deployed those examples it
-  already exists.
+  `self-development/agora/` files that live here. It is also defined in
+  [`workspaces.yaml`](../workspaces.yaml) and references the
+  `kelos-agent-credentials` Secret.
 
 ### 2. Repository labels
 
@@ -360,26 +383,35 @@ done
 Unlike this repository, Agora's CI runs on every PR, so there is **no
 `ok-to-test` gate** and the spawners do not apply that label.
 
-### 3. GitHub Token Secret
+### 3. Session GitHub Token Secret
 
-Create a secret with a GitHub token that has write access to both
-`kelos-dev/agora` and `kelos-dev/kelos` (needed for the `gh` CLI and git
-authentication):
+Create the personal token Secret used by the Session-only Workspace. Task
+credentials remain configured through `agora-agent` and `kelos-agent`:
 
 ```bash
-kubectl create secret generic github-token \
-  --from-literal=GITHUB_TOKEN=<your-github-token>
+kubectl create secret generic personal-github-token \
+  --from-literal=GITHUB_TOKEN="$(gh auth token)" \
+  --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-The token needs `repo` (full control) and `workflow` (if your repo uses GitHub Actions).
+The token needs write access to `kelos-dev/agora` and `repo` plus `workflow`
+when using a classic personal access token.
 
-### 4. GitHub Webhook Secret and Delivery
+### 4. WebhookGateway, Secret, and Delivery
 
-The issue and PR pick-up SessionSpawners and the remaining webhook
-TaskSpawners are event-driven. Reuse the `github-webhook-secret` from your
-existing deployment, then configure a repository webhook on `kelos-dev/agora`:
+The webhook TaskSpawners and SessionSpawners route through the `agora`
+`WebhookGateway`. Apply it in the same namespace as the spawners. Its
+`github-webhook-secret` contains the inbound HMAC secret and outbound API
+credentials.
 
-- Point it at the same `https://<your-domain>/webhook/github` endpoint
+```bash
+kubectl apply -f self-development/agora/webhookgateway.yaml
+```
+
+Then configure a repository webhook on `kelos-dev/agora`:
+
+- Point it at `https://<your-domain>/webhook/<namespace>/agora`; obtain the
+  relative path with `kubectl get webhookgateway agora -o jsonpath='{.status.path}'`
 - Use the same shared secret
 - Subscribe to `issues`, `issue_comment`, and `pull_request_review`
 
@@ -389,14 +421,16 @@ existing issue or PR with a fresh matching event if needed.
 ### 5. Agent Credentials Secret
 
 The spawners reuse the `kelos-credentials` secret (the AI agent credentials are
-the same regardless of repository). The checked-in spawners use Codex OAuth:
+the same regardless of repository). The Codex spawners use Codex OAuth, and
+the Claude reviewer uses Claude Code OAuth:
 
 ```bash
 kubectl create secret generic kelos-credentials \
-  --from-file=CODEX_AUTH_JSON=$HOME/.codex/auth.json
+  --from-file=CODEX_AUTH_JSON=$HOME/.codex/auth.json \
+  --from-literal=CLAUDE_CODE_OAUTH_TOKEN=<your-claude-code-oauth-token>
 ```
 
-For API-key auth, change the worker credential type to `api-key` and use
+For Codex API-key auth, change the worker credential type to `api-key` and use
 `--from-literal=CODEX_API_KEY=<your-openai-api-key>`.
 
 ## Customizing
@@ -414,7 +448,7 @@ references.
 **Webhook spawner not creating work:**
 - For pick-up, check the SessionSpawner status: `kubectl get sessionspawner <name> -o yaml`
 - For other automation, check the TaskSpawner status: `kubectl get taskspawner <name> -o yaml`
-- Verify the Workspaces exist: `kubectl get workspace agora-agent kelos-agent`
+- Verify the Workspaces exist: `kubectl get workspace agora-session-agent agora-agent kelos-agent`
 - Ensure credentials are configured: `kubectl get secret kelos-credentials`
 - Ensure the GitHub webhook server is enabled and the `github-webhook-secret` exists
 - Review the `kelos-dev/agora` repository webhook's recent deliveries in GitHub

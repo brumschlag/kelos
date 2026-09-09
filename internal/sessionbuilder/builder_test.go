@@ -9,6 +9,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	kelos "github.com/kelos-dev/kelos/api/v1alpha2"
+	"github.com/kelos-dev/kelos/internal/spawnercredentials"
 )
 
 func TestBuildRendersSessionTemplateAndOwnership(t *testing.T) {
@@ -102,5 +103,31 @@ func TestBuildUsesUIDLabelForLongSessionSpawnerName(t *testing.T) {
 	}
 	if session.Annotations[AnnotationSessionSpawnerName] != spawnerName {
 		t.Fatalf("%s annotation = %q", AnnotationSessionSpawnerName, session.Annotations[AnnotationSessionSpawnerName])
+	}
+}
+
+func TestAssignSpawnerCredentialUsesConfiguredCredential(t *testing.T) {
+	spawner := &kelos.SessionSpawner{
+		Spec: kelos.SessionSpawnerSpec{Credentials: []kelos.SpawnerCredential{
+			{Name: "account-b", Type: kelos.CredentialTypeOAuth, SecretRef: kelos.SecretReference{Name: "secret-b"}},
+			{Name: "account-a", Type: kelos.CredentialTypeAPIKey, SecretRef: kelos.SecretReference{Name: "secret-a"}},
+		}},
+	}
+	session := &kelos.Session{}
+
+	if err := AssignSpawnerCredential(spawner, session); err != nil {
+		t.Fatalf("AssignSpawnerCredential() error = %v", err)
+	}
+	if session.Spec.Worker.Credentials == nil || session.Spec.Worker.Credentials.SecretRef == nil {
+		t.Fatal("Session credentials were not assigned")
+	}
+	selected := session.Labels[spawnercredentials.AssignmentLabel]
+	wantSecrets := map[string]string{"account-a": "secret-a", "account-b": "secret-b"}
+	wantSecret, ok := wantSecrets[selected]
+	if !ok {
+		t.Fatalf("credential label = %q, want a configured credential", selected)
+	}
+	if got := session.Spec.Worker.Credentials.SecretRef.Name; got != wantSecret {
+		t.Errorf("SecretRef.Name = %q, want %q for %s", got, wantSecret, selected)
 	}
 }

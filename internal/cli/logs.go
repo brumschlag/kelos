@@ -27,6 +27,11 @@ const (
 
 var errTaskLogSegmentNotFound = errors.New("task log segment not found")
 
+type bufferedReadCloser struct {
+	io.Reader
+	io.Closer
+}
+
 type logStreamRetryMode int
 
 const (
@@ -316,7 +321,37 @@ func openTaskLogStream(
 	for {
 		stream, err := open(ctx)
 		if err == nil {
-			return stream, nil
+			if !follow || container != kelos.AgentContainerName {
+				return stream, nil
+			}
+
+			reader := bufio.NewReader(stream)
+			if _, err := reader.Peek(1); err == nil {
+				return &bufferedReadCloser{Reader: reader, Closer: stream}, nil
+			} else if !errors.Is(err, io.EOF) {
+				_ = stream.Close()
+				return nil, fmt.Errorf("reading task %q logs: %w", taskName, err)
+			}
+
+			retry, retryErr := shouldRetryEmptyTaskLogStream(ctx, cl, namespace, taskName, podName, container)
+			if retryErr != nil {
+				_ = stream.Close()
+				return nil, retryErr
+			}
+			if !retry {
+				return &bufferedReadCloser{Reader: reader, Closer: stream}, nil
+			}
+
+			_ = stream.Close()
+			immediateRetryUsed = false
+			timer := time.NewTimer(retryInterval)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, fmt.Errorf("streaming logs: %w", ctx.Err())
+			case <-timer.C:
+			}
+			continue
 		}
 		if !follow || !apierrors.IsBadRequest(err) {
 			return nil, fmt.Errorf("streaming logs: %w", err)
@@ -346,6 +381,71 @@ func openTaskLogStream(
 			return nil, fmt.Errorf("streaming logs: %w", ctx.Err())
 		case <-timer.C:
 		}
+	}
+}
+
+func shouldRetryEmptyTaskLogStream(ctx context.Context, cl client.Client, namespace, taskName, podName, container string) (bool, error) {
+	task := &kelos.Task{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: taskName, Namespace: namespace}, task); err != nil {
+		return false, fmt.Errorf("getting task %q after its log stream closed: %w", taskName, err)
+	}
+	switch task.Status.Phase {
+	case kelos.TaskPhaseSucceeded:
+		return false, nil
+	case kelos.TaskPhaseFailed:
+		msg := "unknown error"
+		if task.Status.Message != "" {
+			msg = task.Status.Message
+		}
+		return false, fmt.Errorf("task %q failed before logs could be streamed: %s", taskName, msg)
+	}
+
+	pod := &corev1.Pod{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: podName, Namespace: namespace}, pod); err != nil {
+		return false, fmt.Errorf("getting pod %q after task %q log stream closed: %w", podName, taskName, err)
+	}
+
+	statuses := append(pod.Status.InitContainerStatuses, pod.Status.ContainerStatuses...)
+	for _, status := range statuses {
+		if status.Name != container {
+			continue
+		}
+		switch {
+		case status.State.Running != nil:
+			return true, nil
+		case status.State.Terminated != nil:
+			return true, nil
+		case status.State.Waiting == nil:
+			return true, nil
+		}
+
+		switch status.State.Waiting.Reason {
+		case "", "PodInitializing", "ContainerCreating":
+			return true, nil
+		default:
+			return false, fmt.Errorf(
+				"container %q in pod %q cannot start while following task %q logs: %s",
+				container,
+				podName,
+				taskName,
+				status.State.Waiting.Reason,
+			)
+		}
+	}
+
+	switch pod.Status.Phase {
+	case corev1.PodSucceeded:
+		return true, nil
+	case corev1.PodFailed:
+		msg := "unknown error"
+		if pod.Status.Message != "" {
+			msg = pod.Status.Message
+		}
+		return false, fmt.Errorf("pod %q failed before task %q logs could be streamed: %s", podName, taskName, msg)
+	case corev1.PodUnknown:
+		return false, fmt.Errorf("pod %q entered phase %s while following task %q logs", podName, pod.Status.Phase, taskName)
+	default:
+		return true, nil
 	}
 }
 

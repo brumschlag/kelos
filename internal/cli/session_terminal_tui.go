@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -21,6 +22,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"github.com/kelos-dev/kelos/internal/sessionruntime"
 	"github.com/muesli/termenv"
+	"k8s.io/apimachinery/pkg/util/uuid"
 )
 
 const (
@@ -31,7 +33,7 @@ const (
 	sessionTUIComposerGap            = 1
 	sessionTUIComposerPrompt         = "> "
 	sessionTUIStatusBarHeight        = 1
-	sessionTUIQueueMaxHeight         = 8
+	sessionTUIPendingMaxHeight       = 8
 	sessionTUIIndent                 = 2
 	sessionTUIToolOutputMaxLines     = 5
 	sessionTUIFrameInterval          = time.Second / 30
@@ -55,6 +57,7 @@ const (
 	sessionTUIBlockError
 	sessionTUIBlockInput
 	sessionTUIBlockDiff
+	sessionTUIBlockTurnSeparator
 )
 
 type sessionTUIBlock struct {
@@ -127,12 +130,19 @@ type sessionTUIModel struct {
 	input              textarea.Model
 	styles             sessionTUIStyles
 	blocks             []sessionTUIBlock
-	queuedTurns        map[string]string
-	queuedTurnOrder    []string
+	pendingTurnID      string
+	pendingTurnText    string
+	pendingTurnInput   string
+	pendingRevision    int64
+	pendingEditTurnID  string
+	pendingEditRev     int64
 	toolNames          map[string]string
+	toolOutputAt       map[string]int
 	width              int
 	height             int
 	ready              bool
+	replayingHistory   bool
+	recoveryActive     bool
 	turnActive         bool
 	streamingAt        int
 	connectionStatus   string
@@ -153,6 +163,17 @@ type sessionTUIModel struct {
 	historyWrites      []sessionTUIHistoryWrite
 	historyWriting     bool
 	nextHistoryID      uint64
+	hideNextHistory    bool
+	historyHiddenUntil int
+	historyCursor      string
+	historyNoticeAt    int
+	historyPageLoading bool
+	historyPageReading bool
+	historyPageCursor  string
+	historyPageEvents  []sessionruntime.Event
+	historyRequestID   string
+	historyPageStarted time.Time
+	historyAllReported bool
 	printHistory       func(string) tea.Cmd
 	waitForTermination tea.Cmd
 	now                func() time.Time
@@ -161,6 +182,7 @@ type sessionTUIModel struct {
 	quitRequested      bool
 	quitting           bool
 	runtimeStatus      sessionruntime.RuntimeStatus
+	pendingAttachments []sessionruntime.Attachment
 }
 
 func runSessionTUI(ctx context.Context, input io.Reader, output io.Writer, events *json.Decoder, requests *json.Encoder, color bool) error {
@@ -224,14 +246,16 @@ func newSessionTUIModel(events *json.Decoder, requests *json.Encoder, output io.
 		requests:           requests,
 		input:              input,
 		styles:             styles,
-		queuedTurns:        make(map[string]string),
 		toolNames:          make(map[string]string),
+		toolOutputAt:       make(map[string]int),
 		width:              sessionTUIDefaultWidth,
 		height:             sessionTUIDefaultHeight,
 		connectionStatus:   sessionTerminalStatusConnecting,
 		connectionStarted:  now(),
+		replayingHistory:   true,
 		historyAt:          -1,
 		streamingAt:        -1,
+		historyNoticeAt:    -1,
 		printHistory:       func(rendered string) tea.Cmd { return tea.Println(rendered) },
 		waitForTermination: waitForTermination,
 		now:                now,
@@ -359,6 +383,11 @@ func (m *sessionTUIModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if m.quitRequested {
 			return m, nil
 		}
+		if message.Paste && m.ready {
+			if path, ok := sessionTerminalDroppedFile(string(message.Runes)); ok {
+				return m, m.attachFile(path)
+			}
+		}
 		switch message.Type {
 		case tea.KeyCtrlC:
 			if m.turnActive {
@@ -368,6 +397,11 @@ func (m *sessionTUIModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyEnter:
 			if m.ready {
 				return m, m.submitInput()
+			}
+			return m, nil
+		case tea.KeyPgUp:
+			if m.ready && m.input.Value() == "" {
+				return m, m.requestOlderHistory()
 			}
 			return m, nil
 		case tea.KeyCtrlJ:
@@ -381,11 +415,16 @@ func (m *sessionTUIModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case tea.KeyUp:
 			if m.ready && !strings.Contains(m.input.Value(), "\n") {
-				m.previousInput()
-				return m, nil
+				if m.recallPendingTurn() {
+					return m, nil
+				}
+				if m.pendingEditTurnID == "" {
+					m.previousInput()
+					return m, nil
+				}
 			}
 		case tea.KeyDown:
-			if m.ready && !strings.Contains(m.input.Value(), "\n") {
+			if m.ready && m.pendingEditTurnID == "" && !strings.Contains(m.input.Value(), "\n") {
 				m.nextInput()
 				return m, nil
 			}
@@ -407,9 +446,9 @@ func (m *sessionTUIModel) View() string {
 	}
 	footer := m.footerView()
 	if m.activeView == "" {
-		return "\n" + footer
+		return footer
 	}
-	return m.activeView + "\n\n" + footer
+	return m.activeView + "\n" + footer
 }
 
 func (m *sessionTUIModel) readEvent() tea.Cmd {
@@ -422,13 +461,52 @@ func (m *sessionTUIModel) readEvent() tea.Cmd {
 
 func (m *sessionTUIModel) submitInput() tea.Cmd {
 	line := m.input.Value()
+	if m.pendingEditTurnID != "" {
+		request := sessionruntime.ClientRequest{
+			Type:             "message.edit",
+			TurnID:           m.pendingEditTurnID,
+			Text:             line,
+			ExpectedRevision: m.pendingEditRev,
+		}
+		if strings.TrimSpace(line) == "" {
+			request.Type = "message.remove"
+			request.Text = ""
+		}
+		if err := m.requests.Encode(request); err != nil {
+			m.err = err
+			return m.quit()
+		}
+		m.pendingEditTurnID = ""
+		m.pendingEditRev = 0
+		m.historyAt = -1
+		m.draft = ""
+		m.input.Reset()
+		m.resizeComposer()
+		return nil
+	}
 	if line == "/quit" || line == "/exit" {
 		return m.quit()
 	}
+	if strings.TrimSpace(line) == "/history" {
+		m.input.Reset()
+		m.resizeComposer()
+		return m.requestOlderHistory()
+	}
 	request := sessionTerminalRequest(line)
+	if request.Type == "" && len(m.pendingAttachments) > 0 && strings.TrimSpace(line) == "" {
+		request = sessionruntime.ClientRequest{Type: "message"}
+	}
 	if request.Type == "" {
 		m.input.Reset()
 		return nil
+	}
+	if request.Type == sessionTerminalRequestAttachment {
+		m.input.Reset()
+		m.resizeComposer()
+		return m.attachFile(request.Text)
+	}
+	if request.Type == "message" {
+		request.AttachmentIDs = sessionAttachmentIDs(m.pendingAttachments)
 	}
 	if err := m.requests.Encode(request); err != nil {
 		m.err = err
@@ -437,11 +515,50 @@ func (m *sessionTUIModel) submitInput() tea.Cmd {
 	if request.Type != "input" {
 		m.history = append(m.history, line)
 	}
+	if request.Type == "message" {
+		m.pendingAttachments = nil
+	}
 	m.historyAt = -1
 	m.draft = ""
 	m.input.Reset()
 	m.resizeComposer()
 	return nil
+}
+
+func (m *sessionTUIModel) attachFile(path string) tea.Cmd {
+	if len(m.pendingAttachments) >= sessionruntime.MaxAttachmentsPerMessage {
+		m.appendBlock(sessionTUIBlockError, fmt.Sprintf("error: a message supports at most %d attachments", sessionruntime.MaxAttachmentsPerMessage))
+		m.refreshActiveView()
+		return m.queueReadyBlocks()
+	}
+	if err := m.requests.Encode(sessionruntime.ClientRequest{Type: sessionTerminalRequestAttachment, Text: path}); err != nil {
+		m.err = err
+		return m.quit()
+	}
+	return nil
+}
+
+func sessionTerminalDroppedFile(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if strings.ContainsAny(value, "\r\n") {
+		return "", false
+	}
+	if strings.HasPrefix(value, "file://") {
+		parsed, err := url.Parse(value)
+		if err != nil || (parsed.Host != "" && parsed.Host != "localhost") {
+			return "", false
+		}
+		value = parsed.Path
+	}
+	if len(value) >= 2 && ((value[0] == '\'' && value[len(value)-1] == '\'') || (value[0] == '"' && value[len(value)-1] == '"')) {
+		value = value[1 : len(value)-1]
+	}
+	value = strings.ReplaceAll(value, `\ `, " ")
+	info, err := os.Stat(value)
+	if err != nil || !info.Mode().IsRegular() || info.Size() > sessionruntime.MaxAttachmentBytes {
+		return "", false
+	}
+	return value, true
 }
 
 func (m *sessionTUIModel) previousInput() {
@@ -457,6 +574,18 @@ func (m *sessionTUIModel) previousInput() {
 	m.input.SetValue(m.history[m.historyAt])
 	m.input.CursorEnd()
 	m.resizeComposer()
+}
+
+func (m *sessionTUIModel) recallPendingTurn() bool {
+	if m.pendingTurnID == "" || m.input.Value() != "" || m.historyAt != -1 || len(m.pendingAttachments) > 0 {
+		return false
+	}
+	m.pendingEditTurnID = m.pendingTurnID
+	m.pendingEditRev = m.pendingRevision
+	m.input.SetValue(m.pendingTurnInput)
+	m.input.CursorEnd()
+	m.resizeComposer()
+	return true
 }
 
 func (m *sessionTUIModel) nextInput() {
@@ -476,11 +605,44 @@ func (m *sessionTUIModel) nextInput() {
 
 func (m *sessionTUIModel) applyEvent(event sessionruntime.Event) sessionTUICommands {
 	var commands sessionTUICommands
+	if m.historyPageReading {
+		if event.Type == sessionruntime.EventHistoryEnd && event.HistoryPage {
+			return m.finishOlderHistoryPage()
+		}
+		if event.Type == sessionTerminalEventDiagnostic || event.Type == sessionTerminalEventAttachmentAdded || (event.Type == sessionruntime.EventHistoryStart && !event.HistoryPage) {
+			m.cancelOlderHistoryPage()
+		} else {
+			m.historyPageEvents = append(m.historyPageEvents, event)
+			return commands
+		}
+	}
+	recoveredCompletion := sessionTerminalRecoveredCompletion(m.recoveryActive, event)
+	if m.recoveryActive && !sessionTerminalRuntimeRecoveryEvent(event) {
+		m.recoveryActive = false
+	}
 	switch event.Type {
 	case sessionruntime.EventHistoryStart:
+		if event.HistoryPage {
+			m.historyPageLoading = true
+			m.historyPageReading = true
+			m.historyPageCursor = event.HistoryCursor
+			m.historyPageEvents = nil
+			return commands
+		}
+		m.replayingHistory = true
+		if event.Reset || !m.ready {
+			m.historyCursor = event.HistoryCursor
+			m.historyAllReported = false
+		}
+		if event.HistoryLimited {
+			m.historyNoticeAt = len(m.blocks)
+			m.appendBlock(sessionTUIBlockNotice, "Earlier Session history is available. Use /history or Page Up to load the previous page.")
+		}
 		if event.Reset {
+			m.cancelOlderHistoryPage()
 			m.turnActive = false
 			m.activeTurnID = ""
+			m.activeTurnStarted = time.Time{}
 			m.waitingForInput = false
 			m.turnInterrupting = false
 		}
@@ -489,11 +651,17 @@ func (m *sessionTUIModel) applyEvent(event sessionruntime.Event) sessionTUIComma
 			m.runtimeStatus = *event.Runtime
 		}
 	case sessionruntime.EventHistoryEnd:
-		m.appendBlock(sessionTUIBlockNotice, "Connected. Enter sends, Ctrl+J inserts a newline, and Ctrl+C or Esc interrupts active work. Ctrl+C quits when idle. Use /answer INPUT QUESTION VALUE or /quit.")
+		m.replayingHistory = false
+		m.applyHistoryState(event.HistoryState)
+		// A terminal-height transcript in both the managed view and native scrollback
+		// makes Bubble Tea move the smaller footer to the top when the copy is removed.
+		m.hideNextHistory = !m.ready
+		m.appendBlock(sessionTUIBlockNotice, "Connected. Enter sends, Ctrl+J inserts a newline, Ctrl+C or Esc interrupts active work, Page Up loads earlier history, and dragging a file attaches it (or use /attach PATH). Press Up on an empty composer to edit pending work. Use !COMMAND, /goal, /answer INPUT QUESTION VALUE, or /quit.")
 		m.ready = true
 		m.connectionStatus = ""
 		commands.ui = tea.Batch(m.input.Focus(), m.scheduleProgress())
 	case sessionruntime.EventRuntimeRecovered:
+		m.recoveryActive = true
 		m.appendBlock(sessionTUIBlockWarning, event.Text)
 	case sessionTerminalEventDiagnostic:
 		if event.Text != "" {
@@ -501,6 +669,7 @@ func (m *sessionTUIModel) applyEvent(event sessionruntime.Event) sessionTUIComma
 		}
 		switch event.Status {
 		case sessionTerminalStatusConnecting, sessionTerminalStatusReconnecting:
+			m.cancelOlderHistoryPage()
 			if m.connectionStatus != event.Status {
 				m.connectionStarted = m.now()
 			}
@@ -512,18 +681,30 @@ func (m *sessionTUIModel) applyEvent(event sessionruntime.Event) sessionTUIComma
 	case sessionruntime.EventUserMessage:
 		if event.TurnID == "" {
 			m.finishStreaming()
-			m.appendBlock(sessionTUIBlockUser, event.Text)
+			m.appendBlock(sessionTUIBlockUser, sessionTerminalMessageText(event.Text, event.Attachments))
 		} else {
-			m.appendQueuedUser(event.TurnID, event.Text)
+			m.setPendingUser(event.TurnID, event.Text, event.Attachments, event.Revision)
+		}
+	case sessionruntime.EventUserMessageUpdated:
+		if m.pendingTurnID == event.TurnID {
+			m.pendingTurnText = sessionTerminalMessageText(event.Text, event.Attachments)
+			m.pendingTurnInput = event.Text
+			m.pendingRevision = max(1, event.Revision)
+		}
+	case sessionruntime.EventUserMessageRemoved:
+		if m.discardPendingTurn(event.TurnID) {
+			m.appendBlock(sessionTUIBlockNotice, "Pending message removed.")
+		}
+	case sessionTerminalEventAttachmentAdded:
+		m.pendingAttachments = append(m.pendingAttachments, event.Attachments...)
+		for _, attachment := range event.Attachments {
+			m.appendBlock(sessionTUIBlockNotice, fmt.Sprintf("Attached %s (%d bytes). Send a message to include it.", attachment.Name, attachment.SizeBytes))
 		}
 	case sessionruntime.EventTurnStarted:
 		m.turnActive = true
-		m.acceptQueuedTurn(event.TurnID)
+		m.acceptPendingTurn(event.TurnID)
 		if m.activeTurnID != event.TurnID {
-			m.activeTurnStarted = m.now()
-			if event.Timestamp != nil {
-				m.activeTurnStarted = *event.Timestamp
-			}
+			m.activeTurnStarted = sessionTerminalTurnStartedAt(event, m.now(), m.replayingHistory)
 		}
 		m.activeTurnID = event.TurnID
 		m.waitingForInput = false
@@ -540,10 +721,13 @@ func (m *sessionTUIModel) applyEvent(event sessionruntime.Event) sessionTUIComma
 	case sessionruntime.EventToolStarted:
 		m.finishStreaming()
 		m.appendToolStart(event)
+	case sessionruntime.EventToolDelta:
+		m.appendToolDelta(event)
 	case sessionruntime.EventToolCompleted:
+		streamed := m.completeToolOutput(event)
 		toolName, needsAttribution := m.toolCompletionAttribution(event)
 		output := strings.TrimRight(sanitizeSessionTUIToolOutput(event.Output), "\n")
-		if output != "" {
+		if output != "" && !streamed {
 			m.appendToolOutput(event.ToolID, toolName, output)
 		}
 		if output == "" || !sessionTUIToolSucceeded(event.Status) {
@@ -553,6 +737,9 @@ func (m *sessionTUIModel) applyEvent(event sessionruntime.Event) sessionTUIComma
 			}
 			m.appendBlock(sessionTUIBlockToolStatus, status)
 		}
+	case sessionruntime.EventGoalUpdated:
+		m.finishStreaming()
+		m.appendBlock(sessionTUIBlockNotice, sessionGoalText(event.Goal, event.Status))
 	case sessionruntime.EventInputRequested:
 		m.finishStreaming()
 		m.waitingForInput = true
@@ -569,18 +756,26 @@ func (m *sessionTUIModel) applyEvent(event sessionruntime.Event) sessionTUIComma
 		m.appendBlock(sessionTUIBlockDiff, event.Diff)
 	case sessionruntime.EventTurnCompleted:
 		m.turnActive = false
-		m.acceptQueuedTurn(event.TurnID)
+		m.acceptPendingTurn(event.TurnID)
 		m.finishStreaming()
+		elapsed, hasElapsed := sessionTerminalTurnElapsed(m.activeTurnID, m.activeTurnStarted, event, m.now(), m.replayingHistory, recoveredCompletion)
 		if event.TurnID == "" || event.TurnID == m.activeTurnID {
 			m.activeTurnID = ""
+			m.activeTurnStarted = time.Time{}
 			m.waitingForInput = false
 			m.turnInterrupting = false
 		}
 		if event.Status == "interrupted" {
 			m.appendBlock(sessionTUIBlockWarning, "Turn interrupted.")
 		}
+		if hasElapsed {
+			m.appendBlock(sessionTUIBlockTurnSeparator, formatSessionTUIElapsed(elapsed))
+		}
 	case sessionruntime.EventError:
 		m.finishStreaming()
+		if event.RequestID != "" && event.RequestID == m.historyRequestID {
+			m.cancelOlderHistoryPage()
+		}
 		if event.Status == "rejected" {
 			m.turnInterrupting = false
 		}
@@ -595,6 +790,141 @@ func (m *sessionTUIModel) applyEvent(event sessionruntime.Event) sessionTUIComma
 		m.refreshActiveView()
 	}
 	return commands
+}
+
+func (m *sessionTUIModel) applyHistoryState(state *sessionruntime.HistoryState) {
+	if state == nil {
+		return
+	}
+	m.pendingTurnID = ""
+	m.pendingTurnText = ""
+	m.pendingTurnInput = ""
+	m.pendingRevision = 0
+	if state.PendingTurn != nil {
+		m.pendingTurnID = state.PendingTurn.TurnID
+		m.pendingTurnText = sessionTerminalMessageText(state.PendingTurn.Text, state.PendingTurn.Attachments)
+		m.pendingTurnInput = state.PendingTurn.Text
+		m.pendingRevision = max(1, state.PendingTurn.Revision)
+	}
+	if m.pendingEditTurnID != "" && m.pendingEditTurnID != m.pendingTurnID {
+		m.cancelPendingEdit(m.pendingEditTurnID)
+	}
+	m.activeTurnID = state.ActiveTurnID
+	m.turnActive = state.ActiveTurnID != ""
+	if state.ActiveTurnStarted != nil {
+		m.activeTurnStarted = *state.ActiveTurnStarted
+	} else if m.turnActive {
+		m.activeTurnStarted = m.now()
+	}
+	m.waitingForInput = state.WaitingForInput
+	m.turnInterrupting = state.TurnInterrupting
+}
+
+func (m *sessionTUIModel) requestOlderHistory() tea.Cmd {
+	if m.historyPageLoading {
+		return nil
+	}
+	if m.historyCursor == "" {
+		if m.historyAllReported {
+			return nil
+		}
+		m.historyAllReported = true
+		m.appendBlock(sessionTUIBlockNotice, "All retained Session history is loaded.")
+		command := m.queueReadyBlocks()
+		m.refreshActiveView()
+		return command
+	}
+	requestID := string(uuid.NewUUID())
+	if err := m.requests.Encode(sessionruntime.ClientRequest{
+		Type:          "history",
+		RequestID:     requestID,
+		HistoryCursor: m.historyCursor,
+	}); err != nil {
+		m.err = err
+		return m.quit()
+	}
+	m.historyPageLoading = true
+	m.historyRequestID = requestID
+	m.historyPageStarted = m.now()
+	return m.scheduleProgress()
+}
+
+func (m *sessionTUIModel) finishOlderHistoryPage() sessionTUICommands {
+	blocks := m.replayHistoryPage(m.historyPageEvents)
+	m.historyCursor = m.historyPageCursor
+	m.historyAllReported = m.historyCursor == ""
+	m.historyPageLoading = false
+	m.historyPageReading = false
+	m.historyPageCursor = ""
+	m.historyPageEvents = nil
+	m.historyRequestID = ""
+
+	noticeChanged := false
+	if m.historyCursor == "" && m.historyNoticeAt >= 0 && m.historyNoticeAt < len(m.blocks) {
+		m.blocks[m.historyNoticeAt].text = "All retained Session history is loaded."
+		m.blocks[m.historyNoticeAt].dirty = true
+		noticeChanged = true
+	}
+	command := m.prependHistoryBlocks(blocks)
+	if len(blocks) == 0 && noticeChanged {
+		m.reflowGeneration++
+		command = m.queueHistoryReflow(m.reflowGeneration)
+	}
+	m.refreshActiveView()
+	return sessionTUICommands{history: command}
+}
+
+func (m *sessionTUIModel) cancelOlderHistoryPage() {
+	m.historyPageLoading = false
+	m.historyPageReading = false
+	m.historyPageCursor = ""
+	m.historyPageEvents = nil
+	m.historyRequestID = ""
+}
+
+func (m *sessionTUIModel) replayHistoryPage(events []sessionruntime.Event) []sessionTUIBlock {
+	replay := &sessionTUIModel{
+		styles:          m.styles,
+		toolNames:       make(map[string]string),
+		toolOutputAt:    make(map[string]int),
+		width:           m.width,
+		height:          m.height,
+		streamingAt:     -1,
+		historyNoticeAt: -1,
+		now:             m.now,
+	}
+	for _, event := range events {
+		replay.applyEvent(event)
+	}
+	replay.finishStreaming()
+	return replay.blocks
+}
+
+func (m *sessionTUIModel) prependHistoryBlocks(blocks []sessionTUIBlock) tea.Cmd {
+	if len(blocks) == 0 {
+		return nil
+	}
+	count := len(blocks)
+	m.blocks = append(blocks, m.blocks...)
+	if m.streamingAt >= 0 {
+		m.streamingAt += count
+	}
+	if m.historyNoticeAt >= 0 {
+		m.historyNoticeAt += count
+	}
+	for toolID, index := range m.toolOutputAt {
+		m.toolOutputAt[toolID] = index + count
+	}
+	m.committed += count
+	m.historyQueued += count
+	for index := range m.historyWrites {
+		if m.historyWrites[index].commitEnd > 0 {
+			m.historyWrites[index].commitEnd += count
+		}
+	}
+	m.invalidateTranscript()
+	m.reflowGeneration++
+	return m.queueHistoryReflow(m.reflowGeneration)
 }
 
 func (m *sessionTUIModel) scheduleRefresh() tea.Cmd {
@@ -620,7 +950,7 @@ func (m *sessionTUIModel) scheduleProgress() tea.Cmd {
 func (m *sessionTUIModel) progressVisible() bool {
 	connecting := m.connectionStatus == sessionTerminalStatusReconnecting ||
 		(m.connectionStatus == sessionTerminalStatusConnecting && !m.ready)
-	return connecting || m.activeTurnID != ""
+	return connecting || m.historyPageLoading || m.activeTurnID != ""
 }
 
 func (m *sessionTUIModel) canInterruptTurn() bool {
@@ -702,6 +1032,51 @@ func (m *sessionTUIModel) appendToolOutput(toolID, toolName, output string) {
 	})
 }
 
+func (m *sessionTUIModel) appendToolDelta(event sessionruntime.Event) {
+	if event.Output == "" {
+		return
+	}
+	index, exists := m.toolOutputAt[event.ToolID]
+	if !exists {
+		m.blocks = append(m.blocks, sessionTUIBlock{
+			kind:     sessionTUIBlockToolOutput,
+			stream:   &strings.Builder{},
+			dirty:    true,
+			toolID:   event.ToolID,
+			toolName: "",
+		})
+		index = len(m.blocks) - 1
+		m.toolOutputAt[event.ToolID] = index
+		m.streamingAt = index
+	}
+	block := &m.blocks[index]
+	if block.stream == nil {
+		block.stream = &strings.Builder{}
+		block.stream.WriteString(block.text)
+		block.text = ""
+	}
+	block.stream.WriteString(sanitizeSessionTUIToolOutput(event.Output))
+	block.dirty = true
+}
+
+func (m *sessionTUIModel) completeToolOutput(event sessionruntime.Event) bool {
+	index, exists := m.toolOutputAt[event.ToolID]
+	if !exists {
+		return false
+	}
+	if m.streamingAt == index {
+		m.finishStreaming()
+	}
+	block := &m.blocks[index]
+	if event.Output != "" {
+		block.text = strings.TrimRight(sanitizeSessionTUIToolOutput(event.Output), "\n")
+	}
+	block.stream = nil
+	block.dirty = true
+	delete(m.toolOutputAt, event.ToolID)
+	return true
+}
+
 func (m *sessionTUIModel) toolCompletionAttribution(event sessionruntime.Event) (string, bool) {
 	name := sanitizeSessionTUIToolOutput(event.ToolName)
 	if name == "" {
@@ -724,30 +1099,50 @@ func (m *sessionTUIModel) toolCompletionAttribution(event sessionruntime.Event) 
 	return name, true
 }
 
-func (m *sessionTUIModel) appendQueuedUser(turnID, text string) bool {
-	if _, exists := m.queuedTurns[turnID]; exists {
-		return false
-	}
-	m.queuedTurns[turnID] = text
-	m.queuedTurnOrder = append(m.queuedTurnOrder, turnID)
-	return true
+func (m *sessionTUIModel) setPendingUser(turnID, text string, attachments []sessionruntime.Attachment, revision int64) {
+	m.pendingTurnID = turnID
+	m.pendingTurnText = sessionTerminalMessageText(text, attachments)
+	m.pendingTurnInput = text
+	m.pendingRevision = max(1, revision)
 }
 
-func (m *sessionTUIModel) acceptQueuedTurn(turnID string) bool {
-	text, exists := m.queuedTurns[turnID]
-	if !exists {
+func (m *sessionTUIModel) acceptPendingTurn(turnID string) bool {
+	if m.pendingTurnID != turnID {
 		return false
 	}
-	delete(m.queuedTurns, turnID)
-	for index, queuedTurnID := range m.queuedTurnOrder {
-		if queuedTurnID == turnID {
-			m.queuedTurnOrder = append(m.queuedTurnOrder[:index], m.queuedTurnOrder[index+1:]...)
-			break
-		}
-	}
+	text := m.pendingTurnText
+	m.pendingTurnID = ""
+	m.pendingTurnText = ""
+	m.pendingTurnInput = ""
+	m.pendingRevision = 0
+	m.cancelPendingEdit(turnID)
 	m.finishStreaming()
 	m.appendBlock(sessionTUIBlockUser, text)
 	return true
+}
+
+func (m *sessionTUIModel) discardPendingTurn(turnID string) bool {
+	if m.pendingTurnID != turnID {
+		return false
+	}
+	m.pendingTurnID = ""
+	m.pendingTurnText = ""
+	m.pendingTurnInput = ""
+	m.pendingRevision = 0
+	m.cancelPendingEdit(turnID)
+	return true
+}
+
+func (m *sessionTUIModel) cancelPendingEdit(turnID string) {
+	if m.pendingEditTurnID != turnID {
+		return
+	}
+	m.pendingEditTurnID = ""
+	m.pendingEditRev = 0
+	m.historyAt = -1
+	m.draft = ""
+	m.input.Reset()
+	m.resizeComposer()
 }
 
 func (m *sessionTUIModel) resize(width, height int) tea.Cmd {
@@ -822,6 +1217,10 @@ func (m *sessionTUIModel) queueReadyBlocks() tea.Cmd {
 		rendered:  m.renderBlockRange(m.historyQueued, end),
 		commitEnd: end,
 	})
+	if m.hideNextHistory {
+		m.historyHiddenUntil = end
+		m.hideNextHistory = false
+	}
 	m.historyQueued = end
 	return m.startHistoryWrite()
 }
@@ -879,6 +1278,9 @@ func (m *sessionTUIModel) completeHistoryWrite(write sessionTUIHistoryWrite) {
 	if write.commitEnd > m.committed {
 		m.committed = write.commitEnd
 	}
+	if m.committed >= m.historyHiddenUntil {
+		m.historyHiddenUntil = 0
+	}
 	m.refreshActiveView()
 }
 
@@ -891,7 +1293,8 @@ func (m *sessionTUIModel) popHistoryWrite() {
 }
 
 func (m *sessionTUIModel) refreshActiveView() {
-	m.activeView = m.renderBlockRange(m.committed, len(m.blocks))
+	start := max(m.committed, m.historyHiddenUntil)
+	m.activeView = m.renderBlockRange(start, len(m.blocks))
 }
 
 func (m *sessionTUIModel) quit() tea.Cmd {
@@ -934,6 +1337,8 @@ func (m *sessionTUIModel) renderBlock(block sessionTUIBlock) string {
 		return m.renderIndentedBlock(text, 0, m.styles.inputHeading)
 	case sessionTUIBlockDiff:
 		return m.renderDiff(text)
+	case sessionTUIBlockTurnSeparator:
+		return m.styles.muted.Render(formatSessionTurnSeparatorText(text, m.width))
 	default:
 		return ""
 	}
@@ -1023,8 +1428,8 @@ func (m *sessionTUIModel) renderUserBlock(text string) string {
 	return m.renderUserBlockWithStatus(text, "")
 }
 
-func (m *sessionTUIModel) renderQueuedUserBlock(text string) string {
-	return m.renderUserBlockWithStatus(text, "Queued")
+func (m *sessionTUIModel) renderPendingUserBlock(text string) string {
+	return m.renderUserBlockWithStatus(text, "Pending")
 }
 
 func (m *sessionTUIModel) renderUserBlockWithStatus(text, status string) string {
@@ -1114,6 +1519,14 @@ func (m *sessionTUIModel) composerView() string {
 		return blank + "\n" + loading + "\n" + blank
 	}
 	middle := strings.TrimSuffix(m.input.View(), "\n")
+	attachmentLine := ""
+	if len(m.pendingAttachments) > 0 {
+		names := make([]string, len(m.pendingAttachments))
+		for index := range m.pendingAttachments {
+			names[index] = m.pendingAttachments[index].Name
+		}
+		attachmentLine = m.renderUserRow("  " + m.styles.muted.Render("Attached: "+strings.Join(names, ", ")))
+	}
 	lines := strings.Split(middle, "\n")
 	continuation := strings.Repeat(" ", len(sessionTUIComposerPrompt))
 	for index := range lines {
@@ -1125,6 +1538,9 @@ func (m *sessionTUIModel) composerView() string {
 	}
 	middle = strings.Join(lines, "\n")
 	middle = m.renderUserRow(middle)
+	if attachmentLine != "" {
+		return attachmentLine + "\n" + middle + "\n" + blank
+	}
 	return blank + "\n" + middle + "\n" + blank
 }
 
@@ -1147,7 +1563,11 @@ func (m *sessionTUIModel) composerMaxHeight() int {
 }
 
 func (m *sessionTUIModel) composerHeight() int {
-	return m.input.Height() + sessionTUIComposerMinHeight - 1
+	height := m.input.Height() + sessionTUIComposerMinHeight - 1
+	if len(m.pendingAttachments) > 0 {
+		height++
+	}
+	return height
 }
 
 func (m *sessionTUIModel) footerHeight() int {
@@ -1155,15 +1575,15 @@ func (m *sessionTUIModel) footerHeight() int {
 }
 
 func (m *sessionTUIModel) footerView() string {
-	parts := make([]string, 0, 4)
+	parts := make([]string, 0, 5)
 	if progress := m.progressView(); progress != "" {
 		parts = append(parts, progress)
 	}
-	queue := m.queueView()
-	if queue != "" {
-		parts = append(parts, queue)
+	pending := m.pendingView()
+	if pending != "" {
+		parts = append(parts, pending)
 	}
-	parts = append(parts, m.composerView(), m.statusBarView())
+	parts = append(parts, "", m.composerView(), m.statusBarView())
 	return strings.Join(parts, "\n")
 }
 
@@ -1219,8 +1639,8 @@ func (m *sessionTUIModel) statusBarFallback() string {
 		return "Connecting"
 	case m.turnActive:
 		return "Working"
-	case len(m.queuedTurnOrder) > 0:
-		return "Queued"
+	case m.pendingTurnID != "":
+		return "Pending"
 	default:
 		return "Ready"
 	}
@@ -1325,17 +1745,16 @@ func formatSessionTUITokens(value int64) string {
 	return formatted + suffix
 }
 
-func (m *sessionTUIModel) queueView() string {
-	blocks := make([]string, 0, len(m.queuedTurnOrder))
-	for _, turnID := range m.queuedTurnOrder {
-		blocks = append(blocks, m.renderQueuedUserBlock(m.queuedTurns[turnID]))
+func (m *sessionTUIModel) pendingView() string {
+	if m.pendingTurnID == "" {
+		return ""
 	}
-	lines := strings.Split(strings.Join(blocks, "\n"), "\n")
+	lines := strings.Split(m.renderPendingUserBlock(m.pendingTurnText), "\n")
 	progressHeight := 0
 	if m.progressVisible() {
 		progressHeight = 1
 	}
-	maxHeight := min(sessionTUIQueueMaxHeight, max(0, m.height-m.footerHeight()-progressHeight))
+	maxHeight := min(sessionTUIPendingMaxHeight, max(0, m.height-m.footerHeight()-progressHeight))
 	if len(lines) > maxHeight {
 		lines = lines[:maxHeight]
 	}
@@ -1356,6 +1775,9 @@ func (m *sessionTUIModel) progressView() string {
 	case m.connectionStatus == sessionTerminalStatusConnecting && !m.ready:
 		label = "Connecting"
 		started = m.connectionStarted
+	case m.historyPageLoading:
+		label = "Loading history"
+		started = m.historyPageStarted
 	case m.turnInterrupting:
 		label = "Interrupting"
 	case m.waitingForInput:
@@ -1386,6 +1808,13 @@ func formatSessionTUIElapsed(elapsed time.Duration) string {
 		return fmt.Sprintf("%dm %02ds", seconds/60, seconds%60)
 	}
 	return fmt.Sprintf("%dh %02dm %02ds", seconds/(60*60), (seconds/60)%60, seconds%60)
+}
+
+func formatSessionTurnSeparatorText(elapsed string, width int) string {
+	width = max(1, width)
+	label := "─ Worked for " + elapsed + " "
+	label = truncateSessionTUIStatus(label, width)
+	return label + strings.Repeat("─", max(0, width-lipgloss.Width(label)))
 }
 
 func truncateSessionTUIProgress(text string, width int) string {

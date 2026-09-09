@@ -35,6 +35,14 @@ spec:
         - field: "$.data.event.platform"
           pattern: "^(python|go|node)"
 
+      # excludeFilters use OR semantics — a delivery matching any of them is
+      # skipped, even when every entry in `filters` matched.
+      excludeFilters:
+        - field: "$.data.event.environment"
+          value: "staging"
+        - field: "$.data.event.title"
+          pattern: "^(?i)test"
+
   taskTemplate:
     type: claude-code
     credentials:

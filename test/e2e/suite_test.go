@@ -12,7 +12,7 @@ import (
 
 const (
 	claudeCodeModel = "haiku"
-	codexModel      = "gpt-5.3-codex-spark"
+	codexModel      = "gpt-5.6-luna"
 	openCodeModel   = "opencode/big-pickle"
 )
 

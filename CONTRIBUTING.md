@@ -106,8 +106,9 @@ Every pull request must follow
 [the pull request template](.github/PULL_REQUEST_TEMPLATE.md):
 
 - Fill in every section; use `N/A` where appropriate.
-- Choose exactly one kind: `/kind bug`, `/kind cleanup`, `/kind docs`, or
-  `/kind feature`.
+- Choose exactly one kind: `/kind api`, `/kind bug`, `/kind cleanup`,
+  `/kind docs`, or `/kind feature`. Use `/kind api` for pull requests that
+  modify files under `api/`.
 - Link the associated issue, or write `N/A` if there is none.
 - Add a meaningful release note for a user-facing change. Write `NONE` in the
   `release-note` block when there is no user-facing change.

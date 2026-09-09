@@ -4,6 +4,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -316,6 +319,8 @@ func TestBuildClaudeCodeJob_WorkspaceWithCommitRefFetchesDetached(t *testing.T) 
 		`checkout --detach FETCH_HEAD`,
 		"-c credential.helper= -c credential.helper=",
 		"--add credential.helper",
+		"-c credential.username=" + gitCredentialDefaultUsername,
+		"config credential.username " + gitCredentialDefaultUsername,
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("Expected commit checkout script to contain %q, got %q", want, script)
@@ -736,6 +741,12 @@ func TestBuildClaudeCodeJob_WorkspaceWithSecretRefPersistsCredentialHelper(t *te
 	if !strings.Contains(script, "--add credential.helper") {
 		t.Error("Expected init container script to --add credential helper in repo config")
 	}
+	if !strings.Contains(script, "-c credential.username="+gitCredentialDefaultUsername) {
+		t.Error("Expected init container script to set the default credential username for clone")
+	}
+	if !strings.Contains(script, "config credential.username "+gitCredentialDefaultUsername) {
+		t.Error("Expected init container script to persist the default credential username")
+	}
 }
 
 func containsVolumeMount(mounts []corev1.VolumeMount, name, path string) bool {
@@ -942,6 +953,65 @@ func TestBuildClaudeCodeJob_CredentialHelperReadsFromTokenFile(t *testing.T) {
 	}
 }
 
+func TestGitCredentialHelperUsername(t *testing.T) {
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git is not available")
+	}
+	tokenFile := filepath.Join(t.TempDir(), GitHubTokenSecretKey)
+
+	tests := []struct {
+		name               string
+		credentialIn       string
+		configuredUsername string
+		wantUsername       string
+	}{
+		{
+			name:         "preserves URL username",
+			credentialIn: "protocol=https\nhost=bitbucket.example\nusername=bitbucket-user\n\n",
+			wantUsername: "bitbucket-user",
+		},
+		{
+			name:         "defaults missing username",
+			credentialIn: "protocol=https\nhost=github.com\n\n",
+			wantUsername: gitCredentialDefaultUsername,
+		},
+		{
+			name:               "overrides configured username when URL omits it",
+			credentialIn:       "protocol=https\nhost=github.com\n\n",
+			configuredUsername: "configured-user",
+			wantUsername:       gitCredentialDefaultUsername,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := []string{
+				"-c", "credential.helper=",
+			}
+			if tt.configuredUsername != "" {
+				args = append(args, "-c", "credential.username="+tt.configuredUsername)
+			}
+			args = append(args,
+				"-c", "credential.helper="+gitCredentialHelperForTokenFile(tokenFile),
+				"-c", "credential.username="+gitCredentialDefaultUsername,
+				"credential", "fill",
+			)
+			cmd := exec.Command(gitPath, args...)
+			cmd.Stdin = strings.NewReader(tt.credentialIn)
+			cmd.Env = append(os.Environ(), "GITHUB_TOKEN=test-token", "GIT_TERMINAL_PROMPT=0")
+
+			output, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("git credential fill failed: %v", err)
+			}
+			if want := "username=" + tt.wantUsername + "\n"; !strings.Contains(string(output), want) {
+				t.Errorf("git credential fill output missing %q", strings.TrimSpace(want))
+			}
+		})
+	}
+}
+
 func TestBuildClaudeCodeJob_EnterpriseWorkspaceSetsGHHostAndEnterpriseToken(t *testing.T) {
 	builder := NewJobBuilder()
 	task := &kelos.Task{
@@ -1021,7 +1091,7 @@ func TestBuildClaudeCodeJob_EnterpriseWorkspaceSetsGHHostAndEnterpriseToken(t *t
 	}
 }
 
-func TestBuildClaudeCodeJob_GithubComWorkspaceUsesGHToken(t *testing.T) {
+func TestBuildClaudeCodeJob_GithubComWorkspaceWithUsernameUsesGHToken(t *testing.T) {
 	builder := NewJobBuilder()
 	task := &kelos.Task{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1039,7 +1109,7 @@ func TestBuildClaudeCodeJob_GithubComWorkspaceUsesGHToken(t *testing.T) {
 	}
 
 	workspace := &kelos.WorkspaceSpec{
-		Repo: "https://github.com/my-org/my-repo.git",
+		Repo: "https://username@github.com/my-org/my-repo.git",
 		SecretRef: &kelos.SecretReference{
 			Name: "github-token",
 		},
@@ -3911,6 +3981,9 @@ func TestBuildJob_BranchSetupWithSecretRefUsesCredentialHelper(t *testing.T) {
 	if !strings.Contains(script, "-c credential.helper= -c credential.helper=") {
 		t.Error("Expected branch-setup script to clear inherited credential helpers before setting workspace helper")
 	}
+	if !strings.Contains(script, "-c credential.username="+gitCredentialDefaultUsername) {
+		t.Error("Expected branch-setup script to set the default credential username")
+	}
 
 	// Verify GITHUB_TOKEN env var is present on branch-setup.
 	var foundToken bool
@@ -5316,6 +5389,12 @@ func TestBuildJob_CredentialHelperClearsInheritedHelpers(t *testing.T) {
 	}
 	if !strings.Contains(script, "--add credential.helper") {
 		t.Error("Expected repo config to --add credential.helper")
+	}
+	if !strings.Contains(script, "-c credential.username="+gitCredentialDefaultUsername) {
+		t.Error("Expected clone to set the default credential username")
+	}
+	if !strings.Contains(script, "config credential.username "+gitCredentialDefaultUsername) {
+		t.Error("Expected repo config to persist the default credential username")
 	}
 }
 

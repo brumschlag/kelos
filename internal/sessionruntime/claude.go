@@ -43,6 +43,9 @@ type ClaudeProvider struct {
 	writeMu sync.Mutex
 	turnMu  sync.Mutex
 
+	shellContextMu       sync.Mutex
+	pendingShellCommands []shellCommandRecord
+
 	controlMu      sync.Mutex
 	controlPending map[string]chan error
 	nextControlID  atomic.Int64
@@ -56,6 +59,14 @@ type ClaudeProvider struct {
 	hadTextDelta      bool
 	blockText         map[int]*strings.Builder
 	interrupted       bool
+
+	statusMu sync.Mutex
+	model    string
+	usage    *RuntimeUsage
+	// countedMessages holds assistant message IDs whose usage was already added
+	// to the totals; Claude Code repeats a message's usage on every content-block
+	// event for that message.
+	countedMessages map[string]struct{}
 
 	sessionMu sync.Mutex
 	sessionID string
@@ -143,7 +154,7 @@ func claudeCommandArgs(config ProviderConfig, sessionID string, resume bool) []s
 }
 
 // RunTurn sends one prompt while keeping the Claude Code process alive between turns.
-func (p *ClaudeProvider) RunTurn(ctx context.Context, prompt string, sink EventSink) error {
+func (p *ClaudeProvider) RunTurn(ctx context.Context, input TurnInput, sink EventSink) error {
 	p.turnMu.Lock()
 	defer p.turnMu.Unlock()
 
@@ -159,6 +170,7 @@ func (p *ClaudeProvider) RunTurn(ctx context.Context, prompt string, sink EventS
 	p.blockText = map[int]*strings.Builder{}
 	p.interrupted = false
 	p.activeMu.Unlock()
+	p.emitRuntimeStatus(sink)
 	defer func() {
 		interactionCancel()
 		p.activeMu.Lock()
@@ -175,21 +187,33 @@ func (p *ClaudeProvider) RunTurn(ctx context.Context, prompt string, sink EventS
 	p.sessionMu.Lock()
 	sessionID := p.sessionID
 	p.sessionMu.Unlock()
+	p.shellContextMu.Lock()
+	content := make([]map[string]string, 0, len(p.pendingShellCommands)+1)
+	for _, record := range p.pendingShellCommands {
+		content = append(content, map[string]string{
+			"type": "text",
+			"text": formatShellCommandRecord(record),
+		})
+	}
+	content = append(content, map[string]string{
+		"type": "text",
+		"text": attachmentPrompt(input),
+	})
 	message := map[string]any{
 		"type": "user",
 		"message": map[string]any{
-			"role": "user",
-			"content": []map[string]string{{
-				"type": "text",
-				"text": prompt,
-			}},
+			"role":    "user",
+			"content": content,
 		},
 		"parent_tool_use_id": nil,
 		"session_id":         sessionID,
 	}
 	if err := p.write(message); err != nil {
+		p.shellContextMu.Unlock()
 		return err
 	}
+	p.pendingShellCommands = nil
+	p.shellContextMu.Unlock()
 
 	select {
 	case result := <-done:
@@ -211,6 +235,13 @@ func (p *ClaudeProvider) RunTurn(ctx context.Context, prompt string, sink EventS
 		}
 		return errors.New("Claude Code stopped")
 	}
+}
+
+func (p *ClaudeProvider) recordShellCommand(_ context.Context, record shellCommandRecord) error {
+	p.shellContextMu.Lock()
+	defer p.shellContextMu.Unlock()
+	p.pendingShellCommands = append(p.pendingShellCommands, record)
+	return nil
 }
 
 // Interrupt stops the active Claude Code turn without closing its session.
@@ -365,15 +396,18 @@ func newProviderScanner(reader io.Reader) *bufio.Scanner {
 
 func (p *ClaudeProvider) handleClaudeLine(line []byte, sink EventSink) (*claudeTurnResult, error) {
 	var envelope struct {
-		Type           string          `json:"type"`
-		Subtype        string          `json:"subtype"`
-		IsError        bool            `json:"is_error"`
-		Result         string          `json:"result"`
-		StopReason     string          `json:"stop_reason"`
-		TerminalReason string          `json:"terminal_reason"`
-		SessionID      string          `json:"session_id"`
-		Event          json.RawMessage `json:"event"`
-		Message        json.RawMessage `json:"message"`
+		Type           string                      `json:"type"`
+		Subtype        string                      `json:"subtype"`
+		IsError        bool                        `json:"is_error"`
+		Result         string                      `json:"result"`
+		StopReason     string                      `json:"stop_reason"`
+		TerminalReason string                      `json:"terminal_reason"`
+		SessionID      string                      `json:"session_id"`
+		Model          string                      `json:"model"`
+		Usage          *claudeUsage                `json:"usage"`
+		ModelUsage     map[string]claudeModelUsage `json:"modelUsage"`
+		Event          json.RawMessage             `json:"event"`
+		Message        json.RawMessage             `json:"message"`
 	}
 	if err := json.Unmarshal(line, &envelope); err != nil {
 		return nil, fmt.Errorf("decoding Claude Code event: %w", err)
@@ -382,6 +416,16 @@ func (p *ClaudeProvider) handleClaudeLine(line []byte, sink EventSink) (*claudeT
 		p.sessionMu.Lock()
 		p.sessionID = envelope.SessionID
 		p.sessionMu.Unlock()
+	}
+	switch envelope.Type {
+	case "system":
+		if envelope.Subtype == "init" {
+			p.updateClaudeModel(envelope.Model, sink)
+		}
+	case "assistant":
+		p.recordClaudeUsage(envelope.Message, sink)
+	case "result":
+		p.recordClaudeResultUsage(envelope.Usage, envelope.ModelUsage, sink)
 	}
 	if sink == nil && envelope.Type != "result" {
 		return nil, nil
@@ -412,6 +456,143 @@ func (p *ClaudeProvider) handleClaudeLine(line []byte, sink EventSink) (*claudeT
 		return result, nil
 	}
 	return nil, nil
+}
+
+type claudeModelUsage struct {
+	ContextWindow int64 `json:"contextWindow"`
+}
+
+type claudeUsage struct {
+	InputTokens              int64 `json:"input_tokens"`
+	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+	OutputTokens             int64 `json:"output_tokens"`
+}
+
+// updateClaudeModel records the model reported by Claude Code. The init event
+// can arrive before any turn is active, so state is stored even without a sink.
+func (p *ClaudeProvider) updateClaudeModel(model string, sink EventSink) {
+	if model == "" {
+		return
+	}
+	p.statusMu.Lock()
+	changed := p.model != model
+	p.model = model
+	p.statusMu.Unlock()
+	if changed && sink != nil {
+		p.emitRuntimeStatus(sink)
+	}
+}
+
+// recordClaudeUsage accumulates token usage from one assistant message event.
+// This keeps totals moving while a turn runs; each result event then replaces
+// them with Claude Code's authoritative session totals.
+func (p *ClaudeProvider) recordClaudeUsage(raw json.RawMessage, sink EventSink) {
+	var message struct {
+		ID    string       `json:"id"`
+		Model string       `json:"model"`
+		Usage *claudeUsage `json:"usage"`
+	}
+	if json.Unmarshal(raw, &message) != nil {
+		return
+	}
+	changed := false
+	p.statusMu.Lock()
+	if message.Model != "" && message.Model != p.model {
+		p.model = message.Model
+		changed = true
+	}
+	if message.Usage != nil {
+		input := message.Usage.InputTokens + message.Usage.CacheCreationInputTokens + message.Usage.CacheReadInputTokens
+		output := message.Usage.OutputTokens
+		if p.usage == nil {
+			p.usage = &RuntimeUsage{}
+		}
+		if message.ID != "" {
+			if _, counted := p.countedMessages[message.ID]; !counted {
+				if p.countedMessages == nil {
+					p.countedMessages = map[string]struct{}{}
+				}
+				p.countedMessages[message.ID] = struct{}{}
+				p.usage.InputTokens += input
+				p.usage.OutputTokens += output
+				p.usage.TotalTokens += input + output
+				changed = true
+			}
+		}
+		if context := input + output; p.usage.ContextTokens != context {
+			p.usage.ContextTokens = context
+			changed = true
+		}
+	}
+	p.statusMu.Unlock()
+	if changed && sink != nil {
+		p.emitRuntimeStatus(sink)
+	}
+}
+
+// recordClaudeResultUsage replaces the running totals with a result event's
+// usage and stores the context window from its per-model usage. Claude Code
+// reports session-cumulative usage on result events, covering subagent and
+// internal API calls that never appear as assistant events in the stream, so
+// the result totals correct any drift in the per-message accumulation.
+func (p *ClaudeProvider) recordClaudeResultUsage(usage *claudeUsage, models map[string]claudeModelUsage, sink EventSink) {
+	changed := false
+	p.statusMu.Lock()
+	if usage != nil {
+		input := usage.InputTokens + usage.CacheCreationInputTokens + usage.CacheReadInputTokens
+		output := usage.OutputTokens
+		// Claude Code emits zeroed usage on synthetic result events; those must
+		// not wipe the totals.
+		if input > 0 || output > 0 {
+			if p.usage == nil {
+				p.usage = &RuntimeUsage{}
+			}
+			if p.usage.InputTokens != input || p.usage.OutputTokens != output || p.usage.TotalTokens != input+output {
+				p.usage.InputTokens = input
+				p.usage.OutputTokens = output
+				p.usage.TotalTokens = input + output
+				changed = true
+			}
+		}
+	}
+	window := models[p.model].ContextWindow
+	if window == 0 {
+		for _, modelUsage := range models {
+			window = max(window, modelUsage.ContextWindow)
+		}
+	}
+	if window > 0 {
+		if p.usage == nil {
+			p.usage = &RuntimeUsage{}
+		}
+		if p.usage.ContextWindow != window {
+			p.usage.ContextWindow = window
+			changed = true
+		}
+	}
+	p.statusMu.Unlock()
+	if changed && sink != nil {
+		p.emitRuntimeStatus(sink)
+	}
+}
+
+func (p *ClaudeProvider) emitRuntimeStatus(sink EventSink) {
+	status := p.runtimeStatusSnapshot()
+	if !status.empty() {
+		sink.Emit(Event{Type: EventRuntimeStatus, Runtime: &status})
+	}
+}
+
+func (p *ClaudeProvider) runtimeStatusSnapshot() RuntimeStatus {
+	p.statusMu.Lock()
+	defer p.statusMu.Unlock()
+	status := RuntimeStatus{Model: p.model, Effort: p.config.Effort}
+	if p.usage != nil {
+		usage := *p.usage
+		status.Usage = &usage
+	}
+	return status
 }
 
 func (p *ClaudeProvider) handleControlRequest(line []byte) {

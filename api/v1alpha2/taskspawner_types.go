@@ -48,8 +48,10 @@ type When struct {
 
 	// GenericWebhook triggers task spawning from arbitrary HTTP POST payloads.
 	// Any system that can send an HTTP POST with a JSON body can trigger
-	// tasks through this source. The URL path is /webhook/<source>.
-	// The endpoint is currently unauthenticated; restrict access at the network layer.
+	// tasks through this source. On the per-source server the URL path is
+	// /webhook/<source>; deliveries are not signature-verified, so restrict
+	// access at the network layer. Set gatewayRef to route through a
+	// WebhookGateway instead.
 	// +optional
 	GenericWebhook *GenericWebhook `json:"webhook,omitempty"`
 
@@ -69,19 +71,53 @@ type Cron struct {
 
 // GitHubReporting configures status reporting back to GitHub.
 // All GitHub sources (issues, pull requests, webhooks) support comment
-// reporting via the Enabled field. The Checks field is supported for
-// githubPullRequests and for githubWebhook sources that include at least
-// one pull-request event type; other sources reject it via CEL validation.
+// reporting. The Checks field is supported for githubPullRequests and for
+// githubWebhook sources that include at least one pull-request event type or
+// only match issue_comment events on pull requests; other sources reject it
+// via CEL validation.
 type GitHubReporting struct {
 	// Enabled posts standard status comments back to the originating GitHub issue or PR.
+	//
+	// Deprecated: use Comments instead.
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
 
+	// Comments configures task status comments on the originating GitHub issue
+	// or pull request. When nil, no comments are posted unless the deprecated
+	// Enabled field is true.
+	// +optional
+	Comments *GitHubCommentsReporting `json:"comments,omitempty"`
+
 	// Checks creates GitHub Check Runs for pull request tasks. When nil,
 	// no Check Runs are created. Supported for githubPullRequests and
-	// githubWebhook sources with pull-request event types.
+	// githubWebhook sources with pull-request event types or PR-scoped
+	// issue_comment filters.
 	// +optional
 	Checks *GitHubChecksReporting `json:"checks,omitempty"`
+}
+
+// GitHubCommentMode controls how task status comments are reused.
+type GitHubCommentMode string
+
+const (
+	// GitHubCommentModePerTask creates one status comment for each Task and
+	// updates it as that Task's phase changes.
+	GitHubCommentModePerTask GitHubCommentMode = "PerTask"
+
+	// GitHubCommentModeSticky maintains one status comment per TaskSpawner and
+	// originating issue or pull request, updating it across Tasks.
+	GitHubCommentModeSticky GitHubCommentMode = "Sticky"
+)
+
+// GitHubCommentsReporting configures GitHub task status comment reporting.
+type GitHubCommentsReporting struct {
+	// Mode controls whether comments are created per Task or reused across
+	// Tasks from the same TaskSpawner and originating issue or pull request.
+	// Defaults to PerTask.
+	// +optional
+	// +kubebuilder:default=PerTask
+	// +kubebuilder:validation:Enum=PerTask;Sticky
+	Mode GitHubCommentMode `json:"mode,omitempty"`
 }
 
 // GitHubChecksReporting configures GitHub Check Run reporting for pull
@@ -348,7 +384,7 @@ type Jira struct {
 }
 
 // GitHubWebhook configures matching for GitHub webhook events.
-// +kubebuilder:validation:XValidation:rule="!has(self.reporting) || !has(self.reporting.checks) || self.events.exists(e, e in ['pull_request', 'pull_request_review', 'pull_request_review_comment', 'pull_request_target'])",message="checks reporting requires at least one pull-request event type"
+// +kubebuilder:validation:XValidation:rule="!has(self.reporting) || !has(self.reporting.checks) || self.events.exists(e, e in ['pull_request', 'pull_request_review', 'pull_request_review_comment', 'pull_request_target']) || (self.events.exists(e, e == 'issue_comment') && has(self.filters) && self.filters.exists(f, f.event == 'issue_comment') && self.filters.all(f, f.event != 'issue_comment' || (has(f.commentOn) && f.commentOn == 'PullRequest')))",message="checks reporting requires a pull-request event type or PR-scoped issue_comment filters"
 type GitHubWebhook struct {
 	// Events is the list of GitHub event types to listen for.
 	// e.g., "issue_comment", "pull_request_review", "push", "issues"
@@ -356,6 +392,11 @@ type GitHubWebhook struct {
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=20
 	Events []string `json:"events"`
+
+	// GatewayRef binds this source to a WebhookGateway in the same namespace whose
+	// spec.github field is set. The per-source webhook server ignores this spawner.
+	// +optional
+	GatewayRef *GatewayReference `json:"gatewayRef,omitempty"`
 
 	// Repository restricts webhooks to a specific repository (owner/repo format).
 	// If empty, webhooks from any repository are accepted.
@@ -497,6 +538,11 @@ type LinearWebhook struct {
 	// +kubebuilder:validation:MinItems=1
 	Types []string `json:"types"`
 
+	// GatewayRef binds this source to a WebhookGateway in the same namespace whose
+	// spec.linear field is set. The per-source webhook server ignores this spawner.
+	// +optional
+	GatewayRef *GatewayReference `json:"gatewayRef,omitempty"`
+
 	// Filters refine which events trigger tasks (OR semantics within same type).
 	// If empty, all events in the Types list trigger tasks.
 	// +optional
@@ -533,17 +579,24 @@ type LinearWebhookFilter struct {
 
 // GenericWebhook configures webhook-driven task spawning from arbitrary HTTP
 // POST payloads with JSON bodies. Any system that can send an HTTP POST can
-// trigger tasks through this source. The URL path is /webhook/<source>.
-// The endpoint is currently unauthenticated; per-source HMAC validation is
-// not implemented.
+// trigger tasks through this source. On the per-source server the URL path is
+// /webhook/<source> and deliveries are not signature-verified, so restrict
+// access at the network layer. Set gatewayRef to route through a
+// WebhookGateway instead.
 // +kubebuilder:validation:XValidation:rule="'id' in self.fieldMapping",message="fieldMapping must include an 'id' key for deduplication and task naming"
 type GenericWebhook struct {
 	// Source is a short identifier for this webhook source (e.g., "notion",
-	// "sentry", "drata"). It determines the URL path: /webhook/<source>.
-	// Must be lowercase alphanumeric with optional hyphens.
+	// "sentry", "drata"). On the per-source server it determines the URL path:
+	// /webhook/<source>. Must be lowercase alphanumeric with optional hyphens.
+	// Ignored for routing when gatewayRef is set.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`
 	Source string `json:"source"`
+
+	// GatewayRef binds this source to a WebhookGateway in the same namespace whose
+	// spec.generic field is set. The per-source webhook server ignores this spawner.
+	// +optional
+	GatewayRef *GatewayReference `json:"gatewayRef,omitempty"`
 
 	// FieldMapping maps JSONPath expressions to WorkItem template variables.
 	// Each key is a template variable name (available as {{.Key}} in
@@ -560,6 +613,14 @@ type GenericWebhook struct {
 	// pattern. If empty, all deliveries trigger tasks.
 	// +optional
 	Filters []GenericWebhookFilter `json:"filters,omitempty"`
+
+	// ExcludeFilters reject a webhook delivery when ANY of them matches (OR
+	// semantics across exclude filters). They are evaluated after Filters, so
+	// a delivery triggers a task only when it matches every entry in Filters
+	// and no entry here. A filter whose field is absent from the payload does
+	// not match and therefore does not exclude the delivery.
+	// +optional
+	ExcludeFilters []GenericWebhookFilter `json:"excludeFilters,omitempty"`
 }
 
 // GenericWebhookFilter defines a condition for filtering generic webhook payloads.
@@ -738,6 +799,15 @@ type HTTPContextSource struct {
 	// +kubebuilder:validation:MaxItems=16
 	HeadersFrom []HTTPHeaderSource `json:"headersFrom,omitempty"`
 
+	// GitHubAppAuth authenticates the request with a GitHub App installation
+	// token minted from credentials in a Secret. When set, an
+	// "Authorization: token <installation-token>" header is added to the
+	// request. An explicit Authorization header supplied via Headers or
+	// HeadersFrom takes precedence and disables GitHub App auth for that
+	// request.
+	// +optional
+	GitHubAppAuth *GitHubAppContextAuth `json:"githubAppAuth,omitempty"`
+
 	// Body is a Go text/template for POST request bodies.
 	// +optional
 	Body string `json:"body,omitempty"`
@@ -767,6 +837,26 @@ type HTTPContextSource struct {
 	// +kubebuilder:default=32768
 	// +optional
 	MaxResponseBytes *int32 `json:"maxResponseBytes,omitempty"`
+}
+
+// GitHubAppContextAuth configures GitHub App installation-token
+// authentication for an HTTP context source.
+type GitHubAppContextAuth struct {
+	// SecretRef references a Secret in the same namespace as the TaskSpawner
+	// holding GitHub App credentials. The Secret must contain appID,
+	// installationID, and privateKey keys.
+	// +kubebuilder:validation:Required
+	SecretRef SecretReference `json:"secretRef"`
+
+	// APIBaseURL overrides the GitHub API base URL used to mint installation
+	// tokens. Defaults to https://api.github.com. Must be an HTTPS URL, since
+	// the signed GitHub App JWT is sent to this endpoint. Set this for GitHub
+	// Enterprise Server (e.g., "https://github.example.com/api/v3").
+	// May be at most 2048 characters.
+	// +kubebuilder:validation:Pattern=`^https://[^/]`
+	// +kubebuilder:validation:MaxLength=2048
+	// +optional
+	APIBaseURL string `json:"apiBaseURL,omitempty"`
 }
 
 // ContextSource declares an external data source whose fetched value is
@@ -803,7 +893,9 @@ type TaskTemplateMetadata struct {
 	// Labels are merged into the spawned Task's labels. Values support Go
 	// text/template with the same variables as branch and promptTemplate.
 	// The kelos.dev/taskspawner label is always set to the TaskSpawner name
-	// and overrides any user value for that key.
+	// and overrides any user value for that key. When TaskSpawner.spec.credentials
+	// is configured, kelos.dev/spawner-credential is also reserved and overrides
+	// any user value with the selected credential name.
 	// +optional
 	Labels map[string]string `json:"labels,omitempty"`
 
@@ -818,12 +910,13 @@ type TaskTemplateMetadata struct {
 // TaskTemplate defines the template for spawned Tasks.
 //
 // Execution source (exactly one required):
-//   - worker (inline): creates a Job using worker.type and worker.credentials.
+//   - worker (inline): creates a Job using worker.type and credentials from
+//     worker.credentials or TaskSpawner.spec.credentials.
 //   - workerPoolRef: dispatches to a pre-warmed pool.
-//   - type + credentials (legacy): equivalent to inline worker, kept for backward compatibility.
+//   - type (legacy): equivalent to inline worker, with credentials from
+//     credentials or TaskSpawner.spec.credentials; kept for backward compatibility.
 //
-// +kubebuilder:validation:XValidation:rule="has(self.workerPoolRef) || (has(self.worker) && has(self.worker.type) && size(self.worker.type) > 0) || (has(self.type) && size(self.type) > 0 && has(self.credentials) && size(self.credentials.type) > 0)",message="either workerPoolRef, worker with type, or type with credentials is required"
-// +kubebuilder:validation:XValidation:rule="has(self.workerPoolRef) || !has(self.worker) || has(self.worker.credentials)",message="worker.credentials is required for inline execution"
+// +kubebuilder:validation:XValidation:rule="has(self.workerPoolRef) || (has(self.worker) && has(self.worker.type) && size(self.worker.type) > 0) || (has(self.type) && size(self.type) > 0)",message="either workerPoolRef, worker with type, or type is required"
 // +kubebuilder:validation:XValidation:rule="!has(self.workerPoolRef) || (!has(self.type) && !has(self.credentials))",message="workerPoolRef is mutually exclusive with inline type/credentials"
 // +kubebuilder:validation:XValidation:rule="!has(self.workerPoolRef) || !has(self.worker)",message="workerPoolRef is mutually exclusive with inline worker (per-task overrides not yet supported)"
 // +kubebuilder:validation:XValidation:rule="!has(self.worker) || (!has(self.type) && !has(self.credentials))",message="worker is mutually exclusive with legacy type/credentials fields"
@@ -1013,14 +1106,28 @@ type TaskTemplate struct {
 
 // TaskSpawnerSpec defines the desired state of TaskSpawner.
 // +kubebuilder:validation:XValidation:rule="!(has(self.when.githubIssues) || has(self.when.githubPullRequests) || has(self.when.githubWebhook) || has(self.when.linearWebhook)) || has(self.taskTemplate.workspaceRef) || (has(self.taskTemplate.worker) && has(self.taskTemplate.worker.workspaceRef)) || has(self.taskTemplate.workerPoolRef)",message="a workspace source is required when using githubIssues, githubPullRequests, githubWebhook, or linearWebhook source (set taskTemplate.workspaceRef, taskTemplate.worker.workspaceRef, or taskTemplate.workerPoolRef — a pool satisfies this because it carries its own workspace)"
+// +kubebuilder:validation:XValidation:rule="has(self.taskTemplate.workerPoolRef) || (has(self.taskTemplate.worker) && (has(self.taskTemplate.worker.credentials) || has(self.credentials))) || (has(self.taskTemplate.type) && (has(self.taskTemplate.credentials) || has(self.credentials)))",message="inline task templates require taskTemplate credentials or spec.credentials"
+// +kubebuilder:validation:XValidation:rule="!has(self.credentials) || (!has(self.taskTemplate.workerPoolRef) && !has(self.taskTemplate.credentials) && (!has(self.taskTemplate.worker) || !has(self.taskTemplate.worker.credentials)))",message="spec.credentials is mutually exclusive with taskTemplate credentials and workerPoolRef"
 type TaskSpawnerSpec struct {
 	// When defines the conditions that trigger task spawning.
 	// +kubebuilder:validation:Required
 	When When `json:"when"`
 
-	// TaskTemplate defines the template for spawned Tasks.
+	// TaskTemplate defines the template for spawned Tasks. Inline worker and
+	// legacy type templates may use TaskSpawner.spec.credentials instead of
+	// credentials nested in the template.
 	// +kubebuilder:validation:Required
 	TaskTemplate TaskTemplate `json:"taskTemplate"`
+
+	// Credentials lists named credentials available to generated Tasks. The
+	// spawner selects one credential at random and copies it to the generated
+	// Task. Mutually exclusive with credentials configured in taskTemplate and
+	// with taskTemplate.workerPoolRef.
+	// +optional
+	// +kubebuilder:validation:MinItems=1
+	// +listType=map
+	// +listMapKey=name
+	Credentials []SpawnerCredential `json:"credentials,omitempty"`
 
 	// MaxConcurrency limits the number of concurrently running (non-terminal) Tasks.
 	// When the limit is reached, the spawner skips creating new Tasks until
