@@ -26,7 +26,13 @@ crds:
 #
 # Agent pods are not rendered by the chart and are pinned separately, through
 # podOverrides.nodeSelector on the WorkerPool in workloads.yaml and on the
-# Session in session.yaml. Any TaskSpawner taskTemplate needs the same.
+# Session in session.yaml.
+#
+# Note the live inpulse-issues TaskSpawner uses a different selector for its own
+# Tasks, `workload: agents`, steering them to a dedicated agent nodepool. Those
+# nodes are all amd64 today, so its Tasks are safe by accident rather than by
+# constraint; adding kubernetes.io/arch=amd64 alongside it would make that
+# explicit. That spawner is a live object and is not defined in this directory.
 #
 # The alternative is publishing multi-arch images, which would let these
 # workloads use the Graviton capacity. Until then this is a real constraint:
