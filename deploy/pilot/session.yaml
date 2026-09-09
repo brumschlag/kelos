@@ -16,8 +16,14 @@
 #      auto-ebs-gp3 / ReadWriteOnce is the only option, which is fine because a
 #      Session is a single-replica StatefulSet.
 #
-# Prerequisite (not created here, since it holds a credential):
+# Prerequisites:
 #   secret/honcho-gateway-key, key gateway-api-key — the LiteLLM gateway token.
+#   Not created here, since it holds a credential.
+#
+#   The v0.55.0 CRDs. spec.idlePolicy does not exist in v0.49.0, and the API
+#   server rejects it outright rather than pruning it ("unknown field
+#   spec.idlePolicy"), so applying this against the pre-upgrade cluster fails.
+#   Apply it after the controller and CRDs from this branch are rolled out.
 #
 # Apply, then watch it come up:
 #   kubectl apply -f deploy/pilot/session.yaml
@@ -60,7 +66,8 @@ spec:
     podOverrides:
       # NOTE: deliberately NO activeDeadlineSeconds here. The envoverrides-pool
       # sets 900s, which is correct for a batch phase but would kill an
-      # interactive Session mid-conversation after 15 minutes.
+      # interactive Session mid-conversation after 15 minutes. spec.idlePolicy
+      # below is the mechanism that bounds an abandoned Session instead.
       env:
         - name: ANTHROPIC_BASE_URL
           value: http://bedrock-gateway.honcho.svc.cluster.local
@@ -71,6 +78,15 @@ spec:
               key: gateway-api-key
         - name: MAX_THINKING_TOKENS
           value: "0"
+  # An abandoned interactive Session would otherwise hold its Pod indefinitely,
+  # so suspend the runtime after 30 minutes idle. Suspending frees the Pod but
+  # keeps the Session and its PVC, and selecting the Session or connecting a
+  # terminal resumes it, so nothing is lost.
+  #
+  # deleteAfterSeconds is deliberately unset: deletion removes the workspace
+  # storage, discarding any uncommitted changes in the Session branch.
+  idlePolicy:
+    suspendAfterSeconds: 1800
   # Persistent workspace keeps conversation history across Pod replacement, which
   # is also what stops initialPrompt being replayed. An emptyDir workspace would
   # resubmit it after every Pod swap.
