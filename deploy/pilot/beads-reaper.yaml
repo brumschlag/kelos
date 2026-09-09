@@ -1,0 +1,193 @@
+# Stale-claim reaper for the beads-ready TaskSpawner.
+# Shipped suspended; unsuspend after a DRY_RUN=1 manual job looks right.
+# The script itself is deploy/pilot/beads-reaper.py (mirrored into the
+# ConfigMap below — regenerate both together).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: beads-reaper
+  namespace: kelos-pilot
+data:
+  beads-reaper.py: "#!/usr/bin/env python3\n\"\"\"Release beads whose Kelos Task is gone or failed.\n\n\
+    WHY THIS EXISTS. The claim-bead initContainer marks a bead in_progress the moment\nits Task starts,\
+    \ which is what keeps it out of `bd ready` and stops it being\nrespawned. That is the right default,\
+    \ but it is one-way: if the Task then fails,\nor is deleted before it finishes, the bead stays in_progress\
+    \ forever. Nothing\nretries it and nothing says why \u2014 the mirror image of the triage-dispatch\
+    \ defect\nwhere a bead was retired on dispatch rather than on success.\n\nWHAT IT DOES NOT DO. It\
+    \ never closes anything, and it never releases a bead whose\nTask SUCCEEDED. A finished Task means\
+    \ an agent did the work; whether that work\nresolved the bead is a human judgement (or the close-on-merge\
+    \ workflow's). Those\nare reported and left alone.\n\nRETRY IS BOUNDED. Releasing a bead makes it\
+    \ ready again, so a bead that fails\nevery time would loop forever and burn an agent run each cycle.\
+    \ Each release adds\na kelos-attempt-<n> label; once MAX_ATTEMPTS is reached the bead is labelled\n\
+    kelos-blocked and left in_progress, so it stays out of `bd ready` and a human has\nto look at it.\n\
+    \"\"\"\n\nimport json\nimport os\nimport re\nimport subprocess\nimport sys\n\nSPAWNER = os.environ[\"\
+    SPAWNER\"]\nTASK_NAMESPACE = os.environ[\"TASK_NAMESPACE\"]\nACTOR = os.environ[\"BEADS_ACTOR\"]\n\
+    MAX_ATTEMPTS = int(os.environ.get(\"MAX_ATTEMPTS\", \"3\"))\nDRY_RUN = os.environ.get(\"DRY_RUN\"\
+    , \"0\") == \"1\"\n\n# Same shape the spawner and the close workflow validate against. A malformed\
+    \ id\n# must never reach `bd update`, which with no id updates \"the last touched issue\".\nID_RE\
+    \ = re.compile(r\"^[a-z0-9]+(-[a-z0-9]+)+$\")\nATTEMPT_RE = re.compile(r\"^kelos-attempt-(\\d+)$\"\
+    )\n\nBLOCKED_LABEL = \"kelos-blocked\"\n\n\ndef bd(*args, check=True):\n    return subprocess.run([\"\
+    bd\", *args], capture_output=True, text=True, check=check)\n\n\ndef claimed_beads():\n    out = bd(\"\
+    list\", \"--status\", \"in_progress\", \"--assignee\", ACTOR,\n             \"--json\", \"--limit\"\
+    , \"0\").stdout.strip()\n    return json.loads(out) if out else []\n\n\ndef task_phases():\n    out\
+    \ = subprocess.run(\n        [\"kubectl\", \"get\", \"tasks\", \"-n\", TASK_NAMESPACE,\n         \"\
+    -l\", f\"kelos.dev/taskspawner={SPAWNER}\", \"-o\", \"json\"],\n        capture_output=True, text=True,\
+    \ check=True).stdout\n    items = json.loads(out).get(\"items\", [])\n    return {t[\"metadata\"][\"\
+    name\"]: (t.get(\"status\") or {}).get(\"phase\", \"\") for t in items}\n\n\ndef attempts_so_far(labels):\n\
+    \    seen = [int(m.group(1)) for m in (ATTEMPT_RE.match(l) for l in labels) if m]\n    return max(seen)\
+    \ if seen else 0\n\n\ndef main():\n    beads = claimed_beads()\n    phases = task_phases()\n    print(f\"\
+    claimed by {ACTOR}: {len(beads)} | tasks for {SPAWNER}: {len(phases)}\")\n\n    released, blocked,\
+    \ left = [], [], []\n    changed = False\n\n    for bead in beads:\n        bid = bead.get(\"id\"\
+    , \"\")\n        if not ID_RE.match(bid):\n            print(f\"  SKIP {bid!r}: not a well-formed\
+    \ bead id\", file=sys.stderr)\n            continue\n\n        task_name = f\"{SPAWNER}-{bid}\"\n\
+    \        phase = phases.get(task_name)\n\n        if phase is None:\n            reason = f\"its Task\
+    \ {task_name} no longer exists\"\n        elif phase == \"Failed\":\n            reason = f\"its Task\
+    \ {task_name} failed\"\n        else:\n            # Running/Pending: still working. Succeeded: an\
+    \ agent finished, so\n            # resolution is a human's call, not ours.\n            left.append((bid,\
+    \ phase or \"<no phase>\"))\n            continue\n\n        labels = bead.get(\"labels\") or []\n\
+    \        n = attempts_so_far(labels) + 1\n\n        if n > MAX_ATTEMPTS:\n            if BLOCKED_LABEL\
+    \ in labels:\n                left.append((bid, f\"already {BLOCKED_LABEL}\"))\n                continue\n\
+    \            print(f\"  BLOCK {bid}: {reason}; {n - 1} attempts already, at the ceiling\")\n     \
+    \       if not DRY_RUN:\n                bd(\"update\", bid, \"--add-label\", BLOCKED_LABEL, \"--append-notes\"\
+    ,\n                   f\"kelos reaper: {reason}. {n - 1} attempts is the ceiling \"\n            \
+    \       f\"(MAX_ATTEMPTS={MAX_ATTEMPTS}); left in_progress and labelled \"\n                   f\"\
+    {BLOCKED_LABEL} so it stays out of bd ready pending a human.\")\n                changed = True\n\
+    \            blocked.append(bid)\n            continue\n\n        print(f\"  RELEASE {bid}: {reason}\
+    \ (attempt {n}/{MAX_ATTEMPTS})\")\n        if not DRY_RUN:\n            bd(\"update\", bid, \"--status\"\
+    , \"open\",\n               \"--add-label\", f\"kelos-attempt-{n}\",\n               \"--append-notes\"\
+    , f\"kelos reaper: released because {reason}. \"\n                                 f\"Attempt {n}\
+    \ of {MAX_ATTEMPTS}.\")\n            changed = True\n        released.append(bid)\n\n    if changed\
+    \ and not DRY_RUN:\n        print(\"pushing to the hub\")\n        bd(\"dolt\", \"push\")\n    elif\
+    \ DRY_RUN:\n        print(\"DRY_RUN=1 \u2014 nothing was written or pushed\")\n\n    print(f\"summary:\
+    \ released={len(released)} blocked={len(blocked)} left={len(left)}\")\n    for bid, why in left:\n\
+    \        print(f\"  left {bid}: {why}\")\n    return 0\n\n\nif __name__ == \"__main__\":\n    sys.exit(main())\n"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: beads-reaper
+  namespace: kelos-pilot
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: beads-reaper
+  namespace: kelos-pilot
+rules:
+- apiGroups:
+  - kelos.dev
+  resources:
+  - tasks
+  verbs:
+  - get
+  - list
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: beads-reaper
+  namespace: kelos-pilot
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: beads-reaper
+subjects:
+- kind: ServiceAccount
+  name: beads-reaper
+  namespace: kelos-pilot
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: beads-reaper
+  namespace: kelos-pilot
+  annotations:
+    purpose: 'Releases beads left in_progress by a Task that failed or was deleted, so they return to
+      bd ready instead of being stranded. Never closes anything, and never touches a bead whose Task succeeded.
+      Bounded by MAX_ATTEMPTS: at the ceiling a bead is labelled kelos-blocked and left claimed for a
+      human.'
+spec:
+  schedule: 0 * * * *
+  timeZone: America/New_York
+  concurrencyPolicy: Forbid
+  suspend: true
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 900
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app: beads-reaper
+        spec:
+          restartPolicy: Never
+          serviceAccountName: beads-reaper
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65532
+            runAsNonRoot: true
+            fsGroup: 65532
+          nodeSelector:
+            kubernetes.io/arch: amd64
+          volumes:
+          - name: work
+            emptyDir: {}
+          - name: script
+            configMap:
+              name: beads-reaper
+              defaultMode: 365
+          containers:
+          - name: reaper
+            image: 565715328522.dkr.ecr.us-east-1.amazonaws.com/triage-dispatch:0.2.0
+            command:
+            - /bin/sh
+            - -c
+            args:
+            - "set -eu\nmkdir -p \"$HOME/.dolt\" /work/repo\ncd /work/repo\nbd init --non-interactive\
+              \ --database beads --prefix beadseed \\\n  --remote \"$BEADS_REMOTE\" >/dev/null\nexec python3\
+              \ /script/beads-reaper.py\n"
+            env:
+            - name: SPAWNER
+              value: beads-ready
+            - name: TASK_NAMESPACE
+              value: kelos-pilot
+            - name: BEADS_ACTOR
+              value: kelos:beads-ready
+            - name: MAX_ATTEMPTS
+              value: '3'
+            - name: DRY_RUN
+              value: '0'
+            - name: HOME
+              value: /work
+            - name: BD_NON_INTERACTIVE
+              value: '1'
+            - name: BEADS_REMOTE
+              value: https://beads-int.ai.tellihealth.com:50051/beads
+            - name: BEADS_DOLT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: beads-dolt-creds
+                  key: BEADS_DOLT_USER
+                  optional: true
+            - name: BEADS_DOLT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: beads-dolt-creds
+                  key: BEADS_DOLT_PASSWORD
+            resources:
+              requests:
+                cpu: 100m
+                memory: 256Mi
+              limits:
+                cpu: '1'
+                memory: 512Mi
+            volumeMounts:
+            - name: work
+              mountPath: /work
+            - name: script
+              mountPath: /script
+              readOnly: true

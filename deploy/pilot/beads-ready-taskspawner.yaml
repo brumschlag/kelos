@@ -1,0 +1,208 @@
+# Live-captured from kelos-pilot. Spawns one Task per ready bead labelled
+# kelos-auto. See deploy/pilot/beads-reaper.yaml for the stale-claim reaper.
+apiVersion: kelos.dev/v1alpha2
+kind: TaskSpawner
+metadata:
+  annotations:
+    purpose: 'Spawns one Task per ready bead carrying the kelos-auto label. Opt-in by design: label a
+      bead kelos-auto and push, and the next cycle picks it up. ttlSecondsAfterFinished is deliberately
+      unset - dedup is against live Task objects, so a GC''d Task would let a still-ready bead respawn
+      forever (beadseed-ugu). Nothing writes back to the tracker yet (beadseed-xyf), so a finished bead
+      must be closed by hand.'
+  finalizers:
+  - kelos.dev/taskspawner-finalizer
+  name: beads-ready
+  namespace: kelos-pilot
+spec:
+  maxConcurrency: 1
+  maxTotalTasks: 3
+  suspend: false
+  taskTemplate:
+    agentConfigRefs:
+    - name: inpulse-knowledge
+    branch: bead-{{.ID}}
+    credentials:
+      type: none
+    model: claude-sonnet-46
+    nameTemplate: issue-{{.Number}}
+    podOverrides:
+      activeDeadlineSeconds: 5400
+      env:
+      - name: ANTHROPIC_BASE_URL
+        value: http://bedrock-gateway.honcho.svc.cluster.local
+      - name: ANTHROPIC_AUTH_TOKEN
+        valueFrom:
+          secretKeyRef:
+            key: gateway-api-key
+            name: honcho-gateway-key
+      - name: DOTNET_ROOT
+        value: /shared/dotnet
+      - name: DOTNET_CLI_TELEMETRY_OPTOUT
+        value: '1'
+      - name: LD_LIBRARY_PATH
+        value: /shared/icu
+      - name: PATH
+        value: /shared/dotnet:/home/claude/.local/bin:/home/claude/go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      - name: CODEARTIFACT_AUTH_TOKEN
+        valueFrom:
+          secretKeyRef:
+            key: CODEARTIFACT_AUTH_TOKEN
+            name: codeartifact-token
+            optional: true
+      - name: GITHUB_TOKEN
+        valueFrom:
+          secretKeyRef:
+            key: GITHUB_TOKEN
+            name: github-token-agent-write
+      extraInitContainers:
+      - args:
+        - "set -eu\n\n# The bead id is not available as a template variable here: Kelos assigns\n# taskTemplate.podOverrides\
+          \ verbatim (no rendering), so {{.ID}} cannot reach an\n# initContainer. It is recovered instead\
+          \ from the Job name, which IS the Task\n# name, which the spawner forms as \"<spawner>-<bead\
+          \ id>\". The Job controller\n# labels every pod it creates with job-name, so the Downward API\
+          \ can read it.\ncase \"$TASK_NAME\" in\n  \"$SPAWNER_PREFIX\"*) BEAD_ID=\"${TASK_NAME#\"$SPAWNER_PREFIX\"\
+          }\" ;;\n  *) echo \"task name '$TASK_NAME' does not start with '$SPAWNER_PREFIX' - refusing\
+          \ to guess a bead id\" >&2; exit 1 ;;\nesac\n\n# `bd update` with NO id updates \"the last touched\
+          \ issue\", so an empty or\n# unexpected value would silently claim an unrelated bead.\ncase\
+          \ \"$BEAD_ID\" in\n  '' ) echo \"refusing: empty bead id\" >&2; exit 1 ;;\n  *[!a-z0-9-]* )\
+          \ echo \"refusing: '$BEAD_ID' is not a well-formed bead id\" >&2; exit 1 ;;\nesac\n\nmkdir -p\
+          \ \"$HOME/.dolt\" /claim/repo\ncd /claim/repo\nbd init --non-interactive --database beads --prefix\
+          \ beadseed --remote \"$BEADS_REMOTE\" >/dev/null\n\n# --claim is atomic and sets status=in_progress,\
+          \ which bd ready EXCLUDES. That\n# is what stops this bead being rediscovered and respawned\
+          \ once this Task is\n# garbage-collected. It is idempotent when this actor already holds it,\
+          \ so a pod\n# retry is safe; if another actor holds it, this fails and the Task does not run,\n\
+          # which is the intended outcome rather than double-working the bead.\nbd update \"$BEAD_ID\"\
+          \ --claim\nbd dolt push\necho \"claimed $BEAD_ID\"\n"
+        command:
+        - /bin/sh
+        - -c
+        env:
+        - name: TASK_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['job-name']
+        - name: SPAWNER_PREFIX
+          value: beads-ready-
+        - name: BEADS_REMOTE
+          value: https://beads-int.ai.tellihealth.com:50051/beads
+        - name: HOME
+          value: /claim
+        - name: BD_NON_INTERACTIVE
+          value: '1'
+        - name: BEADS_ACTOR
+          value: kelos:beads-ready
+        - name: BEADS_DOLT_USER
+          valueFrom:
+            secretKeyRef:
+              key: BEADS_DOLT_USER
+              name: beads-dolt-creds
+              optional: true
+        - name: BEADS_DOLT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: BEADS_DOLT_PASSWORD
+              name: beads-dolt-creds
+        image: 565715328522.dkr.ecr.us-east-1.amazonaws.com/kelos-spawner-beads:230da7e-amd64
+        name: claim-bead
+        volumeMounts:
+        - mountPath: /claim
+          name: beads-claim
+      - args:
+        - 'set -euo pipefail
+
+          cp -a /usr/share/dotnet /shared/dotnet
+
+          mkdir -p /shared/icu
+
+          cp -a /usr/lib/x86_64-linux-gnu/libicu*.so* /shared/icu/
+
+          chmod -R a+rX /shared/dotnet /shared/icu
+
+          echo "injected dotnet $(/shared/dotnet/dotnet --version), $(ls /shared/icu | wc -l) icu files"
+
+          '
+        command:
+        - bash
+        - -c
+        image: mcr.microsoft.com/dotnet/sdk:10.0
+        imagePullPolicy: IfNotPresent
+        name: inject-dotnet
+        resources:
+          limits:
+            cpu: '2'
+            memory: 2Gi
+          requests:
+            cpu: 200m
+            memory: 256Mi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /shared
+          name: shared
+      nodeSelector:
+        kubernetes.io/arch: amd64
+        workload: agents
+      resources:
+        limits:
+          cpu: '2'
+          memory: 10Gi
+        requests:
+          cpu: 500m
+          memory: 3Gi
+      tolerations:
+      - effect: NoSchedule
+        key: workload
+        operator: Equal
+        value: agents
+      volumeMounts:
+      - mountPath: /shared
+        name: shared
+      volumes:
+      - emptyDir: {}
+        name: shared
+      - emptyDir: {}
+        name: beads-claim
+    promptTemplate: 'You are working a single tracked issue from the beads tracker.
+
+
+      Bead:  {{.ID}}
+
+      Type:  {{.Kind}}
+
+      Title: {{.Title}}
+
+
+      Description:
+
+      {{.Body}}
+
+
+      Notes:
+
+      {{.Comments}}
+
+
+      Investigate, make the smallest correct change, run the tests, and open a PR
+
+      against develop. Reference bead {{.ID}} in the PR description.
+
+
+      Nothing updates the tracker automatically: this bead stays open until a
+
+      human closes it. Do not assume any other agent has claimed it.
+
+      '
+    type: claude-code
+    workspaceRef:
+      name: inpulse-write
+  when:
+    beads:
+      database: beads
+      labels:
+      - kelos-auto
+      limit: 1
+      pollInterval: 1m
+      prefix: beadseed
+      remote: https://beads-int.ai.tellihealth.com:50051/beads
+      secretRef:
+        name: beads-dolt-creds
