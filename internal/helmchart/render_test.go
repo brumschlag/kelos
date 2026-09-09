@@ -196,6 +196,29 @@ func TestRender_TaggedManagedImageOverride(t *testing.T) {
 	}
 }
 
+// controllerImageTag exists so a fork can ship its own controller build while
+// image.tag stays on the upstream release that supplies every other image's tag.
+// Every workload running the controller binary must honor it: a consumer that
+// falls back to image.tag pulls a fork-registry image at a tag the fork never
+// pushed, which fails only at runtime as ImagePullBackOff.
+func TestRender_ControllerImageTagAppliesToEveryControllerWorkload(t *testing.T) {
+	const forkImage = "example.com/fork/kelos-controller"
+	data, err := Render(manifests.ChartFS, map[string]interface{}{
+		"controllerImage":    forkImage,
+		"controllerImageTag": "v1.2.3-fork",
+		"image":              map[string]interface{}{"tag": "v1.2.3"},
+	})
+	if err != nil {
+		t.Fatalf("rendering chart: %v", err)
+	}
+	if strings.Contains(string(data), forkImage+":v1.2.3\n") {
+		t.Errorf("a workload rendered %s:v1.2.3, but controllerImageTag requested v1.2.3-fork", forkImage)
+	}
+	if !strings.Contains(string(data), forkImage+":v1.2.3-fork") {
+		t.Errorf("expected %s:v1.2.3-fork in the rendered output", forkImage)
+	}
+}
+
 func TestRender_PullPolicy(t *testing.T) {
 	vals := map[string]interface{}{
 		"image": map[string]interface{}{

@@ -25,7 +25,7 @@ spec:
           restartPolicy: OnFailure
           containers:
             - name: telemetry
-              image: {{ .Values.controllerImage }}{{- if .Values.image.tag }}:{{ .Values.image.tag }}{{- end }}
+              image: {{ .Values.controllerImage }}{{- if or .Values.controllerImageTag .Values.image.tag }}:{{ .Values.controllerImageTag | default .Values.image.tag }}{{- end }}
               {{- if .Values.image.pullPolicy }}
               imagePullPolicy: {{ .Values.image.pullPolicy }}
               {{- end }}
