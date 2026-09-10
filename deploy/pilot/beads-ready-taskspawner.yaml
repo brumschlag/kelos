@@ -1,5 +1,14 @@
 # Live-captured from kelos-pilot. Spawns one Task per ready bead labelled
 # kelos-auto. See deploy/pilot/beads-reaper.yaml for the stale-claim reaper.
+#
+# Two things here are load-bearing and easy to reintroduce by copying another
+# spawner's taskTemplate:
+#   - NO nameTemplate. The default Task name is <spawner>-<bead id>, which is
+#     both the dedup key and how the claim-bead initContainer recovers the bead
+#     id. A GitHub-style nameTemplate such as issue-{{.Number}} renders to
+#     issue-0 for every bead, collapsing all beads onto one Task name.
+#   - NO ttlSecondsAfterFinished. Dedup is against live Task objects, so a
+#     GC'd Task lets a still-ready bead respawn.
 apiVersion: kelos.dev/v1alpha2
 kind: TaskSpawner
 metadata:
@@ -24,7 +33,6 @@ spec:
     credentials:
       type: none
     model: claude-sonnet-46
-    nameTemplate: issue-{{.Number}}
     podOverrides:
       activeDeadlineSeconds: 5400
       env:
@@ -162,36 +170,17 @@ spec:
         name: shared
       - emptyDir: {}
         name: beads-claim
-    promptTemplate: 'You are working a single tracked issue from the beads tracker.
-
-
-      Bead:  {{.ID}}
-
-      Type:  {{.Kind}}
-
-      Title: {{.Title}}
-
-
-      Description:
-
-      {{.Body}}
-
-
-      Notes:
-
-      {{.Comments}}
-
-
-      Investigate, make the smallest correct change, run the tests, and open a PR
-
-      against develop. Reference bead {{.ID}} in the PR description.
-
-
-      Nothing updates the tracker automatically: this bead stays open until a
-
-      human closes it. Do not assume any other agent has claimed it.
-
-      '
+    promptTemplate: "You are working a single tracked issue from the beads tracker.\n\nBead:  {{.ID}}\n\
+      Type:  {{.Kind}}\nTitle: {{.Title}}\n\nDescription:\n{{.Body}}\n\nNotes:\n{{.Comments}}\n\nInvestigate,\
+      \ make the smallest correct change, and run the tests.\n\nYOU ARE RUNNING HEADLESS. There is no\
+      \ human in this session to answer a\nquestion, so never ask for approval and never wait for confirmation:\
+      \ anything\nyou ask is read by nobody and the task simply ends with your work unshipped.\nIn particular\
+      \ do NOT use the commit skill, which is built around an approval\ngate. Stage the specific files\
+      \ you changed, commit, push the branch, and open a\nPR yourself with gh pr create.\n\nPut this line\
+      \ in the PR description so the tracker is updated when it merges:\n    Closes-bead: {{.ID}}\nIf\
+      \ your change does not fully resolve the bead, write Refs-bead: {{.ID}}\ninstead, which records\
+      \ the link without closing it.\n\nNothing updates the tracker automatically until that PR merges,\
+      \ and no other\nagent has claimed this bead - it is claimed for you already.\n"
     type: claude-code
     workspaceRef:
       name: inpulse-write
