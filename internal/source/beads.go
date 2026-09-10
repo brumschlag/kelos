@@ -37,6 +37,9 @@ type BeadsSource struct {
 	Database string
 
 	// Prefix scopes discovery to one project's bead IDs within a shared hub.
+	// It is applied here rather than by the CLI: `bd ready` has no prefix
+	// filter, so a clone initialized with one still reports every project's
+	// ready beads.
 	Prefix string
 
 	// Labels restricts discovery to issues carrying ALL of these labels.
@@ -101,6 +104,12 @@ func (s *BeadsSource) Discover(ctx context.Context) ([]WorkItem, error) {
 	if s.WorkDir == "" {
 		return nil, fmt.Errorf("beads source requires a writable workDir")
 	}
+	// An empty prefix would widen discovery to every project sharing the hub
+	// rather than narrow it to one, so it is a configuration error here even
+	// though the CLI would accept it.
+	if s.Prefix == "" {
+		return nil, fmt.Errorf("beads source requires a prefix to scope discovery")
+	}
 
 	if err := s.sync(ctx); err != nil {
 		return nil, err
@@ -135,8 +144,20 @@ func (s *BeadsSource) Discover(ctx context.Context) ([]WorkItem, error) {
 	// TriggerTime is deliberately left unset. The only candidate signal is the
 	// bead's updated_at, and using it would retrigger a finished Task every
 	// time an agent wrote back to the bead it had just completed.
+	//
+	// One Dolt database commonly serves several projects, and `bd ready` cannot
+	// filter by ID prefix, so the prefix scoping is applied to its output. The
+	// label filters are not a substitute: they are optional, and a spawner that
+	// omitted them would otherwise discover every project's ready beads.
+	//
+	// Bead IDs are "<prefix>-<suffix>", and the separator is part of the match so
+	// prefix "pain" does not also accept a "painful-" project.
+	wantPrefix := s.Prefix + "-"
 	items := make([]WorkItem, 0, len(issues))
 	for _, issue := range issues {
+		if !strings.HasPrefix(issue.ID, wantPrefix) {
+			continue
+		}
 		items = append(items, WorkItem{
 			ID:    issue.ID,
 			Title: issue.Title,

@@ -907,6 +907,11 @@ excludes beads that are in progress, blocked, deferred, hooked, or ephemeral.
 Beads are returned in the CLI's priority order and spawned in that order, so
 `spec.taskTemplate.priorityLabels` is unnecessary here.
 
+Discovery is scoped to `spec.when.beads.prefix`. One Dolt database commonly
+serves several projects, so only beads whose ID carries that prefix are
+considered — a spawner cannot pick up a neighbouring project's work even if no
+label filters are set.
+
 Discovery is read-only — it never claims, labels, or closes a bead, and never
 pushes to the shared hub. Nothing writes back to a bead when its Task finishes,
 so a bead stays ready and would be rediscovered were it not for Task-name

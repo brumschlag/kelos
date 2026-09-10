@@ -33,6 +33,36 @@ const readyJSON = `[
   }
 ]`
 
+// readyMixedJSON mirrors a shared hub: one Dolt database serving several
+// projects, which is what the live hub does. `bd ready` reports all of them
+// because it has no prefix filter.
+const readyMixedJSON = `[
+  {
+    "id": "pain-16c090ee",
+    "title": "Fix tenant database creation failures",
+    "issue_type": "task",
+    "labels": ["triaged"]
+  },
+  {
+    "id": "beadseed-ugu",
+    "title": "Another project's ready bead",
+    "issue_type": "task",
+    "labels": ["triaged"]
+  },
+  {
+    "id": "painful-abc",
+    "title": "A project whose prefix merely starts with ours",
+    "issue_type": "task",
+    "labels": ["triaged"]
+  },
+  {
+    "id": "pain-4ce0eac9",
+    "title": "Fix locationId validation error",
+    "issue_type": "bug",
+    "labels": ["triaged"]
+  }
+]`
+
 // fakeCLI records every invocation and replays canned output keyed by
 // subcommand, so tests can assert the exact argument vectors the source builds.
 type fakeCLI struct {
@@ -210,6 +240,76 @@ func TestBeadsDiscoverRequiresPassword(t *testing.T) {
 	}
 	if len(cli.calls) != 0 {
 		t.Errorf("expected no CLI calls, got %v", cli.calls)
+	}
+}
+
+// TestBeadsDiscoverScopesToPrefix covers what the prefix field is documented to
+// do. `bd ready` accepts no prefix filter, so a clone initialized with one still
+// reports every project sharing the database — the live hub serves 363 "pain-",
+// 65 "beadseed-" and 13 "brian-" beads out of one. Without this filter the only
+// thing scoping a spawner is its optional label list.
+func TestBeadsDiscoverScopesToPrefix(t *testing.T) {
+	cli := &fakeCLI{output: map[string]string{"ready": readyMixedJSON}}
+	s := newBeadsSource(t, cli, true)
+
+	items, err := s.Discover(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var got []string
+	for _, item := range items {
+		got = append(got, item.ID)
+	}
+	want := []string{"pain-16c090ee", "pain-4ce0eac9"}
+	if len(got) != len(want) {
+		t.Fatalf("IDs = %v, want only the %q-prefixed beads %v", got, s.Prefix, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("IDs = %v, want %v (CLI order preserved)", got, want)
+			break
+		}
+	}
+}
+
+// TestBeadsDiscoverPrefixRequiresSeparator pins the separator to the match. A
+// bare strings.HasPrefix on "pain" would also accept a "painful-" project, which
+// is a different tracker in the same database.
+func TestBeadsDiscoverPrefixRequiresSeparator(t *testing.T) {
+	cli := &fakeCLI{output: map[string]string{"ready": readyMixedJSON}}
+	s := newBeadsSource(t, cli, true)
+
+	items, err := s.Discover(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	for _, item := range items {
+		if item.ID == "painful-abc" {
+			t.Errorf("ID %q was accepted for prefix %q; the %q separator must be part of the match",
+				item.ID, s.Prefix, "-")
+		}
+	}
+}
+
+// TestBeadsDiscoverRequiresPrefix guards the fail-fast: an empty prefix widens
+// discovery to every project in the hub instead of narrowing it, so it must be
+// rejected rather than treated as "no filter".
+func TestBeadsDiscoverRequiresPrefix(t *testing.T) {
+	cli := &fakeCLI{output: map[string]string{"ready": readyMixedJSON}}
+	s := newBeadsSource(t, cli, true)
+	s.Prefix = ""
+
+	_, err := s.Discover(context.Background())
+	if err == nil {
+		t.Fatal("expected an error when Prefix is empty")
+	}
+	if !strings.Contains(err.Error(), "prefix") {
+		t.Errorf("error = %v, want it to name the prefix", err)
+	}
+	if len(cli.calls) != 0 {
+		t.Errorf("expected no CLI calls before the config check, got %v", cli.calls)
 	}
 }
 
