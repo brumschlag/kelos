@@ -4,3 +4,9 @@ exclude:
   - internal/manifests/install-crd.yaml
   - internal/manifests/charts/kelos/templates/
   - internal/manifests/charts/kelos/charts/kelos-crds/templates/
+  # Live-captured from the cluster, so its initContainer scripts are multi-line
+  # double-quoted scalars rather than block literals. retain_line_breaks above
+  # substitutes a "#magic___^_^___line" sentinel for the newlines in those
+  # scalars, which corrupts the scripts instead of reformatting them. Verified
+  # by comparing the parsed values before and after.
+  - deploy/pilot/beads-ready-taskspawner.yaml
