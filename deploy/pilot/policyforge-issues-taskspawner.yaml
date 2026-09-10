@@ -1,0 +1,220 @@
+# Spawns one Task per PolicyForge GitHub issue labelled kelos-auto.
+#
+# Modelled on the inpulse-issues spawner in this directory. Three deliberate
+# differences from it, each of which cost something to learn elsewhere:
+#
+#   - BOUNDED. maxConcurrency 1 and a finite maxTotalTasks, where inpulse-issues
+#     runs 5-wide and unlimited. Agents have never worked in this repo, so a
+#     mislabelled backlog should not be able to fan out before anyone looks at
+#     the first result.
+#   - NO ttlSecondsAfterFinished. Kelos deduplicates against LIVE Task objects,
+#     so once a finished Task is garbage-collected a still-open, still-labelled
+#     issue is discovered again and respawned. inpulse-issues accepts that at a
+#     2-day TTL; here the Tasks are kept instead, which costs clutter rather
+#     than a surprise second agent run.
+#   - HEADLESS PROMPT. The first agent Task in this pilot reported Succeeded
+#     having shipped nothing, because it used a commit workflow whose approval
+#     gate nothing can satisfy with no human attached. The prompt below forbids
+#     that explicitly. Do not soften it.
+#
+# nameTemplate IS safe here, unlike on the beads spawner: `.Number` is populated
+# for a githubIssues source, so issue-{{.Number}} renders a distinct name per
+# issue. On the beads source the same template rendered issue-0 for every bead
+# and collapsed them onto one Task name.
+#
+# The repo declares a submodule (integration/inpulse → policyforge-inpulse) and
+# Kelos does not clone submodules. That is fine today because PolicyForge.sln
+# does not reference anything under integration/ — if that changes, use the
+# Workspace's setupCommand to run `git submodule update --init`.
+apiVersion: kelos.dev/v1alpha2
+kind: Workspace
+metadata:
+  name: policyforge-write
+  namespace: kelos-pilot
+spec:
+  repo: https://github.com/accuhealthevelyn/policyforge.git
+  ref: main
+  # Same agent-write credential inpulse-write uses. The token reaches this repo
+  # already; nothing repo-specific had to be provisioned.
+  secretRef:
+    name: github-token-agent-write
+---
+apiVersion: kelos.dev/v1alpha2
+kind: TaskSpawner
+metadata:
+  name: policyforge-issues
+  namespace: kelos-pilot
+  annotations:
+    purpose: >-
+      Spawns one Task per PolicyForge issue carrying the kelos-auto label. Opt-in by design: the label does not exist on any issue yet, so this spawner idles until a human labels one. Bounded to one concurrent Task and a finite total because agents have not worked in this repo before.
+spec:
+  suspend: false
+  maxConcurrency: 1
+  maxTotalTasks: 25
+  when:
+    githubIssues:
+      repo: accuhealthevelyn/policyforge
+      state: open
+      types:
+        - issues
+      # The ONLY thing that enlists an issue. Nothing is discovered until a human
+      # adds this label, which is what makes turning the spawner on safe.
+      labels:
+        - kelos-auto
+      excludeLabels:
+        - blocked
+        - do-not-merge
+        - wontfix
+      priorityLabels:
+        - P0
+        - P1
+      pollInterval: 2m
+      # A trigger comment is only honoured from someone with write access, so a
+      # drive-by comment cannot start an agent run.
+      commentPolicy:
+        minimumPermission: write
+        triggerComment: /kelos go
+      reporting:
+        enabled: true
+  taskTemplate:
+    type: claude-code
+    model: claude-sonnet-46
+    nameTemplate: issue-{{.Number}}
+    credentials:
+      type: none
+    workspaceRef:
+      name: policyforge-write
+    promptTemplate: |
+      You are working autonomously on the PolicyForge repository
+      (accuhealthevelyn/policyforge). There is NO human attached to this session.
+
+      GitHub issue #{{.Number}}: {{.Title}}
+
+      {{.Body}}
+
+      {{if .Comments}}Existing discussion:
+      {{.Comments}}
+      {{end}}
+
+      ## What PolicyForge is
+
+      A C# IAM / policy and billing engine that InPulse consumes as a published
+      package. That consumer relationship matters: a defect here is usually
+      better fixed at the source than worked around in InPulse, because the
+      version pin in a consumer is a floor the implementation depends on, not a
+      frozen external contract. If the right fix is a library change, make it
+      here rather than describing a consumer-side workaround.
+
+      ## How to work
+
+      1. Read enough of the surrounding code to understand the actual behaviour
+         before editing. Confirm the defect is real and attributed to the right
+         layer — a reported symptom is a hypothesis, not a finding.
+      2. Write a failing test first where the change is testable, then make it
+         pass. If you assert a gate or guard, prove it can fail: break the fix,
+         confirm the expected test goes red, restore it.
+      3. Build and test with the dotnet SDK on PATH (injected at /shared/dotnet):
+         `dotnet build PolicyForge.sln` and `dotnet test`. Some projects may need
+         the private package feed; CODEARTIFACT_AUTH_TOKEN is in the environment
+         when one is available.
+      4. Match the conventions already in the file you are editing — comment
+         density, naming, test style. Read CONTRIBUTING.md and any
+         repo-local agent instructions before making structural choices.
+      5. Keep the change scoped to this issue. Do not refactor beyond it.
+
+      ## Shipping — read this carefully
+
+      You must finish by pushing a branch and opening a pull request. That PR is
+      the handoff to a human; it is the ONLY handoff available to you.
+
+      - NEVER ask for confirmation, approval, or review before committing or
+        pushing. Nothing can answer you, and a run that ends on a question is
+        recorded as a success having shipped nothing.
+      - Do NOT invoke any commit workflow, skill, or slash command that presents
+         a plan and waits for approval. Stage the specific files you changed and
+         commit directly.
+      - Reference the issue in the PR body so it is traceable. Describe what you
+        verified and, honestly, what you did not.
+      - If you conclude no change should be made, say so in a comment on the
+        issue with your reasoning, and open no PR.
+      - If you cannot finish, push what you have to a branch and open a DRAFT PR
+        stating exactly where you stopped and why. Leaving nothing behind is the
+        worst outcome.
+    podOverrides:
+      activeDeadlineSeconds: 5400
+      resources:
+        requests:
+          cpu: 500m
+          memory: 4Gi
+        limits:
+          cpu: "2"
+          memory: 16Gi
+      nodeSelector:
+        kubernetes.io/arch: amd64
+        workload: agents
+      tolerations:
+        - key: workload
+          operator: Equal
+          value: agents
+          effect: NoSchedule
+      env:
+        - name: ANTHROPIC_BASE_URL
+          value: http://bedrock-gateway.honcho.svc.cluster.local
+        - name: ANTHROPIC_AUTH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: honcho-gateway-key
+              key: gateway-api-key
+        - name: DOTNET_ROOT
+          value: /shared/dotnet
+        - name: DOTNET_CLI_TELEMETRY_OPTOUT
+          value: "1"
+        # The dotnet SDK image carries its own ICU; the agent image does not, so
+        # both are copied out of the init container and ICU has to be findable or
+        # every culture-sensitive call throws.
+        - name: LD_LIBRARY_PATH
+          value: /shared/icu
+        - name: PATH
+          value: /shared/dotnet:/home/claude/.local/bin:/home/claude/go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        - name: CODEARTIFACT_AUTH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: codeartifact-token
+              key: CODEARTIFACT_AUTH_TOKEN
+              optional: true
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: github-token-agent-write
+              key: GITHUB_TOKEN
+      volumes:
+        - name: shared
+          emptyDir: {}
+      volumeMounts:
+        - name: shared
+          mountPath: /shared
+      extraInitContainers:
+        - name: inject-dotnet
+          image: mcr.microsoft.com/dotnet/sdk:10.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - bash
+            - -c
+          args:
+            - |
+              set -euo pipefail
+              cp -a /usr/share/dotnet /shared/dotnet
+              mkdir -p /shared/icu
+              cp -a /usr/lib/x86_64-linux-gnu/libicu*.so* /shared/icu/
+              chmod -R a+rX /shared/dotnet /shared/icu
+              echo "injected dotnet $(/shared/dotnet/dotnet --version), $(ls /shared/icu | wc -l) icu files"
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
