@@ -777,8 +777,11 @@ to receive refreshed credentials during long-running work.
 > burns an agent run every TTL period with no ceiling.
 >
 > Both are applied by the reporter, so `reporting` must be enabled; and like every
-> reporting annotation they are stamped at Task **creation** time, so enabling
-> them does not cover Tasks already in flight.
+> reporting annotation they are stamped at Task **creation** time, so enabling them
+> covers **no** Task already in flight. Expect a one-cycle tail: in-flight Tasks
+> finish with their trigger label still on and are rediscovered one final time. The
+> Task spawned after them carries the policy and is the last.
+
 | `spec.when.githubPullRequests.repo` | Override repository to poll for PRs (in `owner/repo` format or full URL); defaults to workspace repo URL | No |
 | `spec.when.githubPullRequests.labels` | Filter pull requests by labels | No |
 | `spec.when.githubPullRequests.excludeLabels` | Exclude pull requests with these labels | No |

@@ -663,9 +663,10 @@ func sourceAnnotations(ts *kelos.TaskSpawner, item source.WorkItem) map[string]s
 // AnnotationGitHubCheckName already uses.
 //
 // Consequence worth knowing before enabling it: like every annotation here, this
-// is written at Task CREATION time, so turning the policy on does not cover
-// Tasks already in flight. Those keep their trigger label one last time unless
-// the annotation is added to them by hand.
+// is written at Task CREATION time, so turning the policy on covers NO Task
+// already in flight. Those keep their trigger label and re-arm the loop one final
+// time; the Task spawned after them carries the annotation and is the last one.
+// Plan for that one-cycle tail rather than hand-patching live objects.
 func stampIssueLabelPolicy(ts *kelos.TaskSpawner, annotations map[string]string) {
 	issues := ts.Spec.When.GitHubIssues
 	if issues == nil {

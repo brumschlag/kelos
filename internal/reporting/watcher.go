@@ -103,9 +103,10 @@ const (
 	// labels to remove from the originating issue when the Task succeeds.
 	//
 	// Like AnnotationGitHubReporting, this is stamped at Task CREATION time, so
-	// enabling it on a TaskSpawner does not cover Tasks that are already in
-	// flight — those need the annotation added by hand, or they leave the label
-	// in place one last time.
+	// enabling it on a TaskSpawner covers NO Task that is already in flight.
+	// Expect a one-cycle tail: in-flight Tasks finish with their label still on
+	// and re-arm the loop one final time. That is the intended rollout shape —
+	// the next spawn carries the annotation and is the last one.
 	AnnotationGitHubRemoveLabelsOnSuccess = "kelos.dev/github-remove-labels-on-success"
 
 	// AnnotationGitHubFailureMaxAttempts records the retry ceiling for a failing
