@@ -65,6 +65,26 @@ spec:
         - blocked
         - do-not-merge
         - wontfix
+        # Second, independent control on the retry ceiling below. The
+        # onFailure.removeLabels entry is the load-bearing one.
+        - kelos-blocked
+      # Take the trigger label off when the work LANDS, so the label is one-shot.
+      # Without this, kelos-auto is permanent while the only respawn guard - the
+      # Task object named issue-<N> - is deleted by ttlSecondsAfterFinished, so
+      # every completed issue re-runs on that period for ever. This bit the
+      # inpulse spawner for 338 runs / $1,527.40; see
+      # deploy/pilot/taskspawner-inpulse-issues.yaml for the measured detail.
+      onSuccess:
+        removeLabels:
+          - kelos-auto
+      # The label is kept on FAILURE so the issue is retried, which is only safe
+      # with a ceiling. Mirrors deploy/pilot/beads-reaper.py's MAX_ATTEMPTS=3.
+      onFailure:
+        maxAttempts: 3
+        attemptLabelPrefix: kelos-attempt-
+        blockedLabel: kelos-blocked
+        removeLabels:
+          - kelos-auto
       priorityLabels:
         - P0
         - P1

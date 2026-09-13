@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"strconv"
 	"strings"
 )
@@ -216,6 +217,122 @@ func (r *GitHubReporter) UpdateComment(ctx context.Context, commentID int64, bod
 	}
 
 	return nil
+}
+
+type labelResponse struct {
+	Name string `json:"name"`
+}
+
+type addLabelsRequest struct {
+	Labels []string `json:"labels"`
+}
+
+// RemoveLabel removes a label from a GitHub issue or pull request.
+//
+// A 404 is reported as success. GitHub answers 404 when the label is not on the
+// issue, which is the desired end state, so the call is idempotent and safe to
+// repeat — and repeating is normal here, because the reporter can re-run for the
+// same phase after a controller restart or a failed annotation persist. Any
+// other non-2xx status IS returned as an error: folding a 403 into success would
+// hide a missing Issues:write scope, i.e. hide exactly the leak this method
+// exists to close.
+func (r *GitHubReporter) RemoveLabel(ctx context.Context, number int, label string) error {
+	url := fmt.Sprintf("%s/repos/%s/%s/issues/%d/labels/%s",
+		r.baseURL(), r.Owner, r.Repo, number, neturl.PathEscape(label))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
+	if err != nil {
+		return fmt.Errorf("creating request: %w", err)
+	}
+	r.setHeaders(req)
+
+	resp, err := r.httpClient().Do(req)
+	if err != nil {
+		return fmt.Errorf("removing label %q from #%d: %w", label, number, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("GitHub API returned status %d removing label %q from #%d: %s",
+			resp.StatusCode, label, number, string(errBody))
+	}
+
+	return nil
+}
+
+// AddLabels adds labels to a GitHub issue or pull request. Adding a label that
+// is already present is a no-op on GitHub's side, so this is idempotent too.
+// An empty list spends no API call.
+func (r *GitHubReporter) AddLabels(ctx context.Context, number int, labels []string) error {
+	if len(labels) == 0 {
+		return nil
+	}
+
+	url := fmt.Sprintf("%s/repos/%s/%s/issues/%d/labels", r.baseURL(), r.Owner, r.Repo, number)
+
+	payload, err := json.Marshal(addLabelsRequest{Labels: labels})
+	if err != nil {
+		return fmt.Errorf("marshalling labels: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("creating request: %w", err)
+	}
+	r.setHeaders(req)
+
+	resp, err := r.httpClient().Do(req)
+	if err != nil {
+		return fmt.Errorf("adding labels %v to #%d: %w", labels, number, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("GitHub API returned status %d adding labels %v to #%d: %s",
+			resp.StatusCode, labels, number, string(errBody))
+	}
+
+	return nil
+}
+
+// ListLabels returns the names of the labels currently on a GitHub issue or
+// pull request.
+func (r *GitHubReporter) ListLabels(ctx context.Context, number int) ([]string, error) {
+	url := fmt.Sprintf("%s/repos/%s/%s/issues/%d/labels?per_page=100", r.baseURL(), r.Owner, r.Repo, number)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
+	r.setHeaders(req)
+
+	resp, err := r.httpClient().Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("listing labels on #%d: %w", number, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("GitHub API returned status %d listing labels on #%d: %s",
+			resp.StatusCode, number, string(errBody))
+	}
+
+	var payload []labelResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, fmt.Errorf("decoding labels response: %w", err)
+	}
+
+	names := make([]string, 0, len(payload))
+	for _, l := range payload {
+		names = append(names, l.Name)
+	}
+	return names, nil
 }
 
 // resolveToken returns the current GitHub token. When TokenFunc is set it

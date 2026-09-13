@@ -98,6 +98,43 @@ const (
 	// LabelSlackReporting is applied to Tasks created from Slack so that
 	// the reporting and activity loops can list only relevant Tasks.
 	LabelSlackReporting = "kelos.dev/slack-reporting"
+
+	// AnnotationGitHubRemoveLabelsOnSuccess records the comma-separated GitHub
+	// labels to remove from the originating issue when the Task succeeds.
+	//
+	// Like AnnotationGitHubReporting, this is stamped at Task CREATION time, so
+	// enabling it on a TaskSpawner does not cover Tasks that are already in
+	// flight — those need the annotation added by hand, or they leave the label
+	// in place one last time.
+	AnnotationGitHubRemoveLabelsOnSuccess = "kelos.dev/github-remove-labels-on-success"
+
+	// AnnotationGitHubFailureMaxAttempts records the retry ceiling for a failing
+	// issue. Its presence is what enables the failure policy at all.
+	AnnotationGitHubFailureMaxAttempts = "kelos.dev/github-failure-max-attempts"
+
+	// AnnotationGitHubFailureAttemptLabelPrefix records the prefix for the
+	// per-failure attempt label.
+	AnnotationGitHubFailureAttemptLabelPrefix = "kelos.dev/github-failure-attempt-prefix"
+
+	// AnnotationGitHubFailureBlockedLabel records the label applied once the
+	// retry ceiling is exhausted.
+	AnnotationGitHubFailureBlockedLabel = "kelos.dev/github-failure-blocked-label"
+
+	// AnnotationGitHubFailureRemoveLabels records the comma-separated GitHub
+	// labels to remove once the retry ceiling is exhausted.
+	AnnotationGitHubFailureRemoveLabels = "kelos.dev/github-failure-remove-labels"
+)
+
+const (
+	// DefaultAttemptLabelPrefix matches the bead reaper's kelos-attempt-<n>
+	// convention so both paths read the same way on an issue.
+	DefaultAttemptLabelPrefix = "kelos-attempt-"
+
+	// DefaultBlockedLabel matches the bead reaper's kelos-blocked convention.
+	DefaultBlockedLabel = "kelos-blocked"
+
+	// DefaultMaxAttempts matches the bead reaper's MAX_ATTEMPTS default.
+	DefaultMaxAttempts = 3
 )
 
 // TaskReporter watches Tasks and reports status changes to GitHub.
@@ -311,6 +348,24 @@ func (tr *TaskReporter) reportViaComment(ctx context.Context, task *kelos.Task) 
 	// reconcile that races the annotation Update still sees the correct comment
 	// ID via the in-memory cache and skips re-creation.
 	tr.Cache.store(task.UID, commentID, desiredPhase)
+
+	// Terminal-phase label hygiene on the originating issue. Placed here — after
+	// the comment write, before the phase is persisted — for three reasons: this
+	// function already holds the issue number and an authenticated writer with
+	// the right scope; the phase guard above makes it fire once per phase
+	// transition; and running it before the persist means a persist failure gives
+	// the label work one more attempt on re-entry (every operation below is
+	// idempotent, so a repeat is harmless).
+	//
+	// Neither call returns an error: work that landed must not be reported as
+	// failed, and the status comment must not be re-posted, because a label could
+	// not be changed. Both log and count instead.
+	switch desiredPhase {
+	case "succeeded":
+		tr.removeLabelsOnSuccess(ctx, task, number)
+	case "failed":
+		tr.applyFailurePolicy(ctx, task, number)
+	}
 
 	return tr.persistReportingState(ctx, task, commentID, desiredPhase)
 }
