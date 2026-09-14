@@ -42,9 +42,69 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  set-pr-e2e-pending:
+  # Decides whether e2e CAN run at all, so that "this repository has no agent
+  # credentials" is reported as a VISIBLE ABSENCE OF COVERAGE rather than as a
+  # permanent red — and, more importantly, not as a silently satisfied gate.
+  #
+  # This has to be its own JOB rather than a condition on test-e2e, because the
+  # `secrets` context is NOT available in `jobs.<id>.if`. It IS available in a
+  # step's `env:`, so the check runs in a step and is published as a job output
+  # for downstream `if:` expressions to read.
+  e2e-preflight:
+    # This condition MUST cover every case test-e2e can run in, and it is easy to
+    # get wrong: test-e2e now has `needs: [e2e-preflight]`, and a job whose
+    # dependency was skipped is itself skipped. A preflight scoped to pull
+    # requests only would therefore have silently killed e2e on pushes to main —
+    # the arm that was already working. Keep the two event sets identical.
     if: >-
-      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || github.event_name == 'merge_group'
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'merge_group' || (
+        github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      )
+    runs-on: ubuntu-latest
+    outputs:
+      has-credentials: ${{ steps.check.outputs.has-credentials }}
+    steps:
+      - name: Check for e2e agent credentials
+        id: check
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+        run: |
+          # Mirrors reusable-e2e.yaml's own "Validate E2E secrets" step, which
+          # requires BOTH and exits 1 on either. Checking only one here would let
+          # a half-configured repository through to that same fatal error, which
+          # is the failure this job exists to convert into an honest skip.
+          if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] && [ -n "$CODEX_AUTH_JSON" ]; then
+            echo "has-credentials=true" >>"$GITHUB_OUTPUT"
+            echo "e2e agent credentials are present; test-e2e will run."
+            exit 0
+          fi
+
+          echo "has-credentials=false" >>"$GITHUB_OUTPUT"
+          # A positive artifact, on purpose. A skipped job is indistinguishable
+          # from a passing one at a glance, so the reason is emitted as a warning
+          # annotation AND into the run summary, where it is readable without
+          # opening a log. "It did not run" must not have to be inferred.
+          msg="test-e2e NOT RUN: this repository has no agent credentials configured (CLAUDE_CODE_OAUTH_TOKEN and CODEX_AUTH_JSON). This is MISSING E2E COVERAGE, not a passing gate — do not read the skipped job as a green one."
+          echo "::warning title=e2e coverage missing::${msg}"
+          {
+            echo "### ⚠️ e2e did not run"
+            echo ""
+            echo "${msg}"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  set-pr-e2e-pending:
+    # Gated on the preflight so that when e2e cannot run, the pr-e2e commit
+    # status is never CREATED. That matters: report-pr-e2e-status deliberately
+    # leaves pr-e2e untouched when test-e2e is skipped, so creating a pending
+    # status here would strand it on "pending" for ever. An absent status is the
+    # honest signal for absent coverage — it is neither a red nor a green.
+    needs: [e2e-preflight]
+    if: >-
+      needs.e2e-preflight.outputs.has-credentials == 'true' && (
+        (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || github.event_name == 'merge_group'
+      )
     runs-on: ubuntu-latest
     permissions:
       statuses: write
@@ -137,10 +197,19 @@ jobs:
     # removes failed the other way - nothing ran at all and it looked green.
     # build/verify/test/test-integration now run on every branch; only this
     # cluster-backed job stays pinned.
+    #
+    # The has-credentials arm turns "no agent secrets on this repository" into a
+    # skip with a stated reason instead of a fatal red on every single PR. A
+    # permanently-red check is how people learn to ignore checks; a permanently
+    # GREEN one would be worse, which is why the skip is paired with the warning
+    # annotation in e2e-preflight and with not creating the pr-e2e status at all.
+    needs: [e2e-preflight]
     if: >-
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'merge_group' || (
-        github.event_name == 'pull_request' &&
-        github.event.pull_request.head.repo.full_name == github.repository
+      needs.e2e-preflight.outputs.has-credentials == 'true' && (
+        (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'merge_group' || (
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        )
       )
     permissions:
       contents: read
