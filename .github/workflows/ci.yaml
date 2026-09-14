@@ -1,15 +1,44 @@
 name: CI
 
 on:
+  # DELIBERATELY UNFILTERED - do not add a `branches:` filter to either trigger.
+  #
+  # Both were `branches: [main]`, and the consequence was that CI never ran on any
+  # branch other than main. Measured on 2026-09-14: the long-lived
+  # `integration/upstream-v0.55.0` branch had 316 commits that were not on main and
+  # ZERO workflow runs of any kind, ever - build, verify, test and test-integration
+  # had never executed against a single one of them. Pull requests to that branch
+  # still rendered a check list (the Label workflow has no branch filter), so it
+  # looked gated while nothing was gating it.
+  #
+  # An enumerated allowlist (`[main, integration/**]`) does not fix that class: it
+  # has to be maintained, it silently omits the next long-lived branch, and the
+  # omission renders as a green check list rather than as an error. A filter that
+  # does not exist cannot go stale. If you need to exclude something, exclude it
+  # explicitly with `branches-ignore:` and say why.
+  #
+  # `tags-ignore` is a different kind of filter and is safe: it excludes ALL tags
+  # unconditionally, so it needs no maintenance and cannot omit a new branch. It is
+  # here because an unfiltered `push:` also fires on tags, and a `v*` tag push
+  # would otherwise run the full matrix a second time alongside release.yaml on a
+  # commit its own branch already tested.
   push:
-    branches: [main]
+    tags-ignore: ['**']
   pull_request:
-    branches: [main]
     types: [opened, synchronize, reopened]
   merge_group:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  # `github.event_name` is load-bearing, not decoration. The group was
+  # `CI-${{ head_ref || ref_name }}`, which for a push resolves to `CI-<branch>`
+  # (head_ref is empty) and for a pull_request ALSO resolves to `CI-<branch>`.
+  # With cancel-in-progress that is the same group, so a push and its own
+  # `synchronize` PR run - which fire together - would cancel each other, at
+  # random, leaving a required check either cancelled or never reported. The old
+  # `branches: [main]` filters masked this by making the collision unreachable (a
+  # PR head is never main); removing them exposes it. Keying on the event name
+  # keeps each trigger's runs cancelling only their own supersedes.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
@@ -92,8 +121,24 @@ jobs:
         run: make test-integration TEST_FLAGS=-race
 
   test-e2e:
+    # The push arm is pinned to main ON PURPOSE, and it is a scope RESTORATION,
+    # not a new restriction. While `on.push` was `branches: [main]`, this
+    # condition's `event_name == 'push'` could only ever mean "a push to main".
+    # Unfiltering the trigger would silently widen it to every push to every
+    # branch - and this job is not cheap or side-effect-free: it calls
+    # reusable-e2e.yaml with `secrets: inherit`, needs a live cluster and agent
+    # credentials, and runs ginkgo with a 30m timeout. On an agent fleet that
+    # pushes many short-lived branches that means constant cluster contention and
+    # secret exposure on every branch.
+    #
+    # Naming a branch here is a deliberate trade against the no-filter rule above:
+    # if this goes stale the cost is "e2e does not run on pushes to some new
+    # long-lived branch", which is visible and bounded, whereas the filter this PR
+    # removes failed the other way - nothing ran at all and it looked green.
+    # build/verify/test/test-integration now run on every branch; only this
+    # cluster-backed job stays pinned.
     if: >-
-      github.event_name == 'push' || github.event_name == 'merge_group' || (
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'merge_group' || (
         github.event_name == 'pull_request' &&
         github.event.pull_request.head.repo.full_name == github.repository
       )
