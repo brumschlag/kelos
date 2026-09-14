@@ -331,7 +331,7 @@ func effectiveTaskType(task *kelos.Task, workerPoolTypes map[types.NamespacedNam
 
 func normalizeAgentType(agentType string) string {
 	switch agentType {
-	case "claude-code", "codex", "gemini", "opencode", "cursor":
+	case "claude-code", "codex", "gemini", "opencode", "cursor", "grok":
 		return agentType
 	default:
 		return "unknown"

@@ -153,6 +153,30 @@ func TestStreamUsage(t *testing.T) {
 			},
 		},
 		{
+			// grok --output-format json emits a single JSON object with a
+			// top-level "usage" map, "text" response, and "total_cost_usd".
+			// Field names verified against bundled grok 1.0.30 docs
+			// (~/.grok/docs/user-guide/14-headless-mode.md).
+			name:      "grok headless json object with usage, text, and cost",
+			agentType: "grok",
+			content: `{"text":"Fixed the bug.","stopReason":"end_turn","sessionId":"abc123","requestId":"xyz789","num_turns":7,"usage":{"input_tokens":7210,"cache_read_input_tokens":41000,"cache_creation_input_tokens":0,"output_tokens":1893,"reasoning_tokens":412,"total_tokens":50103},"total_cost_usd":0.01268905}
+`,
+			want: map[string]string{
+				"cost-usd":      "0.01268905",
+				"input-tokens":  "7210",
+				"output-tokens": "1893",
+				"response":      "Rml4ZWQgdGhlIGJ1Zy4=", // base64("Fixed the bug.")
+			},
+		},
+		{
+			// grok error path: {"type":"error",...} carries no usage, so no
+			// token/cost data is produced (but must not crash).
+			name:      "grok error object returns nil",
+			agentType: "grok",
+			content:   `{"type":"error","message":"Not signed in."}` + "\n",
+			want:      nil,
+		},
+		{
 			name:      "unknown agent type returns nil",
 			agentType: "unknown-agent",
 			content:   `{"type":"result"}` + "\n",

@@ -55,7 +55,11 @@ func ExtractLatestAssistantText(r io.Reader, agentType string) string {
 		return extractGeminiText(r)
 	case "opencode":
 		return extractOpenCodeText(r)
-	case "claude-code", "cursor", "":
+	case "claude-code", "cursor", "grok", "":
+		// NOTE: grok's exact NDJSON progress shape is UNCONFIRMED. It is
+		// routed through the generic assistant-text extractor, which
+		// degrades to an empty string when the shape does not match rather
+		// than crashing. Revisit once a real grok run is captured.
 		return extractClaudeText(r)
 	default:
 		return ""

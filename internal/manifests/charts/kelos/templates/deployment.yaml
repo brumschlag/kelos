@@ -59,6 +59,10 @@ spec:
             {{- if .Values.image.pullPolicy }}
             - --cursor-image-pull-policy={{ .Values.image.pullPolicy }}
             {{- end }}
+            - --grok-image={{ .Values.grokImage }}
+            {{- if .Values.image.pullPolicy }}
+            - --grok-image-pull-policy={{ .Values.image.pullPolicy }}
+            {{- end }}
             - --spawner-image={{ .Values.spawner.image }}
             {{- if .Values.image.pullPolicy }}
             - --spawner-image-pull-policy={{ .Values.image.pullPolicy }}
