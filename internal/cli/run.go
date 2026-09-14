@@ -399,7 +399,7 @@ func newRunCommand(cfg *ClientConfig) *cobra.Command {
 
 	cmd.Flags().StringVarP(&prompt, "prompt", "p", "", "task prompt (required unless --prompt-file or --from is set)")
 	cmd.Flags().StringVar(&promptFile, "prompt-file", "", "read task prompt from a file (use - for stdin)")
-	cmd.Flags().StringVarP(&agentType, "type", "t", "claude-code", "agent type (claude-code, codex, gemini, opencode, cursor)")
+	cmd.Flags().StringVarP(&agentType, "type", "t", "claude-code", "agent type (claude-code, codex, gemini, opencode, cursor, grok)")
 	cmd.Flags().StringVar(&secret, "secret", "", "secret name with credentials (overrides oauthToken/apiKey in config)")
 	cmd.Flags().StringVar(&credentialType, "credential-type", "api-key", "credential type (api-key, oauth, none)")
 	cmd.Flags().StringVar(&model, "model", "", "model override")
@@ -421,7 +421,7 @@ func newRunCommand(cfg *ClientConfig) *cobra.Command {
 	cmd.MarkFlagsMutuallyExclusive("prompt", "prompt-file")
 
 	_ = cmd.RegisterFlagCompletionFunc("credential-type", cobra.FixedCompletions([]string{"api-key", "oauth", "none"}, cobra.ShellCompDirectiveNoFileComp))
-	_ = cmd.RegisterFlagCompletionFunc("type", cobra.FixedCompletions([]string{"claude-code", "codex", "gemini", "opencode", "cursor"}, cobra.ShellCompDirectiveNoFileComp))
+	_ = cmd.RegisterFlagCompletionFunc("type", cobra.FixedCompletions([]string{"claude-code", "codex", "gemini", "opencode", "cursor", "grok"}, cobra.ShellCompDirectiveNoFileComp))
 
 	return cmd
 }
@@ -463,6 +463,8 @@ func apiKeySecretKey(agentType string) string {
 		return "OPENCODE_API_KEY"
 	case "cursor":
 		return "CURSOR_API_KEY"
+	case "grok":
+		return "XAI_API_KEY"
 	default:
 		return "ANTHROPIC_API_KEY"
 	}

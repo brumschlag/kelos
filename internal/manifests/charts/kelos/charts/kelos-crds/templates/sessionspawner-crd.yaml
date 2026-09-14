@@ -7193,6 +7193,7 @@ spec:
                         - gemini
                         - opencode
                         - cursor
+                        - grok
                         - ""
                         type: string
                       workspaceRef:

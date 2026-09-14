@@ -1929,6 +1929,83 @@ func TestBuildCursorJob_DefaultImage(t *testing.T) {
 	}
 }
 
+func TestBuildGrokJob_DefaultImage(t *testing.T) {
+	builder := NewJobBuilder()
+	task := &kelos.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-grok",
+			Namespace: "default",
+		},
+		Spec: kelos.TaskSpec{
+			Type:   AgentTypeGrok,
+			Prompt: "Fix the bug",
+			Credentials: &kelos.Credentials{
+				Type:      kelos.CredentialTypeAPIKey,
+				SecretRef: &kelos.SecretReference{Name: "grok-secret"},
+			},
+			Model: "grok-4.6",
+		},
+	}
+
+	job, err := builder.Build(task, nil, nil, task.Spec.Prompt)
+	if err != nil {
+		t.Fatalf("Build() returned error: %v", err)
+	}
+
+	container := job.Spec.Template.Spec.Containers[0]
+
+	if container.Image != GrokImage {
+		t.Errorf("Expected image %q, got %q", GrokImage, container.Image)
+	}
+
+	if container.Name != kelos.AgentContainerName {
+		t.Errorf("Expected container name %q, got %q", kelos.AgentContainerName, container.Name)
+	}
+
+	if len(container.Command) != 1 || container.Command[0] != "/kelos_entrypoint.sh" {
+		t.Errorf("Expected command [/kelos_entrypoint.sh], got %v", container.Command)
+	}
+
+	foundKelosModel := false
+	foundXAIKey := false
+	for _, env := range container.Env {
+		if env.Name == "KELOS_MODEL" {
+			foundKelosModel = true
+			if env.Value != "grok-4.6" {
+				t.Errorf("KELOS_MODEL value: expected %q, got %q", "grok-4.6", env.Value)
+			}
+		}
+		if env.Name == "XAI_API_KEY" {
+			foundXAIKey = true
+			if env.ValueFrom == nil || env.ValueFrom.SecretKeyRef == nil {
+				t.Error("Expected XAI_API_KEY to reference a secret")
+			} else {
+				if env.ValueFrom.SecretKeyRef.Name != "grok-secret" {
+					t.Errorf("Expected secret name %q, got %q", "grok-secret", env.ValueFrom.SecretKeyRef.Name)
+				}
+				if env.ValueFrom.SecretKeyRef.Key != "XAI_API_KEY" {
+					t.Errorf("Expected secret key %q, got %q", "XAI_API_KEY", env.ValueFrom.SecretKeyRef.Key)
+				}
+			}
+		}
+		if env.Name == "ANTHROPIC_API_KEY" {
+			t.Error("ANTHROPIC_API_KEY should not be set for grok agent type")
+		}
+		if env.Name == "CODEX_API_KEY" {
+			t.Error("CODEX_API_KEY should not be set for grok agent type")
+		}
+		if env.Name == "CURSOR_API_KEY" {
+			t.Error("CURSOR_API_KEY should not be set for grok agent type")
+		}
+	}
+	if !foundKelosModel {
+		t.Error("Expected KELOS_MODEL env var to be set")
+	}
+	if !foundXAIKey {
+		t.Error("Expected XAI_API_KEY env var to be set")
+	}
+}
+
 func TestBuildCursorJob_CustomImage(t *testing.T) {
 	builder := NewJobBuilder()
 	task := &kelos.Task{

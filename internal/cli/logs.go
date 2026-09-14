@@ -253,6 +253,12 @@ func parseAgentLogs(agentType string, stream io.Reader) error {
 		return ParseAndFormatGeminiLogs(stream, os.Stdout, os.Stderr)
 	case "opencode":
 		return ParseAndFormatOpenCodeLogs(stream, os.Stdout, os.Stderr)
+	case "grok":
+		// NOTE: grok's exact log JSON shape is UNCONFIRMED. Like cursor, it
+		// is formatted with the generic claude-code-style parser, which
+		// falls back to raw passthrough for lines it does not recognize.
+		// Revisit once a real grok run is captured.
+		return ParseAndFormatLogs(stream, os.Stdout, os.Stderr)
 	default:
 		return ParseAndFormatLogs(stream, os.Stdout, os.Stderr)
 	}

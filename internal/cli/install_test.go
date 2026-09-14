@@ -260,6 +260,7 @@ func TestRenderChart_ImageArgs(t *testing.T) {
 		"--gemini-image=ghcr.io/kelos-dev/gemini",
 		"--opencode-image=ghcr.io/kelos-dev/opencode",
 		"--cursor-image=ghcr.io/kelos-dev/cursor",
+		"--grok-image=ghcr.io/kelos-dev/grok",
 		"--spawner-image=ghcr.io/kelos-dev/kelos-spawner",
 		"--worker-runner-image=ghcr.io/kelos-dev/kelos-worker-runner",
 		"--session-runtime-image=ghcr.io/kelos-dev/kelos-session-runtime",

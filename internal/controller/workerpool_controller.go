@@ -89,6 +89,8 @@ type WorkerPoolReconciler struct {
 	OpenCodeImagePullPolicy     corev1.PullPolicy
 	CursorImage                 string
 	CursorImagePullPolicy       corev1.PullPolicy
+	GrokImage                   string
+	GrokImagePullPolicy         corev1.PullPolicy
 
 	// TokenClient mints GitHub App installation tokens for workspaces backed
 	// by a GitHub App secret. Required for App-backed pools; PAT-style
@@ -1532,6 +1534,11 @@ func (r *WorkerPoolReconciler) agentImage(agentType string) string {
 			return r.CursorImage
 		}
 		return CursorImage
+	case AgentTypeGrok:
+		if r.GrokImage != "" {
+			return r.GrokImage
+		}
+		return GrokImage
 	default:
 		return ClaudeCodeImage
 	}
@@ -1549,6 +1556,8 @@ func (r *WorkerPoolReconciler) agentImagePullPolicy(agentType string) corev1.Pul
 		return r.OpenCodeImagePullPolicy
 	case AgentTypeCursor:
 		return r.CursorImagePullPolicy
+	case AgentTypeGrok:
+		return r.GrokImagePullPolicy
 	default:
 		return r.ClaudeCodeImagePullPolicy
 	}

@@ -124,6 +124,21 @@ func TestExtractClaudeActivity_CursorAgentType(t *testing.T) {
 	}
 }
 
+// TestExtractActivity_GrokDegradesGracefully documents that grok is a
+// recognized agent type routed through the generic activity extractor.
+// grok's `--output-format json` single object is not claude-shaped, so
+// activity degrades to "" rather than crashing. grok's native activity
+// shape is UNCONFIRMED; revisit if a grok-specific parser is added.
+func TestExtractActivity_GrokDegradesGracefully(t *testing.T) {
+	input := `{"text":"done","usage":{"input_tokens":1,"output_tokens":1}}`
+	if got := ExtractActivity(strings.NewReader(input), "grok"); got != "" {
+		t.Errorf("expected empty grok activity, got %q", got)
+	}
+	if got := ExtractActivity(strings.NewReader(""), "grok"); got != "" {
+		t.Errorf("expected empty for empty grok stream, got %q", got)
+	}
+}
+
 func TestExtractClaudeActivity_DefaultAgentType(t *testing.T) {
 	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}`
 	got := ExtractActivity(strings.NewReader(input), "")
