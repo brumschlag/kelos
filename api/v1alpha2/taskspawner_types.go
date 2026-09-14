@@ -246,10 +246,75 @@ type GitHubIssues struct {
 	// +optional
 	Reporting *GitHubReporting `json:"reporting,omitempty"`
 
+	// OnSuccess configures what happens to the originating issue when a Task
+	// created from it succeeds. Requires reporting to be enabled, which is what
+	// supplies the authenticated GitHub writer.
+	// +optional
+	OnSuccess *GitHubIssueCompletion `json:"onSuccess,omitempty"`
+
+	// OnFailure bounds how many times a failing issue is retried. Requires
+	// reporting to be enabled.
+	// +optional
+	OnFailure *GitHubIssueFailurePolicy `json:"onFailure,omitempty"`
+
 	// PollInterval is how often this source is polled (e.g., "30s", "5m").
 	// When empty, a default of 5m is used.
 	// +optional
 	PollInterval string `json:"pollInterval,omitempty"`
+}
+
+// GitHubIssueCompletion configures label hygiene on the originating issue once
+// its Task reaches a terminal phase.
+type GitHubIssueCompletion struct {
+	// RemoveLabels are removed from the issue when its Task succeeds.
+	//
+	// Set this to the trigger label to make an opt-in trigger one-shot. Without
+	// it the label persists for ever, and the ONLY thing preventing the same
+	// issue from being spawned again is the existence of the Task object — which
+	// taskTemplate.ttlSecondsAfterFinished deletes. That inversion (a permanent
+	// trigger guarded by an expiring memory) makes every completed issue re-run
+	// on the TTL period, indefinitely.
+	//
+	// Removal is best-effort: a failure is logged and counted, and never fails
+	// the Task. Removing an absent label is not an error.
+	// +optional
+	RemoveLabels []string `json:"removeLabels,omitempty"`
+}
+
+// GitHubIssueFailurePolicy bounds retries for an issue whose Task keeps
+// failing. It mirrors the bead reaper's shape: stamp an attempt label per
+// failure, and at the ceiling mark the issue blocked and stop retrying.
+//
+// Without a ceiling, an issue that fails for a structural reason (bad prompt
+// fit, unbuildable repo state) burns an agent run on every TTL cycle for ever.
+// Keeping the trigger label on failure is only defensible with this in place.
+type GitHubIssueFailurePolicy struct {
+	// MaxAttempts is how many failures are retried before the issue is marked
+	// blocked. Defaults to 3. Set to 0 to disable the ceiling, which restores
+	// the unbounded-retry behaviour.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	MaxAttempts *int32 `json:"maxAttempts,omitempty"`
+
+	// AttemptLabelPrefix is the prefix for the per-failure attempt label; the
+	// attempt number is appended. Defaults to "kelos-attempt-".
+	// +optional
+	AttemptLabelPrefix string `json:"attemptLabelPrefix,omitempty"`
+
+	// BlockedLabel is applied when MaxAttempts is exhausted. Defaults to
+	// "kelos-blocked".
+	//
+	// NOTE: applying this label does NOT by itself stop discovery. Add it to
+	// excludeLabels as well if you want a second, independent control —
+	// RemoveLabels below is the one that actually breaks the loop.
+	// +optional
+	BlockedLabel string `json:"blockedLabel,omitempty"`
+
+	// RemoveLabels are removed from the issue when MaxAttempts is exhausted.
+	// Set this to the trigger label: removing it is what stops the issue being
+	// rediscovered, independently of excludeLabels.
+	// +optional
+	RemoveLabels []string `json:"removeLabels,omitempty"`
 }
 
 // GitHubPullRequests discovers pull requests from a GitHub repository.

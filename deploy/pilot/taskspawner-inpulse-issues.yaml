@@ -311,13 +311,41 @@ spec:
         - blocked
         - do-not-merge
         - wontfix
+        # kelos-blocked is a SECOND, independent control on the retry ceiling.
+        # onFailure.removeLabels below is the load-bearing one - it takes
+        # kelos-auto off, which is what actually ends discovery. This entry means
+        # a ceiling-blocked issue stays out even if the label removal failed.
+        - kelos-blocked
       labels:
         - kelos-auto
+      # WHY THIS EXISTS. kelos-auto is a PERMANENT trigger, and the only thing
+      # that stopped a completed issue being spawned again was the existence of
+      # the Task object named issue-<N> - which ttlSecondsAfterFinished deletes
+      # after 48h. So the trigger outlived the memory of the work, and every
+      # completed issue re-ran on a 48h cycle indefinitely. Measured before this
+      # fix: 338 runs / $1,527.40 since 2026-09-02, ~143 tasks queued to re-spawn
+      # in one 48h window (~$650/cycle). Taking the label off on success is what
+      # makes the trigger one-shot.
+      onSuccess:
+        removeLabels:
+          - kelos-auto
+      # The label is deliberately KEPT on failure so the issue is retried - which
+      # is only safe with a ceiling. Mirrors deploy/pilot/beads-reaper.py
+      # (kelos-attempt-<n>, then kelos-blocked at MAX_ATTEMPTS=3): without it an
+      # issue that fails structurally burns an agent run every 48h for ever.
+      onFailure:
+        maxAttempts: 3
+        attemptLabelPrefix: kelos-attempt-
+        blockedLabel: kelos-blocked
+        removeLabels:
+          - kelos-auto
       pollInterval: 2m
       priorityLabels:
         - P0
         - P1
       repo: accuhealthevelyn/inpulse
+      # Required for onSuccess/onFailure: the reporter is what applies them, and
+      # it does nothing unless comment reporting is enabled.
       reporting:
         enabled: true
       state: open

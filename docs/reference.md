@@ -759,7 +759,29 @@ to receive refreshed credentials during long-running work.
 | `spec.when.githubIssues.priorityLabels` | Priority-order labels for task selection when `maxConcurrency` is set; index 0 is highest priority | No |
 | `spec.when.githubIssues.reporting.enabled` | **Deprecated:** use `reporting.comments`. Posts status comments back to the GitHub issue using `PerTask` mode | No |
 | `spec.when.githubIssues.reporting.comments.mode` | Enables status comments back to the GitHub issue. `PerTask` (default) creates one comment for each Task; `Sticky` maintains one comment per TaskSpawner and issue across Tasks | No |
+| `spec.when.githubIssues.onSuccess.removeLabels` | Labels removed from the issue when its Task **succeeds**. Set this to the trigger label to make an opt-in trigger one-shot — see the note below. Requires reporting to be enabled | No |
+| `spec.when.githubIssues.onFailure.maxAttempts` | Failures retried before the issue is marked blocked (default `3`). `0` disables the ceiling and restores unbounded retries | No |
+| `spec.when.githubIssues.onFailure.attemptLabelPrefix` | Prefix for the per-failure attempt label; the attempt number is appended (default `kelos-attempt-`) | No |
+| `spec.when.githubIssues.onFailure.blockedLabel` | Label applied once `maxAttempts` is exhausted (default `kelos-blocked`). Does **not** by itself stop discovery — add it to `excludeLabels` too | No |
+| `spec.when.githubIssues.onFailure.removeLabels` | Labels removed once `maxAttempts` is exhausted. Set this to the trigger label: removing it is what actually ends rediscovery | No |
 | `spec.when.githubIssues.pollInterval` | Per-source poll interval (e.g., `"30s"`, `"5m"`). Defaults to `5m` when omitted | No |
+
+> **A trigger label with no exit control re-runs work indefinitely.** A label in
+> `githubIssues.labels` is permanent, but the only thing preventing a completed
+> issue from being spawned again is the existence of its Task object — which
+> `taskTemplate.ttlSecondsAfterFinished` deletes. The trigger therefore outlives
+> the record of the work, and the issue re-runs on the TTL period, for ever. Set
+> `onSuccess.removeLabels` to the trigger label so it comes off when the work
+> lands. Keeping it on *failure* is a reasonable choice — that is what allows a
+> retry — but only alongside `onFailure`, or an issue that fails structurally
+> burns an agent run every TTL period with no ceiling.
+>
+> Both are applied by the reporter, so `reporting` must be enabled; and like every
+> reporting annotation they are stamped at Task **creation** time, so enabling them
+> covers **no** Task already in flight. Expect a one-cycle tail: in-flight Tasks
+> finish with their trigger label still on and are rediscovered one final time. The
+> Task spawned after them carries the policy and is the last.
+
 | `spec.when.githubPullRequests.repo` | Override repository to poll for PRs (in `owner/repo` format or full URL); defaults to workspace repo URL | No |
 | `spec.when.githubPullRequests.labels` | Filter pull requests by labels | No |
 | `spec.when.githubPullRequests.excludeLabels` | Exclude pull requests with these labels | No |
