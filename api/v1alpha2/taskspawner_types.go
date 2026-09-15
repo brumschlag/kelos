@@ -999,7 +999,7 @@ type TaskTemplate struct {
 	//
 	// Deprecated: use taskTemplate.worker.type instead.
 	// +optional
-	// +kubebuilder:validation:Enum=claude-code;codex;gemini;opencode;cursor;""
+	// +kubebuilder:validation:Enum=claude-code;codex;gemini;opencode;cursor;grok;""
 	Type string `json:"type,omitempty"`
 
 	// Credentials specifies how to authenticate with the agent.

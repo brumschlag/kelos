@@ -7817,6 +7817,7 @@ spec:
                     - gemini
                     - opencode
                     - cursor
+                    - grok
                     - ""
                     type: string
                   workspaceRef:
@@ -15303,6 +15304,7 @@ spec:
                         - gemini
                         - opencode
                         - cursor
+                        - grok
                         - ""
                         type: string
                       workspaceRef:
@@ -29988,6 +29990,7 @@ spec:
                 - gemini
                 - opencode
                 - cursor
+                - grok
                 - ""
                 type: string
               upstreamRepo:
@@ -36863,6 +36866,7 @@ spec:
                     - gemini
                     - opencode
                     - cursor
+                    - grok
                     - ""
                     type: string
                   workspaceRef:
@@ -37476,6 +37480,7 @@ spec:
                 - gemini
                 - opencode
                 - cursor
+                - grok
                 type: string
               usage:
                 description: Usage contains structured token and cost usage reported
@@ -53074,6 +53079,7 @@ spec:
                     - gemini
                     - opencode
                     - cursor
+                    - grok
                     - ""
                     type: string
                   upstreamRepo:
@@ -59998,6 +60004,7 @@ spec:
                         - gemini
                         - opencode
                         - cursor
+                        - grok
                         - ""
                         type: string
                       workspaceRef:
@@ -68457,6 +68464,7 @@ spec:
                     - gemini
                     - opencode
                     - cursor
+                    - grok
                     - ""
                     type: string
                   workspaceRef:

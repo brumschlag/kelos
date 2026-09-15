@@ -215,7 +215,7 @@ type PodOverrides struct {
 type WorkerSpec struct {
 	// Type specifies the agent type (e.g., claude-code).
 	// +optional
-	// +kubebuilder:validation:Enum=claude-code;codex;gemini;opencode;cursor;""
+	// +kubebuilder:validation:Enum=claude-code;codex;gemini;opencode;cursor;grok;""
 	Type string `json:"type,omitempty"`
 
 	// Credentials specifies how to authenticate with the agent.
@@ -286,7 +286,7 @@ type TaskSpec struct {
 	//
 	// Deprecated: use spec.worker.type instead.
 	// +optional
-	// +kubebuilder:validation:Enum=claude-code;codex;gemini;opencode;cursor;""
+	// +kubebuilder:validation:Enum=claude-code;codex;gemini;opencode;cursor;grok;""
 	Type string `json:"type,omitempty"`
 
 	// Prompt is the task prompt to send to the agent.

@@ -35,6 +35,8 @@ oauthToken: ""
 #     API key:     depends on the model provider (Anthropic, OpenAI, Google, etc.)
 #   cursor:
 #     API key:     https://cursor.com/dashboard (Integrations tab)
+#   grok:
+#     API key:     https://console.x.ai (XAI_API_KEY)
 
 # Model override (optional)
 # model: ""
@@ -90,6 +92,7 @@ func printNextSteps(configPath string) {
 	fmt.Fprintln(os.Stdout, "   • Gemini (API key): https://aistudio.google.com/app/apikey")
 	fmt.Fprintln(os.Stdout, "   • OpenCode (API key): depends on the model provider")
 	fmt.Fprintln(os.Stdout, "   • Cursor (API key): https://cursor.com/dashboard (Integrations tab)")
+	fmt.Fprintln(os.Stdout, "   • Grok (API key): https://console.x.ai")
 	fmt.Fprintln(os.Stdout, "")
 	fmt.Fprintln(os.Stdout, "2. Edit the config file and add your token:")
 	fmt.Fprintf(os.Stdout, "   %s\n", configPath)

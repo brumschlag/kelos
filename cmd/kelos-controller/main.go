@@ -86,6 +86,8 @@ func main() {
 	var openCodeImagePullPolicy string
 	var cursorImage string
 	var cursorImagePullPolicy string
+	var grokImage string
+	var grokImagePullPolicy string
 	var spawnerImage string
 	var spawnerBeadsImage string
 	var spawnerImagePullPolicy string
@@ -121,6 +123,8 @@ func main() {
 	flag.StringVar(&openCodeImagePullPolicy, "opencode-image-pull-policy", "", "The image pull policy for OpenCode agent containers (e.g., Always, Never, IfNotPresent).")
 	flag.StringVar(&cursorImage, "cursor-image", controller.CursorImageRepository, "The image repository or tagged image to use for Cursor CLI agent containers.")
 	flag.StringVar(&cursorImagePullPolicy, "cursor-image-pull-policy", "", "The image pull policy for Cursor CLI agent containers (e.g., Always, Never, IfNotPresent).")
+	flag.StringVar(&grokImage, "grok-image", controller.GrokImageRepository, "The image repository or tagged image to use for Grok CLI agent containers.")
+	flag.StringVar(&grokImagePullPolicy, "grok-image-pull-policy", "", "The image pull policy for Grok CLI agent containers (e.g., Always, Never, IfNotPresent).")
 	flag.StringVar(&spawnerImage, "spawner-image", controller.SpawnerImageRepository, "The image repository or tagged image to use for spawner Deployments.")
 	flag.StringVar(&spawnerImagePullPolicy, "spawner-image-pull-policy", "", "The image pull policy for spawner Deployments (e.g., Always, Never, IfNotPresent).")
 	flag.StringVar(&spawnerBeadsImage, "spawner-beads-image", controller.SpawnerBeadsImageRepository, "The image repository or tagged image to use for spawner Deployments with a beads source. This variant carries the beads CLI and git, which the default spawner image does not.")
@@ -160,6 +164,7 @@ func main() {
 		{name: "gemini-image", value: &geminiImage},
 		{name: "opencode-image", value: &openCodeImage},
 		{name: "cursor-image", value: &cursorImage},
+		{name: "grok-image", value: &grokImage},
 		{name: "spawner-image", value: &spawnerImage},
 		{name: "spawner-beads-image", value: &spawnerBeadsImage},
 		{name: "ghproxy-image", value: &ghProxyImage},
@@ -271,6 +276,8 @@ func main() {
 	jobBuilder.OpenCodeImagePullPolicy = corev1.PullPolicy(openCodeImagePullPolicy)
 	jobBuilder.CursorImage = cursorImage
 	jobBuilder.CursorImagePullPolicy = corev1.PullPolicy(cursorImagePullPolicy)
+	jobBuilder.GrokImage = grokImage
+	jobBuilder.GrokImagePullPolicy = corev1.PullPolicy(grokImagePullPolicy)
 	if err = (&controller.TaskReconciler{
 		Client:       mgr.GetClient(),
 		Scheme:       mgr.GetScheme(),
@@ -382,6 +389,8 @@ func main() {
 		OpenCodeImagePullPolicy:     corev1.PullPolicy(openCodeImagePullPolicy),
 		CursorImage:                 cursorImage,
 		CursorImagePullPolicy:       corev1.PullPolicy(cursorImagePullPolicy),
+		GrokImage:                   grokImage,
+		GrokImagePullPolicy:         corev1.PullPolicy(grokImagePullPolicy),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "WorkerPool")
 		os.Exit(1)

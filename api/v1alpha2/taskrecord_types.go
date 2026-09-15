@@ -24,7 +24,7 @@ type TaskRecordSpec struct {
 	// Type is the effective agent type of the Task, resolved from
 	// Task.spec.worker.type with a fallback to the legacy Task.spec.type.
 	// +optional
-	// +kubebuilder:validation:Enum=claude-code;codex;gemini;opencode;cursor
+	// +kubebuilder:validation:Enum=claude-code;codex;gemini;opencode;cursor;grok
 	Type string `json:"type,omitempty"`
 
 	// Model is the effective model of the Task, resolved from

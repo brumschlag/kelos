@@ -21,6 +21,7 @@ const (
 	GeminiImageRepository     = "ghcr.io/kelos-dev/gemini"
 	OpenCodeImageRepository   = "ghcr.io/kelos-dev/opencode"
 	CursorImageRepository     = "ghcr.io/kelos-dev/cursor"
+	GrokImageRepository       = "ghcr.io/kelos-dev/grok"
 
 	// ClaudeCodeImage is the default image for Claude Code agent.
 	ClaudeCodeImage = ClaudeCodeImageRepository + ":latest"
@@ -37,6 +38,9 @@ const (
 	// CursorImage is the default image for Cursor CLI agent.
 	CursorImage = CursorImageRepository + ":latest"
 
+	// GrokImage is the default image for xAI Grok CLI agent.
+	GrokImage = GrokImageRepository + ":latest"
+
 	// AgentTypeClaudeCode is the agent type for Claude Code.
 	AgentTypeClaudeCode = "claude-code"
 
@@ -51,6 +55,9 @@ const (
 
 	// AgentTypeCursor is the agent type for Cursor CLI.
 	AgentTypeCursor = "cursor"
+
+	// AgentTypeGrok is the agent type for xAI Grok CLI.
+	AgentTypeGrok = "grok"
 
 	// GitCloneImage is the image used for cloning git repositories.
 	GitCloneImage = "alpine/git:v2.47.2"
@@ -142,6 +149,8 @@ type JobBuilder struct {
 	OpenCodeImagePullPolicy   corev1.PullPolicy
 	CursorImage               string
 	CursorImagePullPolicy     corev1.PullPolicy
+	GrokImage                 string
+	GrokImagePullPolicy       corev1.PullPolicy
 }
 
 // NewJobBuilder creates a new JobBuilder.
@@ -152,6 +161,7 @@ func NewJobBuilder() *JobBuilder {
 		GeminiImage:     GeminiImage,
 		OpenCodeImage:   OpenCodeImage,
 		CursorImage:     CursorImage,
+		GrokImage:       GrokImage,
 	}
 }
 
@@ -233,6 +243,8 @@ func (b *JobBuilder) Build(task *kelos.Task, workspace *kelos.WorkspaceSpec, age
 		return b.buildAgentJob(task, workspace, agentConfig, b.OpenCodeImage, b.OpenCodeImagePullPolicy, prompt)
 	case AgentTypeCursor:
 		return b.buildAgentJob(task, workspace, agentConfig, b.CursorImage, b.CursorImagePullPolicy, prompt)
+	case AgentTypeGrok:
+		return b.buildAgentJob(task, workspace, agentConfig, b.GrokImage, b.GrokImagePullPolicy, prompt)
 	default:
 		return nil, fmt.Errorf("unsupported agent type: %s", agentType)
 	}
@@ -258,6 +270,10 @@ func apiKeyEnvVar(agentType string) string {
 		// CURSOR_API_KEY is the environment variable that the cursor
 		// entrypoint reads for API key authentication.
 		return "CURSOR_API_KEY"
+	case AgentTypeGrok:
+		// XAI_API_KEY is the environment variable that the grok CLI
+		// reads for direct xAI API key authentication.
+		return "XAI_API_KEY"
 	default:
 		return "ANTHROPIC_API_KEY"
 	}

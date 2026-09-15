@@ -37,6 +37,8 @@ func newUsageAccumulator(agentType string) usageAccumulator {
 		return &sumAccumulator{event: "step_finish", extract: extractOpencodeUsage, extractResponse: extractOpencodeResponse}
 	case "cursor":
 		return &lastResultAccumulator{extract: extractCursor}
+	case "grok":
+		return &grokAccumulator{}
 	default:
 		return nil
 	}
@@ -326,6 +328,81 @@ func extractCursor(m map[string]any) map[string]string {
 	}
 	if resp, ok := m["result"].(string); ok && resp != "" {
 		result["response"] = base64.StdEncoding.EncodeToString([]byte(resp))
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+// grokAccumulator keeps the most recent line that carries a top-level
+// "usage" object and, at EOF, extracts token counts, cost, and the response
+// text from it. The grok CLI's `--output-format json` prints a single JSON
+// object carrying "usage"/"text"/"total_cost_usd"; its `streaming-json`
+// form ends with a `type:"end"` line that also carries "usage". Matching on
+// the presence of the usage object handles either shape, and the response
+// "text" (present on the single json object, and on `type:"text"` lines in
+// the streaming form) is tracked separately.
+//
+// Field names were verified against the bundled grok 1.0.30 docs
+// (~/.grok/docs/user-guide/14-headless-mode.md). The token/cost VALUES were
+// NOT verified against a live run (no XAI_API_KEY was available at build
+// time); revisit if a real capture disagrees.
+type grokAccumulator struct {
+	last     map[string]any
+	response string
+}
+
+func (a *grokAccumulator) addLine(line []byte) {
+	m := parseLine(line)
+	if m == nil {
+		return
+	}
+	if _, ok := m["usage"].(map[string]any); ok {
+		a.last = m
+	}
+	if resp, ok := m["text"].(string); ok && resp != "" {
+		a.response = resp
+	}
+}
+
+func (a *grokAccumulator) result() map[string]string {
+	if a.last == nil && a.response == "" {
+		return nil
+	}
+	var r map[string]string
+	if a.last != nil {
+		r = extractGrok(a.last)
+	}
+	if a.response != "" {
+		if r == nil {
+			r = make(map[string]string)
+		}
+		if _, ok := r["response"]; !ok {
+			r["response"] = base64.StdEncoding.EncodeToString([]byte(a.response))
+		}
+	}
+	return r
+}
+
+// extractGrok reads token counts and cost from a grok headless JSON object
+// {"usage":{"input_tokens":N,"output_tokens":N,...},"total_cost_usd":N,...}.
+// input_tokens/output_tokens are the uncached prompt/response counts, matching
+// claude-code's convention (cache buckets live under separate keys and are not
+// summed here). Field names are doc-verified; totals are UNVERIFIED against a
+// live run — see grokAccumulator.
+func extractGrok(m map[string]any) map[string]string {
+	result := make(map[string]string)
+	if v, ok := m["total_cost_usd"]; ok {
+		result["cost-usd"] = formatNumber(v)
+	}
+	if usage, ok := m["usage"].(map[string]any); ok {
+		if v, ok := usage["input_tokens"]; ok {
+			result["input-tokens"] = formatNumber(v)
+		}
+		if v, ok := usage["output_tokens"]; ok {
+			result["output-tokens"] = formatNumber(v)
+		}
 	}
 	if len(result) == 0 {
 		return nil
