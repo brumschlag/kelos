@@ -4,7 +4,10 @@
 #
 # Interface contract:
 #   - First argument ($1): the task prompt
-#   - XAI_API_KEY env var: API key for direct xAI authentication
+#   - M2M_CLIENT_ID env var: Keycloak service-account client id used to mint the
+#     LiteLLM/Bedrock access token (required; set by the Task template)
+#   - M2M_KEY env var: filesystem path to the mounted M2M private key .key file
+#     (required; the grok-m2m-key secret is mounted here)
 #   - KELOS_MODEL env var: model name (optional; defaults to grok-4.6)
 #   - KELOS_AGENTS_MD env var: user-level instructions (optional)
 #   - KELOS_EFFORT env var: reasoning effort hint (optional)
@@ -25,14 +28,61 @@
 #
 # NOTE: the CLI has no `--no-auto-update` flag in this version; the image
 # instead sets `[cli] auto_update = false` in ~/.grok/config.toml, which is the
-# documented equivalent. XAI_API_KEY must be set or the CLI cannot authenticate
-# in a headless (no-browser) environment.
+# documented equivalent.
+#
+# AUTHENTICATION: this image does NOT use XAI_API_KEY (direct xAI). Instead the
+# config.toml below defines a `grok-4.6` model override that points at the
+# LiteLLM ingress (https://llm.ai.tellihealth.com/v1, fronting Bedrock) and an
+# `auth_provider` command (get-token.py) that mints a short-lived Keycloak
+# private_key_jwt access token from the mounted M2M private key. The token
+# carries the llm-proxy audience and the service-account email (per-user
+# attribution). Auth therefore requires M2M_CLIENT_ID + M2M_KEY, not XAI_API_KEY.
 
 set -uo pipefail
 
 PROMPT="${1:?Prompt argument is required}"
 
 MODEL="${KELOS_MODEL:-grok-4.6}"
+
+# --- LiteLLM/Bedrock auth wiring -------------------------------------------
+# The M2M identity is required: without it the auth_provider cannot mint a
+# token and grok cannot reach the LiteLLM ingress. Fail early with a clear
+# message rather than letting grok surface an opaque auth error.
+: "${M2M_CLIENT_ID:?M2M_CLIENT_ID is required (Keycloak service-account client id)}"
+: "${M2M_KEY:?M2M_KEY is required (path to the mounted M2M private key)}"
+if [ ! -r "$M2M_KEY" ]; then
+  echo "M2M_KEY=$M2M_KEY is not readable; is the grok-m2m-key secret mounted?" >&2
+  exit 1
+fi
+
+# Write the grok CLI config that routes the `grok-4.6` catalog entry through
+# the LiteLLM/Bedrock ingress via the get-token.py auth_provider. Written at
+# runtime (not baked into the image) so the routing/auth wiring lives with the
+# entrypoint. HOME is /home/agent in this image; the path is a literal inside
+# the container. A quoted heredoc keeps the TOML verbatim (no shell expansion).
+GROK_CONFIG_DIR="${HOME:-/home/agent}/.grok"
+mkdir -p "$GROK_CONFIG_DIR"
+cat >"$GROK_CONFIG_DIR/config.toml" <<'TOML'
+[cli]
+auto_update = false
+
+[models]
+default = "grok-4.6"
+
+[auth_provider.litellm]
+command = "python3 /kelos/get-token.py"
+token_ttl_secs = 3300
+
+[model."grok-4.6"]
+model = "grok-4-6"
+base_url = "https://llm.ai.tellihealth.com/v1"
+name = "Grok 4.6 (LiteLLM / Bedrock)"
+description = "xAI Grok 4.6 via LiteLLM (us.xai.grok-4.6)"
+api_backend = "chat_completions"
+auth_provider = "litellm"
+context_window = 500000
+reasoning_summary = "none"
+TOML
 
 # Kelos delivers user-level instructions (KELOS_AGENTS_MD) and an optional
 # reasoning-effort hint (KELOS_EFFORT). grok's native user-instruction /
