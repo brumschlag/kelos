@@ -9,10 +9,15 @@
 # fork images carry fully-qualified tags instead, which the controller passes
 # through unchanged (cmd/kelos-controller/main.go imageForVersion).
 #
-# The three fork images now share one tag, v0.55.0-pilot1, rather than a
-# per-image suffix naming each one's feature. They are cut from the same commit
-# and only ever deployed together, so a single tag removes the possibility of
-# running a mismatched trio and leaves one value to bump.
+# The fork images no longer all share one tag. claude-code and the worker
+# runner stay on v0.55.0-pilot1 -- cut from the same commit and deployed
+# together -- while the controller and grok were rebuilt independently and
+# carry their own tags: the controller at 0a4d731-amd64 (the integration
+# commit that brought grok onto this branch) and grok at 1.0.30-litellm1
+# (Keycloak-M2M -> LiteLLM -> Bedrock auth). Each still carries a
+# fully-qualified tag the controller passes through unchanged, so bumping one
+# never points the others -- or the upstream images -- at a tag that does not
+# exist.
 
 crds:
   # Applied separately with --force-conflicts: upstream kelos owns spec.versions
@@ -42,7 +47,7 @@ nodeSelector:
 
 controllerImage: 565715328522.dkr.ecr.us-east-1.amazonaws.com/kelos-controller
 # Tagged separately from image.tag so --version stays on the upstream release.
-controllerImageTag: v0.55.0-pilot1
+controllerImageTag: 0a4d731-amd64
 image:
   # Stays on the upstream release tag. It feeds --version, which supplies the tag
   # for every image not overridden below, so a fork tag here would point the
@@ -52,6 +57,11 @@ image:
 
 # Carries the tool_use stream parsing that reports tool-calls/tool-breakdown.
 claudeCodeImage: 565715328522.dkr.ecr.us-east-1.amazonaws.com/claude-code:v0.55.0-pilot1
+
+# Grok CLI agent image. Routes grok through Keycloak-M2M -> LiteLLM -> Bedrock
+# (grok/get-token.py + entrypoint) rather than a direct xAI key. The controller
+# passes this through unchanged as --grok-image (chart wires .Values.grokImage).
+grokImage: 565715328522.dkr.ecr.us-east-1.amazonaws.com/grok:1.0.30-litellm1
 
 workerRunner:
   # Carries preCommands + postCommands.
