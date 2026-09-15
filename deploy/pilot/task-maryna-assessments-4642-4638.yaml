@@ -1,0 +1,117 @@
+apiVersion: kelos.dev/v1alpha2
+kind: Task
+metadata:
+  name: maryna-assessments-4642-4638
+  namespace: kelos-pilot
+  labels:
+    kelos.dev/experiment: maryna-feature-hardening
+spec:
+  type: claude-code
+  model: claude-sonnet-46
+  credentials:
+    type: none
+  workspaceRef:
+    name: inpulse-write
+  ttlSecondsAfterFinished: 86400
+  agentConfigRefs:
+  - name: inpulse-knowledge
+  preCommands:
+  # Trust the workspace (merge-safe; must not clobber ~/.claude.json which the AgentConfig also writes).
+  - ["python3","-c","import json,os,pathlib\np=pathlib.Path('/home/claude/.claude.json')\nd={}\nif p.exists():\n    try: d=json.loads(p.read_text() or '{}')\n    except Exception: d={}\nd.setdefault('projects',{}).setdefault('/workspace/repo',{})['hasTrustDialogAccepted']=True\nt=str(p)+'.tmp'\nopen(t,'w').write(json.dumps(d,indent=2))\nos.replace(t,str(p))\nprint('TRUST_OK')"]
+  # npm ci in the FE app root, in a preCommand so it can't hit Claude Code's Bash-tool timeout / auto-background.
+  - ["bash","-c","cd /workspace/repo/src/frontend/inpulse-web && npm ci 2>&1 | tail -20; echo \"NPM_CI_EXIT=${PIPESTATUS[0]}\""]
+  prompt: |
+    You are fixing TWO confirmed frontend bugs in the InPulse web app, both in the SAME
+    file, shipped as ONE pull request. You are running UNATTENDED — there is no human to
+    approve anything, so you must push and open the PR yourself.
+
+    The repo is already cloned at /workspace/repo (branch develop). The frontend app root
+    is /workspace/repo/src/frontend/inpulse-web and its node_modules are ALREADY installed
+    (npm ci ran in preCommands — check the pod log for NPM_CI_EXIT=0; if it was nonzero,
+    run `npm ci` again from that dir before proceeding). Run all npm / npx tsc / vitest
+    commands from that app root.
+
+    FILE TO EDIT (relative to the app root):
+      src/features/patients/components/patient-chart/patient-chart-assessments/index.tsx
+
+    BUG 1 — GitHub issue #4642 (P1, layout): A long assessment name does not wrap or
+    truncate; it overlaps adjacent elements and makes the WHOLE PAGE scroll sideways.
+    Root cause (verified): the name's flex container (~line 251, classes include
+    `min-w-[180px] flex-1`) has a min-width FLOOR but no `min-w-0`, so it cannot shrink
+    below its content; and the name span (~line 256, `font-extrabold text-(--text)`) has
+    no `truncate`/`break-words`. FIX: add `min-w-0` to the container and `truncate` (or
+    `break-words` if the design wants wrapping) to the name span so a long name is
+    clipped/wrapped instead of forcing horizontal overflow. Confirm the row no longer
+    forces page-level horizontal scroll.
+
+    BUG 2 — GitHub issue #4638 (P2, dead control): The "Templates" button
+    (~line 179-182, data-testid="assessment-templates-btn") is INERT — it has no onClick.
+    The target route already exists: ROUTES.ASSESSMENTS ('/assessments') renders
+    AssessmentTemplatesPage. FIX: import useNavigate (react-router) and ROUTES, and wire
+    the button's onClick to navigate to ROUTES.ASSESSMENTS, matching how other buttons in
+    this codebase navigate.
+
+    REQUIREMENTS:
+    1. Make BOTH fixes in the one file (plus the minimal import additions #4638 needs).
+    2. Add or extend a focused component/unit test for each fix where a sibling test
+       pattern already exists (e.g. assert the Templates button triggers navigation; assert
+       the name span carries `truncate` / the container carries `min-w-0`). Mirror existing
+       tests — do NOT invent a heavy new harness.
+    3. Verify BEFORE pushing, from the app root: `npx tsc --noEmit` MUST be clean, and the
+       relevant vitest specs for this component MUST pass. Read .github/workflows/ci.yml and
+       mirror what the `frontend-static` job actually runs. Long runs are fine — you are in
+       a container, NOT under a tool timeout.
+    4. Create ONE branch `kelos/maryna-assessments-4642-4638` off develop, commit with a
+       clear conventional message, and push it.
+    5. Open ONE pull request against `develop`, e.g. title
+       "fix(assessments): wrap/truncate long name (#4642) + wire Templates button (#4638)".
+       Body: cause + fix per issue, the VERBATIM tsc/test output, and the lines
+       "Closes #4642" and "Closes #4638".
+    6. Do NOT invoke the commit skill or any /commit slash command — it deadlocks unattended
+       and your work will be discarded. Run `git add <specific files>`, `git commit`,
+       `git push`, and `gh pr create` DIRECTLY.
+    7. Do NOT enable auto-merge. Do NOT touch any file under .github/. Do NOT edit any
+       unrelated file.
+    8. If either fix turns out to need more than a small, self-contained change (e.g. the
+       route doesn't resolve, or the layout fix requires parent-component changes), STOP
+       that part and say so plainly in the PR body rather than forcing it — a partial,
+       honest PR beats a wrong one.
+
+    Report at the end: the branch name, the PR URL, and the exact tsc/test results.
+  podOverrides:
+    activeDeadlineSeconds: 3600
+    nodeSelector:
+      workload: agents
+    tolerations:
+    - key: workload
+      operator: Equal
+      value: agents
+      effect: NoSchedule
+    resources:
+      requests:
+        cpu: "500m"
+        memory: 2Gi
+      limits:
+        cpu: "2"
+        memory: 6Gi
+    env:
+    - name: ANTHROPIC_BASE_URL
+      value: http://bedrock-gateway.honcho.svc.cluster.local
+    - name: ANTHROPIC_AUTH_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: honcho-gateway-key
+          key: gateway-api-key
+    # Write path: kelos's clone credential is not exposed to gh/git as an env var, so
+    # inject the write token explicitly. Map to BOTH names: gh prefers GH_TOKEN, git's
+    # credential helper reads GITHUB_TOKEN.
+    - name: GITHUB_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: github-token-agent-write
+          key: GITHUB_TOKEN
+    - name: GH_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: github-token-agent-write
+          key: GITHUB_TOKEN

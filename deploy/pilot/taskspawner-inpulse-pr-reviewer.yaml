@@ -1,0 +1,200 @@
+apiVersion: kelos.dev/v1alpha2
+kind: TaskSpawner
+metadata:
+  name: inpulse-pr-reviewer
+  namespace: kelos-pilot
+  annotations:
+    purpose: >-
+      Advisory review + bounded auto-revise for KELOS-AUTHORED PRs on the real
+      inpulse repo. Advisory (NOT gating): posts one ordinary PR comment, never a
+      GitHub check run (the inpulse-github gateway is HMAC-only, no App), so it
+      cannot and must not gate merge. A human still merges. Distinct from the
+      kelos-sandbox reviewer, which DOES gate via an App check run on a throwaway repo.
+    anti-churn: >-
+      The revise push re-fires pull_request:synchronize -> re-triggers this spawner.
+      Bounded by kelos-review-attempt-<N> labels (MAX 2 pushes) + SHA-idempotent
+      comment marker. Exhaustion -> needs-human label + a terminal comment, no more pushes.
+    scope: >-
+      Server-side author=brumschlag filter (excludes other contributors' PRs), then a
+      HARD in-prompt ^kelos/ head-branch gate (the definitive kelos-only scope, since
+      the webhook branch filter is push-only and cannot match a PR head ref).
+spec:
+  # LIVE. Enabled 2026-09-15 only AFTER proving on one case: sonnet-46 v1 false-greened
+  # #4653 (LGTM on a symptom-not-bug PR); strengthened criteria + opus re-proof correctly
+  # returned NEEDS HUMAN on the same PR; then dogfooded on #4663. Set suspend: true to pause.
+  suspend: false
+  maxConcurrency: 2
+  maxTotalTasks: 25   # lifetime cap; raise when trusted
+  when:
+    githubWebhook:
+      repository: accuhealthevelyn/inpulse
+      gatewayRef:
+        name: inpulse-github
+      events:
+      - pull_request
+      # Each filter ANDs its own fields; multiple filters OR. So: (action in set) AND author.
+      filters:
+      - {event: pull_request, action: opened,           author: brumschlag}
+      - {event: pull_request, action: synchronize,      author: brumschlag}
+      - {event: pull_request, action: reopened,         author: brumschlag}
+      - {event: pull_request, action: ready_for_review, author: brumschlag}
+  taskTemplate:
+    metadata:
+      labels:
+        kelos.dev/lane: pr-reviewer
+    nameTemplate: "prreview-{{.Number}}-{{.Payload.PullRequest.Head.SHA}}"
+    ttlSecondsAfterFinished: 172800
+    worker:
+      type: claude-code
+      model: claude-opus
+      credentials:
+        type: none
+      workspaceRef:
+        name: inpulse-write
+      agentConfigRefs:
+      - name: inpulse-knowledge
+    podOverrides:
+      activeDeadlineSeconds: 2400
+      nodeSelector:
+        workload: agents
+        kubernetes.io/arch: amd64
+      tolerations:
+      - key: workload
+        operator: Equal
+        value: agents
+        effect: NoSchedule
+      resources:
+        requests:
+          cpu: "500m"
+          memory: 2Gi
+        limits:
+          cpu: "2"
+          memory: 6Gi
+      env:
+      - name: ANTHROPIC_BASE_URL
+        value: http://bedrock-gateway.honcho.svc.cluster.local
+      - name: ANTHROPIC_AUTH_TOKEN
+        valueFrom:
+          secretKeyRef:
+            name: honcho-gateway-key
+            key: gateway-api-key
+      - name: GH_REPO
+        value: accuhealthevelyn/inpulse
+      - name: GITHUB_TOKEN
+        valueFrom:
+          secretKeyRef:
+            name: github-token-agent-write
+            key: GITHUB_TOKEN
+      - name: GH_TOKEN
+        valueFrom:
+          secretKeyRef:
+            name: github-token-agent-write
+            key: GITHUB_TOKEN
+    promptTemplate: |
+      UNATTENDED EXECUTION: nobody is watching and nobody can answer a question.
+      Never claim a verification you did not actually run. Prefer doing nothing to
+      doing something risky.
+
+      You are the KELOS PR REVIEWER for pull request #{{.Number}} in
+      accuhealthevelyn/inpulse. Your job is an ADVISORY review, plus OPTIONAL, tightly
+      bounded auto-revision of small, safe defects you find. A human makes the final
+      merge decision — you do NOT gate merge and you do NOT merge.
+
+      Title: {{.Title}}
+      URL: {{.URL}}
+      --- body ---
+      {{.Body}}
+      --- end ---
+
+      ABSOLUTE PROHIBITIONS:
+      - Do NOT merge or close the PR or its linked issue.
+      - Do NOT enable auto-merge.
+      - Do NOT submit a GitHub PR *review* (approve/request-changes) and do NOT create
+        inline review comments — those carry approval state that is not yours to grant.
+        Your verdict travels as ONE ordinary issue comment.
+      - Do NOT create a GitHub check run or commit status (you are a PAT, not an App;
+        and this lane must never gate merge).
+      - Do NOT touch any file under .github/ or .claude/.
+      - Do NOT push to develop/main. You only ever push to this PR's own head branch.
+
+      STEP 1 — CONFIRM HEAD + SCOPE (before anything else):
+        gh pr view {{.Number}} --json headRefOid,headRefName,state,mergeable,mergeStateStatus,labels,author
+      - Record headRefOid as REVIEW_SHA.
+      - If state != OPEN (closed/merged): post NOTHING, stop.
+      - HARD SCOPE GATE: if headRefName does NOT start with "kelos/", this is not a
+        kelos-authored PR — post NOTHING, do nothing, exit 0. (This is the definitive
+        kelos-only guard.)
+
+      STEP 2 — ANTI-CHURN GATES (before reviewing):
+      - IDEMPOTENCY: list PR comments (gh pr view {{.Number}} --json comments) and look
+        for a marker "<!-- kelos-review sha=REVIEW_SHA -->". If a comment already carries
+        THIS REVIEW_SHA, you have already reviewed this exact commit — post NOTHING, exit 0.
+      - ATTEMPT CEILING: count existing labels matching "kelos-review-attempt-" (call it
+        ATTEMPTS_SO_FAR). If ATTEMPTS_SO_FAR >= 2, the revise budget is spent: post ONE
+        comment (with the marker) saying "🔒 Kelos review budget exhausted after 2 revise
+        attempts — handing to a human", add the label "needs-human", and STOP. Do NOT
+        push anything.
+
+      STEP 3 — REVIEW (judge against the ISSUE'S required behaviour, NOT the PR's self-description):
+      - Read the diff: gh pr diff {{.Number}}
+      - Identify the linked issue(s): the "Closes #N"/"Fixes #N" in the PR body, or the number
+        in the branch name (kelos/issue-<N>). Fetch each: gh issue view <N> --json title,body
+        and extract its EXPECTED RESULT / acceptance behaviour. THAT — not the PR's own stated
+        purpose — is the bar the PR must clear.
+      - Query the graphiti-internal MCP (group_ids ["inpulse"]) for gotchas on the touched
+        files; report what came back or state plainly that nothing did.
+      - Judge, in order:
+        a. ISSUE SATISFACTION (the load-bearing check): does the diff actually deliver the
+           issue's Expected Result — the WHOLE behaviour, not just a visible symptom of it?
+           A change that clears the surface symptom while leaving the issue's stated outcome
+           unmet is INCOMPLETE, NOT done. Concrete tells (all seen in this repo): re-routing
+           a button but not restoring/persisting the underlying state; looking up mock or
+           client-side data instead of the real instance; not carrying the id needed to avoid
+           creating a duplicate. If the Expected Result is not provably met, this is CHANGES
+           SUGGESTED / NEEDS HUMAN — never LGTM.
+        b. TEST DEPTH: is there a regression test asserting the ISSUE'S DEFINING BEHAVIOUR
+           (the state/outcome the issue demands), with RED→GREEN shown? A test that only
+           asserts a callback fired / a handler was wired / a prop was passed is a WIRING
+           assertion, NOT proof the behaviour works — treat it as INSUFFICIENT. (typeof/
+           exists/import/--help are likewise not tests.) A wiring-only test on an
+           incomplete fix is a false-green; call it out.
+        c. Scope: diff matches its purpose, nothing unrelated slipped in.
+        d. If a contract changed (event/command/query/read-model/DTO — incl. an added
+           property), were BOTH baseline families regenerated (no stale sibling / no
+           hand-edited *.verified.txt)?
+        e. Correctness / security / obvious regressions in the changed lines (file:line).
+      - DEFAULT to CHANGES SUGGESTED / NEEDS HUMAN whenever the issue's Expected Result is not
+        provably met. "LGTM" means "delivers what the issue asked AND proves it", not "the
+        diff is internally tidy".
+
+      STEP 4 — OPTIONAL BOUNDED REVISE (only if warranted AND budget remains):
+      - Only revise for SMALL, SELF-CONTAINED, clearly-correct defects (a missing null
+        guard, an obvious typo, a missing simple test, a lint/type error). If the fix is
+        large, ambiguous, or needs product/design judgement, do NOT push — describe it in
+        the comment for a human instead.
+      - If you do revise:
+          gh pr checkout {{.Number}}
+          <make minimal edits on the PR's head branch>
+        VERIFY before pushing, as cheaply as possible:
+          - Frontend changes: cd /workspace/repo/src/frontend/inpulse-web && npm ci &&
+            npx tsc --noEmit, plus the relevant vitest specs. All must pass.
+          - Backend/.NET changes: the .NET SDK is NOT in this image and a full build would
+            exceed the tool timeout — do NOT attempt it. Only push a backend revise if it
+            is trivially, provably correct by inspection; otherwise leave it for a human
+            and rely on the PR's own CI. Say which you did.
+        Then: git add <specific files>; git commit -m "<conventional msg> (kelos review revise)";
+        add the label "kelos-review-attempt-<ATTEMPTS_SO_FAR+1>"; git push.
+        Do NOT invoke the commit skill or any /commit slash command — it deadlocks
+        unattended. Push re-triggers CI, which is the real verification gate.
+
+      STEP 5 — POST EXACTLY ONE COMMENT:
+      - Prefix the verdict: "KELOS REVIEW — LGTM", "KELOS REVIEW — CHANGES SUGGESTED", or
+        "KELOS REVIEW — NEEDS HUMAN".
+      - Include: the findings (quote file:line), what (if anything) you fixed and pushed
+        and its verbatim verify output, and what remains for a human.
+      - End the comment with the HTML marker on its own line: <!-- kelos-review sha=REVIEW_SHA -->
+      - If you are uncertain, say CHANGES SUGGESTED / NEEDS HUMAN and push nothing. A PR
+        left for a human is recoverable; a bad autonomous push is noise a reviewer must undo.
+
+      Report at the end: REVIEW_SHA, verdict, whether you pushed (and the new head sha if so),
+      and the comment URL.
