@@ -134,6 +134,7 @@ The secret referenced by `spec.credentials.secretRef.name` must contain a single
 | `gemini` | `api-key` or `oauth` | `GEMINI_API_KEY` |
 | `opencode` | `api-key` or `oauth` | `OPENCODE_API_KEY` |
 | `cursor` | `api-key` or `oauth` | `CURSOR_API_KEY` |
+| `grok` | `api-key` | `XAI_API_KEY` |
 
 Example for `claude-code` with an API key:
 
@@ -182,7 +183,7 @@ the refreshed value on their next sync and are not supported.
 
 | Field | Description | Required |
 |-------|-------------|----------|
-| `worker.type` | Agent type (`claude-code`, `codex`, `gemini`, `opencode`, or `cursor`) | Yes for inline Task execution (CEL-enforced) |
+| `worker.type` | Agent type (`claude-code`, `codex`, `gemini`, `opencode`, `cursor`, or `grok`) | Yes for inline Task execution (CEL-enforced) |
 | `worker.credentials.type` | `api-key`, `oauth`, or `none` | Yes for inline Task execution (CEL-enforced) |
 | `worker.credentials.secretRef.name` | Secret name (not required when `type` is `none`) | Conditional |
 | `worker.model` | Model override passed as `KELOS_MODEL` | No |
@@ -1347,7 +1348,7 @@ The `token` and `githubApp` fields are mutually exclusive. If both `name` and `r
 
 | Field | Description |
 |-------|-------------|
-| `type` | Default agent type (`claude-code`, `codex`, `gemini`, `opencode`, or `cursor`) |
+| `type` | Default agent type (`claude-code`, `codex`, `gemini`, `opencode`, `cursor`, or `grok`) |
 | `model` | Default model override |
 | `effort` | Default agent reasoning effort |
 | `namespace` | Default Kubernetes namespace |

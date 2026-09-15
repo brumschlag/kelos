@@ -15558,6 +15558,7 @@ spec:
                     - gemini
                     - opencode
                     - cursor
+                    - grok
                     - ""
                     type: string
                   upstreamRepo:
@@ -22482,6 +22483,7 @@ spec:
                         - gemini
                         - opencode
                         - cursor
+                        - grok
                         - ""
                         type: string
                       workspaceRef:

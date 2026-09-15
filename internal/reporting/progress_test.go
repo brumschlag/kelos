@@ -94,6 +94,23 @@ func TestExtractLatestAssistantText_LargeLine(t *testing.T) {
 	}
 }
 
+// TestExtractLatestAssistantText_GrokDegradesGracefully documents that grok
+// is a recognized agent type routed through the generic assistant-text
+// extractor. grok's `--output-format json` emits a single object
+// ({"text":...,"usage":...}) that does NOT match the claude-code
+// assistant-message NDJSON shape, so progress text degrades to "" rather
+// than crashing. grok's native progress shape is UNCONFIRMED; revisit if a
+// grok-specific parser is added.
+func TestExtractLatestAssistantText_GrokDegradesGracefully(t *testing.T) {
+	logs := `{"text":"Fixed the bug.","stopReason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`
+	if got := ExtractLatestAssistantText(strings.NewReader(logs), "grok"); got != "" {
+		t.Errorf("expected empty (grok json object is not claude-shaped assistant text), got %q", got)
+	}
+	if got := ExtractLatestAssistantText(strings.NewReader(""), "grok"); got != "" {
+		t.Errorf("expected empty for empty grok stream, got %q", got)
+	}
+}
+
 func TestExtractLatestAssistantText_UnknownAgent(t *testing.T) {
 	logs := `{"type":"assistant","message":{"content":[{"type":"text","text":"hello"}]}}`
 

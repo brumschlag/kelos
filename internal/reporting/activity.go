@@ -89,7 +89,11 @@ func ExtractActivity(r io.Reader, agentType string) string {
 		return extractGeminiActivity(r)
 	case "opencode":
 		return extractOpenCodeActivity(r)
-	case "claude-code", "cursor", "":
+	case "claude-code", "cursor", "grok", "":
+		// NOTE: grok's exact NDJSON activity shape is UNCONFIRMED. It is
+		// routed through the generic activity extractor, which degrades to
+		// an empty string when the shape does not match rather than
+		// crashing. Revisit once a real grok run is captured.
 		return extractClaudeActivity(r)
 	default:
 		return ""
