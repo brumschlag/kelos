@@ -17,6 +17,15 @@ RUN apt-get update && apt-get install -y \
     && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
 
+# Python + the JWT libraries used by the M2M auth_provider (get-token.py) to
+# mint a Keycloak private_key_jwt access token for the LiteLLM/Bedrock ingress.
+# ubuntu:24.04 ships an externally-managed Python, so --break-system-packages
+# is required to install into the system site-packages.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 python3-pip \
+    && pip install --break-system-packages --no-cache-dir PyJWT cryptography \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN ARCH=$(dpkg --print-architecture) \
     && TARBALL="go${GO_VERSION}.linux-${ARCH}.tar.gz" \
     && curl -fsSL -o "/tmp/${TARBALL}" "https://dl.google.com/go/${TARBALL}" \
@@ -35,6 +44,10 @@ RUN chmod +x /usr/local/bin/gh
 
 ARG TARGETARCH
 COPY bin/kelos-capture-linux-${TARGETARCH} /kelos/kelos-capture
+
+# The M2M auth_provider command invoked by grok's config.toml. It mints a
+# short-lived Keycloak access token from the mounted private key at runtime.
+COPY grok/get-token.py /kelos/get-token.py
 
 RUN useradd -u 61100 -m -s /bin/bash agent
 RUN mkdir -p /home/agent/.grok /home/agent/.local/bin && chown -R agent:agent /home/agent
