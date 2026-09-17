@@ -222,10 +222,54 @@ type GitHubIssues struct {
 	// +optional
 	Reporting *GitHubReporting `json:"reporting,omitempty"`
 
+	// OnSuccess configures what happens to the originating issue when a Task
+	// created from it succeeds. See the v1alpha2 type for the full rationale.
+	// +optional
+	OnSuccess *GitHubIssueCompletion `json:"onSuccess,omitempty"`
+
+	// OnFailure bounds how many times a failing issue is retried. See the
+	// v1alpha2 type for the full rationale.
+	// +optional
+	OnFailure *GitHubIssueFailurePolicy `json:"onFailure,omitempty"`
+
 	// PollInterval overrides spec.pollInterval for this source (e.g., "30s", "5m").
 	// When empty, spec.pollInterval is used.
 	// +optional
 	PollInterval string `json:"pollInterval,omitempty"`
+}
+
+// GitHubIssueCompletion configures label hygiene on the originating issue once
+// its Task reaches a terminal phase. Field-for-field identical to the v1alpha2
+// type so the JSON round-trip conversion is lossless.
+type GitHubIssueCompletion struct {
+	// RemoveLabels are removed from the issue when its Task succeeds.
+	// +optional
+	RemoveLabels []string `json:"removeLabels,omitempty"`
+}
+
+// GitHubIssueFailurePolicy bounds retries for an issue whose Task keeps
+// failing. Field-for-field identical to the v1alpha2 type so the JSON
+// round-trip conversion is lossless.
+type GitHubIssueFailurePolicy struct {
+	// MaxAttempts is how many failures are retried before the issue is marked
+	// blocked. Defaults to 3. Set to 0 to disable the ceiling.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	MaxAttempts *int32 `json:"maxAttempts,omitempty"`
+
+	// AttemptLabelPrefix is the prefix for the per-failure attempt label.
+	// Defaults to "kelos-attempt-".
+	// +optional
+	AttemptLabelPrefix string `json:"attemptLabelPrefix,omitempty"`
+
+	// BlockedLabel is applied when MaxAttempts is exhausted. Defaults to
+	// "kelos-blocked".
+	// +optional
+	BlockedLabel string `json:"blockedLabel,omitempty"`
+
+	// RemoveLabels are removed from the issue when MaxAttempts is exhausted.
+	// +optional
+	RemoveLabels []string `json:"removeLabels,omitempty"`
 }
 
 // GitHubPullRequests discovers pull requests from a GitHub repository.

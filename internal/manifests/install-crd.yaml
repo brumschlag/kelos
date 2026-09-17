@@ -44867,6 +44867,47 @@ spec:
                         items:
                           type: string
                         type: array
+                      onFailure:
+                        description: |-
+                          OnFailure bounds how many times a failing issue is retried. See the
+                          v1alpha2 type for the full rationale.
+                        properties:
+                          attemptLabelPrefix:
+                            description: |-
+                              AttemptLabelPrefix is the prefix for the per-failure attempt label.
+                              Defaults to "kelos-attempt-".
+                            type: string
+                          blockedLabel:
+                            description: |-
+                              BlockedLabel is applied when MaxAttempts is exhausted. Defaults to
+                              "kelos-blocked".
+                            type: string
+                          maxAttempts:
+                            description: |-
+                              MaxAttempts is how many failures are retried before the issue is marked
+                              blocked. Defaults to 3. Set to 0 to disable the ceiling.
+                            format: int32
+                            minimum: 0
+                            type: integer
+                          removeLabels:
+                            description: RemoveLabels are removed from the issue when
+                              MaxAttempts is exhausted.
+                            items:
+                              type: string
+                            type: array
+                        type: object
+                      onSuccess:
+                        description: |-
+                          OnSuccess configures what happens to the originating issue when a Task
+                          created from it succeeds. See the v1alpha2 type for the full rationale.
+                        properties:
+                          removeLabels:
+                            description: RemoveLabels are removed from the issue when
+                              its Task succeeds.
+                            items:
+                              type: string
+                            type: array
+                        type: object
                       pollInterval:
                         description: |-
                           PollInterval overrides spec.pollInterval for this source (e.g., "30s", "5m").
@@ -60238,6 +60279,65 @@ spec:
                         items:
                           type: string
                         type: array
+                      onFailure:
+                        description: |-
+                          OnFailure bounds how many times a failing issue is retried. Requires
+                          reporting to be enabled.
+                        properties:
+                          attemptLabelPrefix:
+                            description: |-
+                              AttemptLabelPrefix is the prefix for the per-failure attempt label; the
+                              attempt number is appended. Defaults to "kelos-attempt-".
+                            type: string
+                          blockedLabel:
+                            description: |-
+                              BlockedLabel is applied when MaxAttempts is exhausted. Defaults to
+                              "kelos-blocked".
+
+                              NOTE: applying this label does NOT by itself stop discovery. Add it to
+                              excludeLabels as well if you want a second, independent control —
+                              RemoveLabels below is the one that actually breaks the loop.
+                            type: string
+                          maxAttempts:
+                            description: |-
+                              MaxAttempts is how many failures are retried before the issue is marked
+                              blocked. Defaults to 3. Set to 0 to disable the ceiling, which restores
+                              the unbounded-retry behaviour.
+                            format: int32
+                            minimum: 0
+                            type: integer
+                          removeLabels:
+                            description: |-
+                              RemoveLabels are removed from the issue when MaxAttempts is exhausted.
+                              Set this to the trigger label: removing it is what stops the issue being
+                              rediscovered, independently of excludeLabels.
+                            items:
+                              type: string
+                            type: array
+                        type: object
+                      onSuccess:
+                        description: |-
+                          OnSuccess configures what happens to the originating issue when a Task
+                          created from it succeeds. Requires reporting to be enabled, which is what
+                          supplies the authenticated GitHub writer.
+                        properties:
+                          removeLabels:
+                            description: |-
+                              RemoveLabels are removed from the issue when its Task succeeds.
+
+                              Set this to the trigger label to make an opt-in trigger one-shot. Without
+                              it the label persists for ever, and the ONLY thing preventing the same
+                              issue from being spawned again is the existence of the Task object — which
+                              taskTemplate.ttlSecondsAfterFinished deletes. That inversion (a permanent
+                              trigger guarded by an expiring memory) makes every completed issue re-run
+                              on the TTL period, indefinitely.
+
+                              Removal is best-effort: a failure is logged and counted, and never fails
+                              the Task. Removing an absent label is not an error.
+                            items:
+                              type: string
+                            type: array
+                        type: object
                       pollInterval:
                         description: |-
                           PollInterval is how often this source is polled (e.g., "30s", "5m").

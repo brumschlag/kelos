@@ -652,7 +652,71 @@ func sourceAnnotations(ts *kelos.TaskSpawner, item source.WorkItem) map[string]s
 		}
 	}
 
+	stampIssueLabelPolicy(ts, annotations)
+
 	return annotations
+}
+
+// stampIssueLabelPolicy copies when.githubIssues.onSuccess/onFailure onto the
+// Task's annotations. The reporter has no access to the TaskSpawner spec, so
+// this stamping is what makes the policy reachable at all — the same pattern
+// AnnotationGitHubCheckName already uses.
+//
+// Consequence worth knowing before enabling it: like every annotation here, this
+// is written at Task CREATION time, so turning the policy on covers NO Task
+// already in flight. Those keep their trigger label and re-arm the loop one final
+// time; the Task spawned after them carries the annotation and is the last one.
+// Plan for that one-cycle tail rather than hand-patching live objects.
+func stampIssueLabelPolicy(ts *kelos.TaskSpawner, annotations map[string]string) {
+	issues := ts.Spec.When.GitHubIssues
+	if issues == nil {
+		return
+	}
+	if issues.OnSuccess == nil && issues.OnFailure == nil {
+		return
+	}
+
+	// The reporter returns early unless comment reporting is enabled, so without
+	// it these annotations would sit on the Task looking configured while doing
+	// nothing. Log rather than stamp: a visible misconfiguration beats an
+	// invisible no-op.
+	if !reportingEnabled(ts) {
+		ctrl.Log.WithName("spawner").Info(
+			"Ignoring when.githubIssues.onSuccess/onFailure because reporting is not enabled; "+
+				"the label policy is applied by the reporter, so it cannot fire without it",
+			"taskspawner", ts.Name, "namespace", ts.Namespace)
+		return
+	}
+
+	if oc := issues.OnSuccess; oc != nil && len(oc.RemoveLabels) > 0 {
+		annotations[reporting.AnnotationGitHubRemoveLabelsOnSuccess] = strings.Join(oc.RemoveLabels, ",")
+	}
+
+	if fp := issues.OnFailure; fp != nil {
+		// A nil MaxAttempts means "unset", which defaults to the bead reaper's
+		// ceiling. An explicit 0 means "no ceiling" and must survive untouched.
+		maxAttempts := int32(reporting.DefaultMaxAttempts)
+		if fp.MaxAttempts != nil {
+			maxAttempts = *fp.MaxAttempts
+		}
+		annotations[reporting.AnnotationGitHubFailureMaxAttempts] = strconv.Itoa(int(maxAttempts))
+
+		prefix := fp.AttemptLabelPrefix
+		if prefix == "" {
+			prefix = reporting.DefaultAttemptLabelPrefix
+		}
+		annotations[reporting.AnnotationGitHubFailureAttemptLabelPrefix] = prefix
+
+		blocked := fp.BlockedLabel
+		if blocked == "" {
+			blocked = reporting.DefaultBlockedLabel
+		}
+		annotations[reporting.AnnotationGitHubFailureBlockedLabel] = blocked
+
+		if len(fp.RemoveLabels) > 0 {
+			annotations[reporting.AnnotationGitHubFailureRemoveLabels] = strings.Join(fp.RemoveLabels, ",")
+		}
+	}
 }
 
 // reportingEnabled returns true when GitHub comment reporting is configured
