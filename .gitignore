@@ -39,3 +39,7 @@ bin/
 .claude/
 CLAUDE.local.md
 .claude
+
+# Python bytecode (deploy/pilot/beads_reaper_test.py runs under make verify)
+__pycache__/
+*.pyc

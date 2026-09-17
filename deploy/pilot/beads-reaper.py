@@ -59,6 +59,70 @@ def task_phases():
     return {t["metadata"]["name"]: (t.get("status") or {}).get("phase", "") for t in items}
 
 
+def task_records():
+    out = subprocess.run(
+        ["kubectl", "get", "taskrecords", "-n", TASK_NAMESPACE, "-o", "json"],
+        capture_output=True, text=True, check=True).stdout
+    return latest_record_phase(json.loads(out))
+
+
+def latest_record_phase(records):
+    """Map task name -> phase of its most recently COMPLETED TaskRecord.
+
+    Several TaskRecords can share one taskRef.name, one per run, so "the"
+    record's phase is not well defined. Measured in production:
+    beads-ready-beadseed-31w has two, completing 00:21:05Z and 00:27:50Z. The
+    latest completion is the current state.
+    """
+    latest = {}
+    for record in (records or {}).get("items") or []:
+        spec = record.get("spec") or {}
+        name = (spec.get("taskRef") or {}).get("name")
+        if not name:
+            continue
+        # RFC3339 in a fixed zone sorts lexicographically. A record missing
+        # completionTime (the CRD requires it, but a malformed one must not take
+        # the sweep down) sorts below any dated record instead of raising.
+        completion = spec.get("completionTime") or ""
+        if name not in latest or completion >= latest[name][0]:
+            latest[name] = (completion, spec.get("phase"))
+    return {name: phase for name, (_, phase) in latest.items()}
+
+
+def classify_bead(task_phase, record_phase, task_name="its Task"):
+    """Return (action, reason) for one claimed bead. action is reap or leave.
+
+    A bead is reapable iff its claiming Task will never make further progress.
+    task_phase is None only when no live Task object exists.
+    """
+    if task_phase is None:
+        # An absent Task does NOT mean the work never ran. A terminal Task is
+        # deleted by ttlSecondsAfterFinished, so a SUCCESS that has since been
+        # garbage-collected looks identical to a Task that never existed -- and
+        # releasing in that case re-runs work that already succeeded. TaskRecords
+        # retain 30 days and are what distinguishes the two.
+        #
+        # This spawner sets no ttlSecondsAfterFinished today, so the case cannot
+        # arise here yet. That is an accident of configuration that anyone can
+        # remove, and it is the same inversion (a permanent claim guarded by an
+        # expiring record) that the issues path paid $1,527 for. Guard it here
+        # rather than relying on a sibling manifest's comment.
+        if record_phase == "Succeeded":
+            return "leave", f"{task_name} succeeded and was then garbage-collected"
+        if record_phase == "Failed":
+            return "reap", f"{task_name} failed and was then garbage-collected"
+        return "reap", f"{task_name} no longer exists"
+
+    if task_phase == "Failed":
+        return "reap", f"{task_name} failed"
+
+    # Running/Pending/Waiting: still working. Succeeded: an agent finished, so
+    # whether that resolved the bead is a human judgement, not ours. An
+    # unrecognised phase fails safe to leave -- never read "unknown" as "dead".
+    # A live Task is authoritative; a stale record must not override it.
+    return "leave", task_phase or "<no phase>"
+
+
 def attempts_so_far(labels):
     seen = [int(m.group(1)) for m in (ATTEMPT_RE.match(l) for l in labels) if m]
     return max(seen) if seen else 0
@@ -67,7 +131,14 @@ def attempts_so_far(labels):
 def main():
     beads = claimed_beads()
     phases = task_phases()
-    print(f"claimed by {ACTOR}: {len(beads)} | tasks for {SPAWNER}: {len(phases)}")
+    records = task_records()
+    # Report the DENOMINATORS, not just the actions taken. Every run of this job
+    # so far has printed 0 claimed beads and taken no action, and a real zero is
+    # indistinguishable from a broken query -- claimed_beads() turns empty stdout
+    # into [] silently. Printing what each source returned is what makes a future
+    # zero interpretable instead of merely reassuring.
+    print(f"claimed by {ACTOR}: {len(beads)} | tasks for {SPAWNER}: {len(phases)}"
+          f" | taskrecords: {len(records)}")
 
     released, blocked, left = [], [], []
     changed = False
@@ -79,16 +150,11 @@ def main():
             continue
 
         task_name = f"{SPAWNER}-{bid}"
-        phase = phases.get(task_name)
+        action, reason = classify_bead(
+            phases.get(task_name), records.get(task_name), f"its Task {task_name}")
 
-        if phase is None:
-            reason = f"its Task {task_name} no longer exists"
-        elif phase == "Failed":
-            reason = f"its Task {task_name} failed"
-        else:
-            # Running/Pending: still working. Succeeded: an agent finished, so
-            # resolution is a human's call, not ours.
-            left.append((bid, phase or "<no phase>"))
+        if action == "leave":
+            left.append((bid, reason))
             continue
 
         labels = bead.get("labels") or []

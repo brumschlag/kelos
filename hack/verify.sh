@@ -139,9 +139,29 @@ if ! find . -name '*.sh' -not -path './bin/*' -exec "${SHFMT}" -d -i 2 -ci {} + 
   ret=1
 fi
 
+# ---------------------------------------------------------------------------
+# 8. Run the Python tests for deploy/pilot/beads-reaper.py.
+#
+#    Wired in here on purpose rather than left standalone: a test nobody runs is
+#    not coverage. The reaper's release and block paths have never executed
+#    against a non-empty input in production, so these tests are the only oracle
+#    those decisions have. They also gate two things a comment cannot: that the
+#    ConfigMap copy of the script still matches the readable .py (the ConfigMap
+#    copy is what actually runs), and that the Role grants the taskrecords read
+#    the script now depends on.
+#
+#    `make test` is Go-only, so this is the natural home - it runs locally via
+#    `make verify` and in CI's verify job, one place for both.
+# ---------------------------------------------------------------------------
+if ! python3 -m unittest discover -s deploy/pilot -p '*_test.py' >/dev/null 2>&1; then
+  echo "ERROR: deploy/pilot Python tests failed:"
+  python3 -m unittest discover -s deploy/pilot -p '*_test.py' 2>&1 || true
+  ret=1
+fi
+
 if [[ ${ret} -ne 0 ]]; then
   echo ""
-  echo "Generated files are out of date. Run 'make update' and commit the changes."
+  echo "Generated files are out of date, or a check above failed. Run 'make update' and commit the changes."
   exit 1
 fi
 
