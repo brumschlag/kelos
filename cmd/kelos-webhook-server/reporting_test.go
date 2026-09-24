@@ -364,3 +364,37 @@ func TestReportingAnnotationPredicate_Update(t *testing.T) {
 		})
 	}
 }
+
+// The controller can mark a Task Failed before it has captured the agent's
+// response; the failed comment must be refreshed once the response arrives.
+func TestReportingAnnotationPredicate_UpdateOnLateFailedResponse(t *testing.T) {
+	annotations := map[string]string{reporting.AnnotationGitHubReporting: "enabled"}
+	tests := []struct {
+		name       string
+		phase      kelos.TaskPhase
+		oldResults map[string]string
+		newResults map[string]string
+		want       bool
+	}{
+		{name: "failed task gains response", phase: kelos.TaskPhaseFailed, newResults: map[string]string{"response": "YQ=="}, want: true},
+		{name: "failed task response unchanged", phase: kelos.TaskPhaseFailed, oldResults: map[string]string{"response": "YQ=="}, newResults: map[string]string{"response": "YQ=="}, want: false},
+		{name: "failed task gains only cost", phase: kelos.TaskPhaseFailed, newResults: map[string]string{"cost-usd": "1"}, want: false},
+		{name: "succeeded task gains response", phase: kelos.TaskPhaseSucceeded, newResults: map[string]string{"response": "YQ=="}, want: false},
+	}
+	pred := reportingAnnotationPredicate{}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			oldTask := &kelos.Task{
+				ObjectMeta: metav1.ObjectMeta{Annotations: annotations},
+				Status:     kelos.TaskStatus{Phase: tt.phase, Results: tt.oldResults},
+			}
+			newTask := &kelos.Task{
+				ObjectMeta: metav1.ObjectMeta{Annotations: annotations},
+				Status:     kelos.TaskStatus{Phase: tt.phase, Results: tt.newResults},
+			}
+			if got := pred.Update(event.UpdateEvent{ObjectOld: oldTask, ObjectNew: newTask}); got != tt.want {
+				t.Errorf("Update() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

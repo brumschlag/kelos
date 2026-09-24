@@ -100,6 +100,10 @@ const (
 	LabelSlackReporting = "kelos.dev/slack-reporting"
 )
 
+// reportPhaseFailedNoOutput is the AnnotationGitHubReportPhase value for a
+// failed Task reported before any agent response was captured.
+const reportPhaseFailedNoOutput = "failed-no-output"
+
 // TaskReporter watches Tasks and reports status changes to GitHub.
 type TaskReporter struct {
 	Client         client.Client
@@ -226,6 +230,12 @@ func (tr *TaskReporter) reportViaComment(ctx context.Context, task *kelos.Task) 
 		desiredPhase = "succeeded"
 	case kelos.TaskPhaseFailed:
 		desiredPhase = "failed"
+		// The controller can set Failed before it has captured the agent's
+		// outputs (it retries the capture). Report that state separately so
+		// the comment is updated with the cause once the response arrives.
+		if task.Status.Results["response"] == "" {
+			desiredPhase = reportPhaseFailedNoOutput
+		}
 	default:
 		return nil
 	}
@@ -275,8 +285,8 @@ func (tr *TaskReporter) reportViaComment(ctx context.Context, task *kelos.Task) 
 		body = FormatAcceptedComment(task.Name)
 	case "succeeded":
 		body = FormatSucceededComment(task.Name)
-	case "failed":
-		body = FormatFailedComment(task.Name)
+	case "failed", reportPhaseFailedNoOutput:
+		body = FormatFailedComment(task.Name, task.Status.Message, task.Status.Results)
 	}
 
 	if annotations[AnnotationGitHubCommentMode] == string(kelos.GitHubCommentModeSticky) {

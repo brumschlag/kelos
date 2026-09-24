@@ -171,7 +171,8 @@ func (r *reportingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 // reportingAnnotationPredicate filters Task events down to ones the reporter
 // actually cares about: only Tasks carrying the github-reporting annotation,
-// and only on phase transitions. Status sub-resource updates do not bump
+// and only on phase transitions or when a Failed Task's agent response is
+// captured after the transition. Status sub-resource updates do not bump
 // metadata.generation, so GenerationChangedPredicate alone would miss them.
 type reportingAnnotationPredicate struct{}
 
@@ -190,7 +191,11 @@ func (reportingAnnotationPredicate) Update(e event.UpdateEvent) bool {
 	if !ok1 || !ok2 {
 		return true
 	}
-	return oldTask.Status.Phase != newTask.Status.Phase
+	if oldTask.Status.Phase != newTask.Status.Phase {
+		return true
+	}
+	return newTask.Status.Phase == kelos.TaskPhaseFailed &&
+		oldTask.Status.Results["response"] == "" && newTask.Status.Results["response"] != ""
 }
 
 func reportingEnabled(obj client.Object) bool {

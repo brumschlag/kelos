@@ -376,6 +376,7 @@ func TestReportTaskStatus_UpdatesCommentOnFailed(t *testing.T) {
 		AnnotationGitHubCommentID:   "5555",
 		AnnotationGitHubReportPhase: "accepted",
 	})
+	task.Status.Results = map[string]string{"response": b64("It broke")}
 
 	cl := fake.NewClientBuilder().
 		WithScheme(newTestScheme()).

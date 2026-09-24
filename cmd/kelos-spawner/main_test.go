@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -2642,6 +2644,66 @@ func TestRunOnce_UsesTokenResolverForReporting(t *testing.T) {
 
 	if gotAuth != "token pat-token" {
 		t.Fatalf("Authorization = %q, want %q", gotAuth, "token pat-token")
+	}
+}
+
+// A failing discovery cycle (GitHub API error, a Task creation error for any
+// other item) must not stop status reporting for Tasks that already exist:
+// otherwise every Task of the spawner silently stops getting comments until
+// the cycle recovers.
+func TestRunOnce_ReportsTaskStatusWhenDiscoveryFails(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.When.GitHubIssues.Reporting = &kelos.GitHubReporting{Enabled: true}
+
+	task := newTask("spawner-42", "default", "spawner", kelos.TaskPhaseFailed)
+	task.Annotations = map[string]string{
+		reporting.AnnotationGitHubReporting: "enabled",
+		reporting.AnnotationSourceNumber:    "42",
+		reporting.AnnotationSourceKind:      "issue",
+	}
+	task.Status.Results = map[string]string{"response": base64.StdEncoding.EncodeToString([]byte("Autocompact is thrashing"))}
+
+	cl, key := setupTest(t, ts, task)
+
+	var (
+		mu       sync.Mutex
+		comments []string
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/issues/42/comments") {
+			var body struct {
+				Body string `json:"body"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			comments = append(comments, body.Body)
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(map[string]int64{"id": 999})
+			return
+		}
+		// Every discovery request fails.
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	_, err := runOnce(context.Background(), cl, key, spawnerRuntimeConfig{
+		GitHubOwner:      "owner",
+		GitHubRepo:       "repo",
+		GitHubAPIBaseURL: server.URL,
+		TokenResolver:    newGitHubTokenResolver("pat-token", "", "", "", ""),
+	})
+	if err == nil {
+		t.Fatal("Expected the discovery error to be returned")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(comments) != 1 {
+		t.Fatalf("Posted %d comments, want 1 failed-status comment despite the discovery error", len(comments))
+	}
+	if !strings.Contains(comments[0], "has **failed**") || !strings.Contains(comments[0], "Autocompact is thrashing") {
+		t.Fatalf("Comment = %q, want a failed comment with the cause", comments[0])
 	}
 }
 
