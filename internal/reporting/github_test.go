@@ -327,7 +327,7 @@ func TestFormatComments(t *testing.T) {
 		t.Error("Expected non-empty succeeded comment")
 	}
 
-	failed := FormatFailedComment("test-task")
+	failed := FormatFailedComment("test-task", "", nil)
 	if failed == "" {
 		t.Error("Expected non-empty failed comment")
 	}

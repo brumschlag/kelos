@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -70,18 +71,24 @@ func (r *spawnerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 func runOnce(ctx context.Context, cl client.Client, key types.NamespacedName, cfg spawnerRuntimeConfig) (time.Duration, error) {
-	if err := runCycleWithProxy(ctx, cl, key, cfg.GitHubOwner, cfg.GitHubRepo, cfg.GHProxyURL, cfg.GitHubAPIBaseURL, cfg.TokenResolver, cfg.JiraBaseURL, cfg.JiraProject, cfg.JiraJQL, cfg.HTTPClient); err != nil {
-		return 0, err
-	}
+	// A failed discovery cycle (a GitHub API error, or a creation error for
+	// any one work item) must not skip reporting: the reporting cycle covers
+	// Tasks that already exist, and skipping it silently stops status
+	// comments for every Task of this spawner until discovery recovers. The
+	// cycle error is still returned after reporting.
+	cycleErr := runCycleWithProxy(ctx, cl, key, cfg.GitHubOwner, cfg.GitHubRepo, cfg.GHProxyURL, cfg.GitHubAPIBaseURL, cfg.TokenResolver, cfg.JiraBaseURL, cfg.JiraProject, cfg.JiraJQL, cfg.HTTPClient)
 
 	var ts kelos.TaskSpawner
 	if err := cl.Get(ctx, key, &ts); err != nil {
+		if cycleErr != nil {
+			return 0, cycleErr
+		}
 		return 0, fmt.Errorf("fetching TaskSpawner after cycle: %w", err)
 	}
 
 	if reportingEnabled(&ts) || checksReportingEnabled(&ts) {
 		if cfg.TokenResolver == nil {
-			return 0, fmt.Errorf("GitHub reporting is enabled but no token resolver is configured")
+			return 0, errors.Join(cycleErr, fmt.Errorf("GitHub reporting is enabled but no token resolver is configured"))
 		}
 		resolve := cfg.TokenResolver
 		tokenFunc := func() string {
@@ -114,10 +121,13 @@ func runOnce(ctx context.Context, cl client.Client, key types.NamespacedName, cf
 			}
 		}
 		if err := runReportingCycle(ctx, cl, key, reporter); err != nil {
-			return 0, err
+			return 0, errors.Join(cycleErr, err)
 		}
 	}
 
+	if cycleErr != nil {
+		return 0, cycleErr
+	}
 	return resolvedPollInterval(&ts), nil
 }
 

@@ -3,6 +3,7 @@ package capture
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -26,14 +27,56 @@ const (
 // that no on-disk copy of the stream is required. It returns non-zero when
 // the stream cannot be processed or Claude Code reports an incomplete result.
 func Run() int {
-	return run(os.Getenv("KELOS_AGENT_TYPE"), os.Stdin, os.Stdout, os.Stderr, realRunner{})
+	thrash, err := loadThrashConfig(os.Getenv)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "kelos-capture: %v\n", err)
+		return 2
+	}
+	stopper := pidFileStopper{path: thrash.AgentPIDFile, grace: agentStopGrace}
+	return run(os.Getenv("KELOS_AGENT_TYPE"), os.Stdin, os.Stdout, os.Stderr, realRunner{}, thrash, stopper)
 }
 
-func run(agentType string, input io.Reader, stdout, stderr io.Writer, commandRunner runner) int {
-	usage, err := StreamUsage(agentType, input, stdout)
+func run(agentType string, input io.Reader, stdout, stderr io.Writer, commandRunner runner, thrash thrashConfig, stopper agentStopper) int {
+	// Autocompact thrash detection applies to Claude Code only: it relies on
+	// Claude Code's stream-json compact_boundary events.
+	var detector *thrashDetector
+	if agentType == "claude-code" {
+		detector = newThrashDetector(thrash)
+	}
+	var hook func([]byte) bool
+	cancelStop := func() {}
+	if detector != nil {
+		hook = func(line []byte) bool {
+			if !detector.addLine(line) {
+				return true
+			}
+			fmt.Fprintf(stderr, "kelos-capture: Stopping Claude Code early for autocompact thrash after %d auto-compactions\n", len(detector.compactions))
+			cancel, err := stopper.stop()
+			if err != nil {
+				// Stop reading so the agent fails on its next write once
+				// this process exits and closes the pipe.
+				fmt.Fprintf(stderr, "kelos-capture: Failed to stop Claude Code, closing its output pipe instead: %v\n", err)
+				return false
+			}
+			cancelStop = cancel
+			return true
+		}
+	}
+
+	usage, err := streamUsage(agentType, input, stdout, hook)
+	cancelStop()
 	exitCode := 0
 	if err != nil {
 		fmt.Fprintf(stderr, "kelos-capture: %v\n", err)
+		exitCode = 1
+	}
+	if detector != nil && detector.tripped {
+		// The stop is the failure cause, whatever the agent printed while
+		// shutting down.
+		if usage == nil {
+			usage = make(map[string]string)
+		}
+		usage["response"] = base64.StdEncoding.EncodeToString([]byte(detector.report()))
 		exitCode = 1
 	}
 	outputs := captureOutputs(commandRunner, usage)

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -246,7 +247,78 @@ func FormatSucceededComment(taskName string) string {
 	return fmt.Sprintf("🤖 **Kelos Task Status**\n\nTask `%s` has **succeeded**. ✅", taskName)
 }
 
-// FormatFailedComment returns the comment body for a failed task.
-func FormatFailedComment(taskName string) string {
-	return fmt.Sprintf("🤖 **Kelos Task Status**\n\nTask `%s` has **failed**. ❌", taskName)
+// maxFailureCauseChars caps how much of the agent's final message a failed
+// status comment quotes.
+const maxFailureCauseChars = 1500
+
+// secretPatterns match common credential formats. The agent's final message
+// is agent-authored text and may echo credentials it saw, so it is redacted
+// before being posted.
+// Only sk- keys require a word boundary, so text like "task-management-..."
+// is not redacted; the other prefixes are distinctive enough to match even
+// when glued to surrounding text.
+var secretPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{20,}`),
+	regexp.MustCompile(`github_pat_[A-Za-z0-9_]{20,}`),
+	regexp.MustCompile(`(?:AKIA|ASIA)[0-9A-Z]{16}`),
+	regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{20,}`),
+	regexp.MustCompile(`xox[abposr]-[A-Za-z0-9-]{10,}`),
+}
+
+func redactSecrets(s string) string {
+	for _, re := range secretPatterns {
+		s = re.ReplaceAllString(s, "[REDACTED]")
+	}
+	return s
+}
+
+// FormatFailedComment returns the comment body for a failed task. It quotes
+// the agent's final message (the base64 "response" result) as the cause,
+// redacted and truncated, plus the cost when reported. When no response was
+// captured it says so and includes the controller's status message instead.
+func FormatFailedComment(taskName, statusMessage string, results map[string]string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "🤖 **Kelos Task Status**\n\nTask `%s` has **failed**. ❌", taskName)
+
+	if response := strings.TrimSpace(decodeResponse(results["response"])); response != "" {
+		response = redactSecrets(response)
+		runes := []rune(response)
+		truncated := len(runes) > maxFailureCauseChars
+		if truncated {
+			response = string(runes[:maxFailureCauseChars])
+		}
+		fence := codeFence(response)
+		fmt.Fprintf(&b, "\n\n**Cause** (final agent message):\n\n%stext\n%s\n%s", fence, response, fence)
+		if truncated {
+			fmt.Fprintf(&b, "\n\n_Truncated: showing the first %d of %d characters._", maxFailureCauseChars, len(runes))
+		}
+	} else {
+		b.WriteString("\n\nNo agent response was captured for this run.")
+		if msg := strings.TrimSpace(statusMessage); msg != "" {
+			fmt.Fprintf(&b, "\n\n**Controller status:** %s", redactSecrets(msg))
+		}
+	}
+
+	if cost, err := strconv.ParseFloat(results["cost-usd"], 64); err == nil {
+		fmt.Fprintf(&b, "\n\n**Cost:** $%.2f", cost)
+	}
+	return b.String()
+}
+
+// codeFence returns a backtick fence longer than any backtick run in s, so s
+// cannot close the fence and inject markdown (mentions, links) into the
+// comment.
+func codeFence(s string) string {
+	longest, run := 0, 0
+	for _, r := range s {
+		if r == '`' {
+			run++
+			if run > longest {
+				longest = run
+			}
+		} else {
+			run = 0
+		}
+	}
+	return strings.Repeat("`", max(3, longest+1))
 }

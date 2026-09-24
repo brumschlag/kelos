@@ -7,6 +7,7 @@ import (
 	"io"
 	"sort"
 	"strconv"
+	"strings"
 	"text/template"
 	"time"
 
@@ -886,7 +887,7 @@ func (r *TaskReconciler) updateStatus(ctx context.Context, task *kelos.Task, job
 	} else if isJobFailed(job) {
 		if task.Status.Phase != kelos.TaskPhaseFailed {
 			newPhase = kelos.TaskPhaseFailed
-			newMessage = "Task failed"
+			newMessage = jobFailureMessage(job, pods.Items)
 			setCompletionTime = true
 			r.recordEvent(task, corev1.EventTypeWarning, "TaskFailed", "Task failed")
 			taskCompletedTotal.WithLabelValues(task.Namespace, resolveTaskType(task), string(kelos.TaskPhaseFailed)).Inc()
@@ -1398,6 +1399,72 @@ func isJobFailed(job *batchv1.Job) bool {
 		}
 	}
 	return false
+}
+
+// maxFailureMessageLen caps the Task status message built from Job and Pod
+// failure details.
+const maxFailureMessageLen = 1024
+
+// jobFailureMessage describes why a Task's Job failed, from the Job's Failed
+// condition and the latest Pod's agent container termination, so the cause
+// is visible on the Task (and in status reports) even when the agent
+// produced no outputs.
+func jobFailureMessage(job *batchv1.Job, pods []corev1.Pod) string {
+	var details []string
+	for _, c := range job.Status.Conditions {
+		if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue {
+			if detail := joinReasonMessage(c.Reason, c.Message); detail != "" {
+				details = append(details, detail)
+			}
+			break
+		}
+	}
+
+	latest := latestTaskPodName(pods)
+	for i := range pods {
+		pod := &pods[i]
+		if pod.Name != latest {
+			continue
+		}
+		containerDetail := ""
+		for _, cs := range pod.Status.ContainerStatuses {
+			if cs.Name != kelos.AgentContainerName || cs.State.Terminated == nil {
+				continue
+			}
+			term := cs.State.Terminated
+			containerDetail = fmt.Sprintf("container %s in pod %s terminated (reason=%s, exitCode=%d)", cs.Name, pod.Name, term.Reason, term.ExitCode)
+			if msg := strings.TrimSpace(term.Message); msg != "" {
+				containerDetail += ": " + msg
+			}
+		}
+		if containerDetail != "" {
+			details = append(details, containerDetail)
+		} else if detail := joinReasonMessage(pod.Status.Reason, pod.Status.Message); detail != "" {
+			details = append(details, fmt.Sprintf("pod %s: %s", pod.Name, detail))
+		}
+		break
+	}
+
+	msg := "Task failed"
+	if len(details) > 0 {
+		msg += ": " + strings.Join(details, "; ")
+	}
+	if len(msg) > maxFailureMessageLen {
+		msg = msg[:maxFailureMessageLen-3] + "..."
+	}
+	return msg
+}
+
+func joinReasonMessage(reason, message string) string {
+	reason, message = strings.TrimSpace(reason), strings.TrimSpace(message)
+	switch {
+	case reason != "" && message != "":
+		return reason + ": " + message
+	case reason != "":
+		return reason
+	default:
+		return message
+	}
 }
 
 // SetupWithManager sets up the controller with the Manager.
