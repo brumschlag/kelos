@@ -1,0 +1,55 @@
+Ignoring 2 permissions.allow entries from .claude/settings.json: this workspace has not been trusted. Run Claude Code interactively here once and accept the trust dialog, or set projects["/workspace/r
+[mcp-sdk] SEP-2352: stored OAuth credential has no 'issuer' stamp (pre-upgrade storage or provider not round-tripping the value). SEP-2352 isolation is inactive for this read; ensure your provider rou
+[claude-code:unrecognized_model] {"model":"claude-opus-55","query_source":"sdk"}
+{"type":"system","subtype":"init"}
+{"type":"assistant","message":{"id":"msg_bdrk_mtieefshv3dfwruxorayzsnmegzacvxvhbjhw2j7kkzdel5wvowa","content":[{"type":"thinking"}]}}
+{"type":"assistant","message":{"id":"msg_bdrk_mtieefshv3dfwruxorayzsnmegzacvxvhbjhw2j7kkzdel5wvowa","content":[{"type":"tool_use","name":"Bash"}]}}
+{"type":"user","message":{"content":[{"type":"tool_result"}]}}
+{"type":"assistant","message":{"id":"msg_bdrk_wse24uwpykhupwul6izlmdo3apjuyiaag3hf2tp66sgnuas4jvma","content":[{"type":"tool_use","name":"Read"}]}}
+{"type":"user","message":{"content":[{"type":"tool_result"}]}}
+{"type":"assistant","message":{"id":"msg_bdrk_wse24uwpykhupwul6izlmdo3apjuyiaag3hf2tp66sgnuas4jvma","content":[{"type":"tool_use","name":"Read"}]}}
+{"type":"user","message":{"content":[{"type":"tool_result"}]}}
+{"type":"assistant","message":{"id":"msg_bdrk_wse24uwpykhupwul6izlmdo3apjuyiaag3hf2tp66sgnuas4jvma","content":[{"type":"tool_use","name":"Read"}]}}
+{"type":"user","message":{"content":[{"type":"tool_result"}]}}
+{"type":"assistant","message":{"id":"msg_bdrk_wse24uwpykhupwul6izlmdo3apjuyiaag3hf2tp66sgnuas4jvma","content":[{"type":"tool_use","name":"Read"}]}}
+{"type":"user","message":{"content":[{"type":"tool_result"}]}}
+{"type":"assistant","message":{"id":"msg_bdrk_wse24uwpykhupwul6izlmdo3apjuyiaag3hf2tp66sgnuas4jvma","content":[{"type":"tool_use","name":"Read"}]}}
+{"type":"user","message":{"content":[{"type":"tool_result"}]}}
+{"type":"system","subtype":"status"}
+{"type":"system","subtype":"status"}
+{"type":"system","subtype":"status"}
+{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":169394,"post_tokens":10073}}
+{"type":"user","message":{"content":[{"type":"text"}]}}
+{"type":"assistant","message":{"id":"msg_bdrk_ned6cifrcg5suvygzywxx2qvycbqqdj7fdm3uwnpoizxmutxfolq","content":[{"type":"thinking"}]}}
+{"type":"assistant","message":{"id":"msg_bdrk_ned6cifrcg5suvygzywxx2qvycbqqdj7fdm3uwnpoizxmutxfolq","content":[{"type":"tool_use","name":"mcp__graphiti-internal__search_memory_facts"}]}}
+{"type":"user","message":{"content":[{"type":"tool_result"}]}}
+{"type":"assistant","message":{"id":"msg_bdrk_ned6cifrcg5suvygzywxx2qvycbqqdj7fdm3uwnpoizxmutxfolq","content":[{"type":"tool_use","name":"mcp__graphiti-internal__search_nodes"}]}}
+{"type":"assistant","message":{"id":"msg_bdrk_ned6cifrcg5suvygzywxx2qvycbqqdj7fdm3uwnpoizxmutxfolq","content":[{"type":"tool_use","name":"Bash"}]}}
+{"type":"user","message":{"content":[{"type":"tool_result"}]}}
+{"type":"user","message":{"content":[{"type":"tool_result"}]}}
+{"type":"system","subtype":"status"}
+{"type":"system","subtype":"status"}
+{"type":"system","subtype":"status"}
+{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":169113,"post_tokens":7152}}
+{"type":"user","message":{"content":[{"type":"text"}]}}
+{"type":"assistant","message":{"id":"msg_bdrk_zcrcp5zkdpjlqywcjknqdvw66flpwyeqy336ewoq6gmifnyf6ahq","content":[{"type":"thinking"}]}}
+{"type":"assistant","message":{"id":"msg_bdrk_zcrcp5zkdpjlqywcjknqdvw66flpwyeqy336ewoq6gmifnyf6ahq","content":[{"type":"tool_use","name":"Bash"}]}}
+{"type":"user","message":{"content":[{"type":"tool_result"}]}}
+{"type":"assistant","message":{"id":"msg_bdrk_ww3q3meflwtwwg4i6xoxr347mqnj3pttftlktbh4llcv6dzqogla","content":[{"type":"tool_use","name":"Read"}]}}
+{"type":"user","message":{"content":[{"type":"tool_result"}]}}
+{"type":"system","subtype":"status"}
+{"type":"system","subtype":"status"}
+{"type":"system","subtype":"status"}
+{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":166436,"post_tokens":7589}}
+{"type":"user","message":{"content":[{"type":"text"}]}}
+{"type":"assistant","message":{"id":"msg_bdrk_gob2mhjdbuzq3aqwykkebblbxwscl73upvjefdbcrznotruwklpa","content":[{"type":"tool_use","name":"Bash"}]}}
+{"type":"user","message":{"content":[{"type":"tool_result"}]}}
+{"type":"assistant","message":{"id":"msg_bdrk_gob2mhjdbuzq3aqwykkebblbxwscl73upvjefdbcrznotruwklpa","content":[{"type":"tool_use","name":"Bash"}]}}
+{"type":"user","message":{"content":[{"type":"tool_result"}]}}
+{"type":"assistant","message":{"id":"msg_bdrk_rgrfsivr5it3f7ea5ddzkis5mbkj3f6edaume4moqvruofm54eoa","content":[{"type":"thinking"}]}}
+{"type":"assistant","message":{"id":"msg_bdrk_rgrfsivr5it3f7ea5ddzkis5mbkj3f6edaume4moqvruofm54eoa","content":[{"type":"tool_use","name":"Bash"}]}}
+{"type":"user","message":{"content":[{"type":"tool_result"}]}}
+{"type":"assistant","message":{"id":"msg_bdrk_rgrfsivr5it3f7ea5ddzkis5mbkj3f6edaume4moqvruofm54eoa","content":[{"type":"tool_use","name":"Read"}]}}
+{"type":"user","message":{"content":[{"type":"tool_result"}]}}
+{"type":"assistant","message":{"id":"562bc86a-b772-4633-a68c-73a02b59c812","content":[{"type":"text"}]}}
+{"type":"result","subtype":"success","is_error":true,"num_turns":19,"total_cost_usd":3.9937039999999997,"usage":{"input_tokens":14,"output_tokens":2352},"result":"Autocompact is thrashing: the context refilled to the limit within 3 turns of the previous compact, 3 times in a row. A file being read or a tool output is likely too large for the context window. Try reading in smaller chunks, or use /clear to start fresh.","terminal_reason":"rapid_refill_breaker","stop_reason":"stop_sequence"}

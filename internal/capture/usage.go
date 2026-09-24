@@ -57,6 +57,13 @@ func newUsageAccumulator(agentType string) usageAccumulator {
 // forwarded faithfully (memory cost is bounded by the longest line, which
 // the agent producer is already holding).
 func StreamUsage(agentType string, r io.Reader, w io.Writer) (usage map[string]string, err error) {
+	return streamUsage(agentType, r, w, nil)
+}
+
+// streamUsage is StreamUsage with an optional per-line hook. The hook sees
+// each line (without its newline) after it has been forwarded to w; when it
+// returns false, reading stops early and the usage parsed so far is returned.
+func streamUsage(agentType string, r io.Reader, w io.Writer, hook func(line []byte) bool) (usage map[string]string, err error) {
 	acc := newUsageAccumulator(agentType)
 	bw := bufio.NewWriter(w)
 	defer func() {
@@ -80,14 +87,15 @@ func StreamUsage(agentType string, r io.Reader, w io.Writer) (usage map[string]s
 					return nil, werr
 				}
 			}
-			if acc != nil {
-				body := line
-				if body[len(body)-1] == '\n' {
-					body = body[:len(body)-1]
-				}
-				if len(body) > 0 {
-					acc.addLine(body)
-				}
+			body := line
+			if body[len(body)-1] == '\n' {
+				body = body[:len(body)-1]
+			}
+			if acc != nil && len(body) > 0 {
+				acc.addLine(body)
+			}
+			if hook != nil && len(body) > 0 && !hook(body) {
+				break
 			}
 		}
 		if readErr != nil {

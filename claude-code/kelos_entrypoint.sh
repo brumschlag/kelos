@@ -90,8 +90,22 @@ if [ -n "${KELOS_PLUGIN_DIR:-}" ] && [ -d "${KELOS_PLUGIN_DIR}" ]; then
   done
 fi
 
-claude "${ARGS[@]}" | /kelos/kelos-capture
+# Record Claude Code's PID so kelos-capture can stop it early when it detects
+# autocompact thrash. The group records its own PID and then execs claude, so
+# the recorded PID is the claude process itself.
+KELOS_AGENT_PID_FILE="$(mktemp 2>/dev/null || true)"
+export KELOS_AGENT_PID_FILE
+
+{
+  if [ -n "$KELOS_AGENT_PID_FILE" ]; then
+    printf '%s\n' "$BASHPID" >"$KELOS_AGENT_PID_FILE"
+  fi
+  exec claude "${ARGS[@]}"
+} | /kelos/kelos-capture
 PIPE_EXIT_CODES=("${PIPESTATUS[@]}")
+if [ -n "$KELOS_AGENT_PID_FILE" ]; then
+  rm -f "$KELOS_AGENT_PID_FILE"
+fi
 AGENT_EXIT_CODE=${PIPE_EXIT_CODES[0]}
 CAPTURE_EXIT_CODE=${PIPE_EXIT_CODES[1]}
 

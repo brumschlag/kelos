@@ -325,7 +325,7 @@ func TestRunClaudeCodeResultStatus(t *testing.T) {
 				"git rev-parse --is-inside-work-tree": {err: fmt.Errorf("not a git repo")},
 			}}
 			var stdout, stderr bytes.Buffer
-			gotCode := run("claude-code", strings.NewReader(tt.input), &stdout, &stderr, commandRunner)
+			gotCode := run("claude-code", strings.NewReader(tt.input), &stdout, &stderr, commandRunner, thrashConfig{MaxRepeats: defaultThrashMaxRepeats, WindowTurns: defaultThrashWindowTurns}, &fakeStopper{})
 			if gotCode != tt.wantCode {
 				t.Fatalf("run() exit code = %d, want %d", gotCode, tt.wantCode)
 			}

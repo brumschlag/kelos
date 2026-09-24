@@ -274,6 +274,25 @@ usual outputs in that case and returns non-zero, so the Job's retry reruns the
 agent. The `response` output is still captured on the failing attempt, so the
 agent's final message is recorded in the Task's results either way.
 
+For Claude Code, `kelos-capture` also stops a run early on autocompact thrash:
+when an automatic compaction follows the previous one after fewer than
+`KELOS_THRASH_WINDOW_TURNS` assistant turns (default `3`),
+`KELOS_THRASH_MAX_REPEATS` times in a row (default `1`, i.e. on the first
+repeat), it sends `SIGTERM` to Claude Code (then `SIGKILL` after 30 seconds),
+sets the `response` output to a message naming the compaction count and each
+compaction's `pre_tokens`, and returns non-zero so the Task fails. Manual
+compactions are ignored, and a compaction that is not followed by another one
+within the window does not stop the run. Setting either variable to `0`
+disables the check; a non-integer or negative value makes `kelos-capture` exit
+with an error. Because a stopped run exits before Claude Code writes its final
+result, `cost-usd` and token counts are usually not reported for it. Set these
+variables through `Task.spec.podOverrides.env`. The check needs the agent's PID
+in the file named by `KELOS_AGENT_PID_FILE`; the reference entrypoint records it
+by running `claude` from a pipeline group that writes `$BASHPID` to that file and
+then `exec`s the agent (the entrypoint itself keeps running). Without a PID,
+`kelos-capture` stops reading the stream instead, so the agent fails on its next
+write once `kelos-capture` exits.
+
 Also use `set -uo pipefail` (without `-e`) so the capture step runs even if
 the agent exits non-zero.
 

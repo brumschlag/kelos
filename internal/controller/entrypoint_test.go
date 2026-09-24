@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestAgentEntrypointsHandleKelosEffort(t *testing.T) {
@@ -206,6 +207,71 @@ func TestClaudeEntrypointPropagatesPipelineFailures(t *testing.T) {
 				t.Fatalf("entrypoint exit code = %d, want %d: %v\n%s", gotExitCode, tt.wantExitCode, runErr, output)
 			}
 		})
+	}
+}
+
+// kelos-capture stops Claude Code early on autocompact thrash by signalling
+// the PID in KELOS_AGENT_PID_FILE. That PID must be the claude process itself
+// (not a wrapper subshell), and the stopped run must fail the entrypoint.
+func TestClaudeEntrypointLetsCaptureStopAgent(t *testing.T) {
+	tmp := t.TempDir()
+	home := filepath.Join(tmp, "home")
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	agentPIDOut := filepath.Join(tmp, "agent-pid")
+	signalledPIDOut := filepath.Join(tmp, "signalled-pid")
+
+	// The fake agent records its own PID, emits one line, then keeps running
+	// as if it were still working.
+	writeFile(t, filepath.Join(tmp, "claude"), "#!/bin/bash\nprintf '%s' \"$$\" >\"$FAKE_AGENT_PID_OUT\"\nprintf '%s\\n' '{\"type\":\"system\"}'\nexec sleep 30\n")
+	if err := os.Chmod(filepath.Join(tmp, "claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The fake capture stops the agent through the PID file, as
+	// kelos-capture does on thrash, then drains the stream and fails.
+	capturePath := filepath.Join(tmp, "kelos-capture")
+	writeFile(t, capturePath, "#!/bin/bash\nread -r _\npid=\"$(cat \"$KELOS_AGENT_PID_FILE\")\"\nprintf '%s' \"$pid\" >\"$FAKE_SIGNALLED_PID_OUT\"\nkill -TERM \"$pid\"\ncat >/dev/null\nexit 1\n")
+	if err := os.Chmod(capturePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	entrypointData, err := os.ReadFile("../../claude-code/kelos_entrypoint.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entrypointPath := filepath.Join(tmp, "kelos_entrypoint.sh")
+	writeFile(t, entrypointPath, strings.ReplaceAll(string(entrypointData), "/kelos/kelos-capture", capturePath))
+	if err := os.Chmod(entrypointPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	command := exec.Command("bash", entrypointPath, "test prompt")
+	command.Env = []string{
+		"HOME=" + home,
+		"TMPDIR=" + tmp,
+		"PATH=" + tmp + ":/usr/bin:/bin",
+		"FAKE_AGENT_PID_OUT=" + agentPIDOut,
+		"FAKE_SIGNALLED_PID_OUT=" + signalledPIDOut,
+	}
+	start := time.Now()
+	output, _ := command.CombinedOutput()
+	if elapsed := time.Since(start); elapsed > 20*time.Second {
+		t.Fatalf("Entrypoint took %v; the agent was not stopped\n%s", elapsed, output)
+	}
+	if code := command.ProcessState.ExitCode(); code == 0 {
+		t.Fatalf("Entrypoint exit code = 0, want non-zero for a stopped agent\n%s", output)
+	}
+	agentPID, err := os.ReadFile(agentPIDOut)
+	if err != nil {
+		t.Fatalf("Reading fake agent PID: %v\n%s", err, output)
+	}
+	signalledPID, err := os.ReadFile(signalledPIDOut)
+	if err != nil {
+		t.Fatalf("Reading signalled PID: %v\n%s", err, output)
+	}
+	if len(agentPID) == 0 || string(signalledPID) != string(agentPID) {
+		t.Fatalf("KELOS_AGENT_PID_FILE held PID %q, want the claude process PID %q\n%s", signalledPID, agentPID, output)
 	}
 }
 
