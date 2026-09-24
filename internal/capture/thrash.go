@@ -32,6 +32,13 @@ const (
 	agentStopGrace = 30 * time.Second
 )
 
+// ExitThrashStopped is kelos-capture's exit code after it stops the agent for
+// autocompact thrash. It is 143 (128+SIGTERM) so that it is one of the
+// controller's default --agent-fail-fast-exit-codes and the Job fails instead
+// of retrying; the claude-code entrypoint passes it through whatever the agent
+// exited with, because a SIGTERM-handling agent may exit 0 or 1.
+const ExitThrashStopped = 143
+
 // thrashConfig configures autocompact thrash detection.
 type thrashConfig struct {
 	MaxRepeats   int

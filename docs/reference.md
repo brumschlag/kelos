@@ -20,7 +20,7 @@ Exactly one execution source is required: `spec.worker` (preferred), `spec.worke
 | `spec.dependsOn` | Task names that must succeed before this Task starts (creates `Waiting` phase). Not supported with `workerPoolRef` | No |
 | `spec.branch` | Git branch to work on; only one Task with the same branch runs at a time (mutex). Not supported with `workerPoolRef` | No |
 | `spec.ttlSecondsAfterFinished` | Auto-delete task after N seconds (0 for immediate) | No |
-| `spec.podFailurePolicy` | Kubernetes Job pod failure policy copied to `Job.spec.podFailurePolicy`. If omitted, Kelos leaves it unset and Kubernetes default Job failure handling applies | No |
+| `spec.podFailurePolicy` | Kubernetes Job pod failure policy copied to `Job.spec.podFailurePolicy`, replacing the controller default. If omitted, Kelos applies the controller default policy (see [Task Pod Failure Policy](#task-pod-failure-policy)) | No |
 | `spec.podOverrides` | **(Deprecated)** Pod customization — use `spec.worker.podOverrides` instead | Legacy |
 | `spec.podOverrides.labels` | Additional labels to apply to the Job and its Pod. Merged with built-in labels; built-in labels take precedence on conflict | No |
 | `spec.podOverrides.resources` | CPU/memory requests and limits for the agent container | No |
@@ -48,7 +48,25 @@ If an existing manifest uses a user volume name such as `kelos-cache`, rename th
 
 `spec.podFailurePolicy` accepts Kubernetes Job `podFailurePolicy` rules except `FailIndex`, which only applies to indexed Jobs and is rejected for Kelos Task Jobs. Kelos copies the field as a complete policy; it does not merge in default rules. Rule order matters because Kubernetes stops evaluating after the first match.
 
-When the field is omitted, Kelos leaves `Job.spec.podFailurePolicy` unset. To ignore infrastructure disruptions while still failing the Job on non-zero container exits, set the policy explicitly:
+When the field is omitted, Kelos applies a default policy so that an agent container killed at its memory limit (`OOMKilled`, exit 137) or stopped by SIGTERM (exit 143, e.g. the `kelos-capture` autocompact-thrash stop) fails the Task immediately instead of being retried with the same limits:
+
+```yaml
+podFailurePolicy:
+  rules:
+    - action: Ignore
+      onPodConditions:
+        - type: DisruptionTarget
+          status: "True"
+    - action: FailJob
+      onExitCodes:
+        containerName: kelos-agent
+        operator: In
+        values: [137, 143]
+```
+
+Pod disruptions (preemption, eviction, node drain) do not count against the Job's backoff limit, and other agent exit codes, as well as failures of init or extra containers, still follow the backoff limit. The Task's failure message states the exit code, termination reason, agent memory limit, and attempt count. Configure the exit codes with the controller flag `--agent-fail-fast-exit-codes` (default `137,143`); set it to an empty value to leave `Job.spec.podFailurePolicy` unset for Tasks that omit the field.
+
+To ignore infrastructure disruptions while failing the Job on any non-zero container exit, set the policy explicitly:
 
 ```yaml
 spec:
@@ -854,7 +872,7 @@ to receive refreshed credentials during long-running work.
 | `spec.taskTemplate.branch` | Git branch template for spawned Tasks (supports Go template variables, e.g., `kelos-task-{{.Number}}`). Not supported with `workerPoolRef` | No |
 | `spec.taskTemplate.nameTemplate` | Go text/template for the spawned Task's name (overrides the default naming below). The rendered value is lowercased, sanitized to a valid resource name, and truncated to 63 characters. Use a deterministic template (e.g. `{{.Number}}`) to deduplicate Tasks: work items that render to the same name reuse the existing Task instead of creating a duplicate — the recommended way to avoid duplicate Tasks from multiple GitHub webhook deliveries for the same pull request. Names must be unique across the whole namespace; a collision with a Task owned by a different TaskSpawner (or any unrelated Task) is an error, not deduplication (see [Generated Task Names](#generated-task-names)). Keep the identifying part within the first 63 characters. `.Context.NAME` is not available to `nameTemplate` on any source — a Task's identity must not depend on mutable external data | No |
 | `spec.taskTemplate.ttlSecondsAfterFinished` | Auto-delete spawned tasks after N seconds | No |
-| `spec.taskTemplate.podFailurePolicy` | Kubernetes Job pod failure policy copied to spawned Tasks as `Task.spec.podFailurePolicy` | No |
+| `spec.taskTemplate.podFailurePolicy` | Kubernetes Job pod failure policy copied to spawned Tasks as `Task.spec.podFailurePolicy`. If omitted, spawned Tasks get the controller default policy (see [Task Pod Failure Policy](#task-pod-failure-policy)) | No |
 | `spec.taskTemplate.podOverrides` | **(Deprecated)** Pod customization — use `taskTemplate.worker.podOverrides` instead | Legacy |
 | `spec.taskTemplate.metadata.labels` | Labels merged into spawned Tasks; values support the same Go template variables as `branch`/`promptTemplate`; `kelos.dev/taskspawner` and, when `spec.credentials` is configured, `kelos.dev/spawner-credential` are reserved and override conflicting user values | No |
 | `spec.taskTemplate.metadata.annotations` | Annotations merged into spawned Tasks; values support the same Go template variables as `branch`/`promptTemplate`; source annotations (e.g. `kelos.dev/source-kind`) are applied after rendering and override conflicting user values | No |

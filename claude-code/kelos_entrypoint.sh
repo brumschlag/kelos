@@ -109,6 +109,14 @@ fi
 AGENT_EXIT_CODE=${PIPE_EXIT_CODES[0]}
 CAPTURE_EXIT_CODE=${PIPE_EXIT_CODES[1]}
 
+# 143 from kelos-capture means it stopped the agent for autocompact thrash
+# (capture.ExitThrashStopped). Surface it whatever the agent exited with: an
+# agent that handles SIGTERM may exit 0 or 1, and only 143 matches the
+# controller's podFailurePolicy FailJob rule that stops a pointless retry.
+if [ "$CAPTURE_EXIT_CODE" -eq 143 ]; then
+  exit 143
+fi
+
 if [ "$AGENT_EXIT_CODE" -ne 0 ]; then
   exit "$AGENT_EXIT_CODE"
 fi

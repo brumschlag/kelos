@@ -1411,8 +1411,10 @@ const maxFailureMessageLen = 1024
 // produced no outputs.
 func jobFailureMessage(job *batchv1.Job, pods []corev1.Pod) string {
 	var details []string
+	failedReason := ""
 	for _, c := range job.Status.Conditions {
 		if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue {
+			failedReason = c.Reason
 			if detail := joinReasonMessage(c.Reason, c.Message); detail != "" {
 				details = append(details, detail)
 			}
@@ -1421,6 +1423,16 @@ func jobFailureMessage(job *batchv1.Job, pods []corev1.Pod) string {
 	}
 
 	latest := latestTaskPodName(pods)
+	if failedReason == batchv1.JobReasonPodFailurePolicy {
+		// The summary already names the agent container's exit and pod.
+		if summary, termMessage := podFailurePolicySummary(job, pods, latest); summary != "" {
+			details = append([]string{summary}, details...)
+			if termMessage != "" {
+				details = append(details, termMessage)
+			}
+			return capFailureMessage("Task failed: " + strings.Join(details, "; "))
+		}
+	}
 	for i := range pods {
 		pod := &pods[i]
 		if pod.Name != latest {
@@ -1449,10 +1461,87 @@ func jobFailureMessage(job *batchv1.Job, pods []corev1.Pod) string {
 	if len(details) > 0 {
 		msg += ": " + strings.Join(details, "; ")
 	}
+	return capFailureMessage(msg)
+}
+
+func capFailureMessage(msg string) string {
 	if len(msg) > maxFailureMessageLen {
 		msg = msg[:maxFailureMessageLen-3] + "..."
 	}
 	return msg
+}
+
+// podFailurePolicySummary explains, in plain terms, a Job that a
+// podFailurePolicy FailJob rule failed without a retry, from the latest
+// Pod's agent container termination. It returns "" when the agent container
+// did not exit non-zero, e.g. when a Task-level rule matched another container.
+// It also returns the termination message, if any.
+func podFailurePolicySummary(job *batchv1.Job, pods []corev1.Pod, latest string) (string, string) {
+	for i := range pods {
+		pod := &pods[i]
+		if pod.Name != latest {
+			continue
+		}
+		term := agentContainerTermination(pod)
+		if term == nil || term.ExitCode == 0 {
+			return "", ""
+		}
+		var why string
+		switch {
+		case term.Reason == "OOMKilled":
+			why = "a retry would OOM again"
+			if limit, ok := agentContainerMemoryLimit(pod); ok {
+				why = fmt.Sprintf("same limit would OOM again (memory limit %s)", limit.String())
+			}
+		case term.ExitCode == 137:
+			why = "agent was killed with SIGKILL"
+		case term.ExitCode == 143:
+			why = "agent was stopped with SIGTERM (e.g. kelos-capture autocompact-thrash stop)"
+		default:
+			why = "exit code matched a podFailurePolicy FailJob rule"
+		}
+		reason := strings.TrimSpace(term.Reason)
+		if reason == "" {
+			reason = "unknown reason"
+		}
+		summary := fmt.Sprintf("agent container exited %d (%s) — not retried: %s; pod %s", term.ExitCode, reason, why, pod.Name)
+		if job.Status.Failed > 0 {
+			summary += fmt.Sprintf(", attempt %d", job.Status.Failed)
+			if job.Spec.BackoffLimit != nil {
+				summary += fmt.Sprintf(" of %d", *job.Spec.BackoffLimit+1)
+			}
+		}
+		return summary, strings.TrimSpace(term.Message)
+	}
+	return "", ""
+}
+
+// agentContainerTermination returns the agent container's termination from
+// state.terminated, falling back to lastState.terminated.
+func agentContainerTermination(pod *corev1.Pod) *corev1.ContainerStateTerminated {
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.Name != kelos.AgentContainerName {
+			continue
+		}
+		if cs.State.Terminated != nil {
+			return cs.State.Terminated
+		}
+		return cs.LastTerminationState.Terminated
+	}
+	return nil
+}
+
+// agentContainerMemoryLimit returns the agent container's memory limit from
+// the Pod spec, if one is set.
+func agentContainerMemoryLimit(pod *corev1.Pod) (resource.Quantity, bool) {
+	for _, c := range pod.Spec.Containers {
+		if c.Name != kelos.AgentContainerName {
+			continue
+		}
+		limit, ok := c.Resources.Limits[corev1.ResourceMemory]
+		return limit, ok
+	}
+	return resource.Quantity{}, false
 }
 
 func joinReasonMessage(reason, message string) string {

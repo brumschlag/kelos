@@ -414,8 +414,12 @@ type TaskSpec struct {
 	TTLSecondsAfterFinished *int32 `json:"ttlSecondsAfterFinished,omitempty"`
 
 	// PodFailurePolicy specifies how failed pods affect the backing Job's
-	// retry accounting. If unset, Kelos leaves Job.spec.podFailurePolicy unset
-	// and Kubernetes default Job handling applies.
+	// retry accounting. When set, it replaces the controller default. If
+	// unset, Kelos applies the controller default: disruptions are ignored and
+	// the Job fails without a retry when the agent container exits with one
+	// of the controller's --agent-fail-fast-exit-codes (default 137,143). If
+	// that flag is empty, Job.spec.podFailurePolicy is left unset and
+	// Kubernetes default Job handling applies.
 	// +optional
 	// +kubebuilder:validation:XValidation:rule="self.rules.all(r, r.action != 'FailIndex')",message="podFailurePolicy.rules[].action FailIndex is not supported for Task Jobs"
 	PodFailurePolicy *batchv1.PodFailurePolicy `json:"podFailurePolicy,omitempty"`

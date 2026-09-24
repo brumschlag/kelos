@@ -106,6 +106,7 @@ func main() {
 	var workerRunnerImagePullPolicy string
 	var sessionRuntimeImage string
 	var sessionRuntimeImagePullPolicy string
+	var agentFailFastExitCodes string
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -143,6 +144,7 @@ func main() {
 	flag.StringVar(&workerRunnerImagePullPolicy, "worker-runner-image-pull-policy", "", "The image pull policy for worker-runner containers (e.g., Always, Never, IfNotPresent).")
 	flag.StringVar(&sessionRuntimeImage, "session-runtime-image", controller.SessionRuntimeImageRepository, "The image repository or tagged image used to inject the runtime into Session Pods.")
 	flag.StringVar(&sessionRuntimeImagePullPolicy, "session-runtime-image-pull-policy", "", "The image pull policy for the Session runtime image (e.g., Always, Never, IfNotPresent).")
+	flag.StringVar(&agentFailFastExitCodes, "agent-fail-fast-exit-codes", controller.FormatExitCodes(controller.DefaultAgentFailFastExitCodes), "Comma-separated agent container exit codes that fail a Task's Job without a retry, for Tasks without their own spec.podFailurePolicy (137: SIGKILL/OOMKilled, 143: SIGTERM/autocompact-thrash stop). Set to an empty value to leave Job.spec.podFailurePolicy unset.")
 
 	opts, applyVerbosity := logging.SetupZapOptions(flag.CommandLine)
 	flag.Parse()
@@ -192,6 +194,11 @@ func main() {
 	limits, err := controller.ParseResourceList(spawnerResourceLimits)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error parsing --spawner-resource-limits: %v\n", err)
+		os.Exit(1)
+	}
+	failFastExitCodes, err := controller.ParseExitCodes(agentFailFastExitCodes)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing --agent-fail-fast-exit-codes: %v\n", err)
 		os.Exit(1)
 	}
 	if requests != nil || limits != nil {
@@ -278,6 +285,7 @@ func main() {
 	jobBuilder.CursorImagePullPolicy = corev1.PullPolicy(cursorImagePullPolicy)
 	jobBuilder.GrokImage = grokImage
 	jobBuilder.GrokImagePullPolicy = corev1.PullPolicy(grokImagePullPolicy)
+	jobBuilder.AgentFailFastExitCodes = failFastExitCodes
 	if err = (&controller.TaskReconciler{
 		Client:       mgr.GetClient(),
 		Scheme:       mgr.GetScheme(),
