@@ -163,6 +163,12 @@ func TestClaudeEntrypointPropagatesPipelineFailures(t *testing.T) {
 		{name: "success", agentExitCode: "0", captureExitCode: "0", wantExitCode: 0},
 		{name: "capture failure", agentExitCode: "0", captureExitCode: "7", wantExitCode: 7},
 		{name: "agent failure takes precedence", agentExitCode: "6", captureExitCode: "7", wantExitCode: 6},
+		// A thrash stop must surface as 143 however the agent exited, so the
+		// controller's podFailurePolicy FailJob rule fails the Job instead of
+		// retrying: a clean SIGTERM exit (0) or an error exit (1) would otherwise
+		// be retried silently.
+		{name: "thrash stop wins over a clean agent exit", agentExitCode: "0", captureExitCode: "143", wantExitCode: 143},
+		{name: "thrash stop wins over an agent error exit", agentExitCode: "1", captureExitCode: "143", wantExitCode: 143},
 	}
 
 	for _, tt := range tests {

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
+	"slices"
+	"strconv"
 	"strings"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -151,7 +153,17 @@ type JobBuilder struct {
 	CursorImagePullPolicy     corev1.PullPolicy
 	GrokImage                 string
 	GrokImagePullPolicy       corev1.PullPolicy
+	// AgentFailFastExitCodes are the agent container exit codes that fail the
+	// Job immediately instead of consuming backoffLimit retries. It applies
+	// only to Tasks without their own spec.podFailurePolicy. Empty disables
+	// the default policy, leaving Job.spec.podFailurePolicy unset.
+	AgentFailFastExitCodes []int32
 }
+
+// DefaultAgentFailFastExitCodes are the agent container exit codes that fail a
+// Task's Job without a retry: 137 (SIGKILL, including OOMKilled at the memory
+// limit) and 143 (SIGTERM, including kelos-capture's autocompact-thrash stop).
+var DefaultAgentFailFastExitCodes = []int32{137, 143}
 
 // NewJobBuilder creates a new JobBuilder.
 func NewJobBuilder() *JobBuilder {
@@ -162,6 +174,8 @@ func NewJobBuilder() *JobBuilder {
 		OpenCodeImage:   OpenCodeImage,
 		CursorImage:     CursorImage,
 		GrokImage:       GrokImage,
+
+		AgentFailFastExitCodes: append([]int32(nil), DefaultAgentFailFastExitCodes...),
 	}
 }
 
@@ -977,7 +991,7 @@ fi`,
 		},
 		Spec: batchv1.JobSpec{
 			BackoffLimit:          &backoffLimit,
-			PodFailurePolicy:      task.Spec.PodFailurePolicy,
+			PodFailurePolicy:      b.podFailurePolicy(task),
 			ActiveDeadlineSeconds: activeDeadlineSeconds,
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
@@ -1048,6 +1062,88 @@ func sanitizeWorkspaceFilePath(filePath string) (string, error) {
 
 func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
+}
+
+// podFailurePolicy returns the Task's own podFailurePolicy verbatim when set
+// (it is not merged with the default), otherwise the controller default built
+// from AgentFailFastExitCodes, or nil when that is empty.
+//
+// The default ignores disruptions first, so preemption, API eviction and
+// node drain, which SIGTERM (143) or SIGKILL (137) the agent, still retry
+// without consuming backoffLimit. It then fails the Job when the agent
+// container, and only that container, exits with a fail-fast code.
+//
+// 137 is any SIGKILL, not only an OOM kill. FailJob on it is still right
+// because, with disruptions excluded, a SIGKILL of the agent comes from the
+// pod itself: the kernel OOM killer at the container memory limit, or
+// kelos-capture escalating its autocompact-thrash stop to SIGKILL after the
+// grace period. A retry reuses the same limits and prompt, so it would die
+// the same way after the same cost. Other exit codes (e.g. 1) match no rule
+// and still follow backoffLimit.
+func (b *JobBuilder) podFailurePolicy(task *kelos.Task) *batchv1.PodFailurePolicy {
+	if task.Spec.PodFailurePolicy != nil {
+		return task.Spec.PodFailurePolicy
+	}
+	if len(b.AgentFailFastExitCodes) == 0 {
+		return nil
+	}
+	return &batchv1.PodFailurePolicy{
+		Rules: []batchv1.PodFailurePolicyRule{
+			{
+				Action: batchv1.PodFailurePolicyActionIgnore,
+				OnPodConditions: []batchv1.PodFailurePolicyOnPodConditionsPattern{
+					{Type: corev1.DisruptionTarget, Status: corev1.ConditionTrue},
+				},
+			},
+			{
+				Action: batchv1.PodFailurePolicyActionFailJob,
+				OnExitCodes: &batchv1.PodFailurePolicyOnExitCodesRequirement{
+					ContainerName: ptr.To(kelos.AgentContainerName),
+					Operator:      batchv1.PodFailurePolicyOnExitCodesOpIn,
+					Values:        append([]int32(nil), b.AgentFailFastExitCodes...),
+				},
+			},
+		},
+	}
+}
+
+// ParseExitCodes parses a comma-separated list of container exit codes into
+// the sorted, de-duplicated form Kubernetes requires for podFailurePolicy
+// onExitCodes values. An empty or blank string returns nil. Zero is rejected
+// because Kubernetes does not allow it with the In operator.
+func ParseExitCodes(s string) ([]int32, error) {
+	if strings.TrimSpace(s) == "" {
+		return nil, nil
+	}
+	seen := make(map[int32]struct{})
+	var codes []int32
+	for _, field := range strings.Split(s, ",") {
+		field = strings.TrimSpace(field)
+		code, err := strconv.ParseInt(field, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("invalid exit code %q: %w", field, err)
+		}
+		if code <= 0 {
+			return nil, fmt.Errorf("invalid exit code %d: must be greater than 0", code)
+		}
+		if _, dup := seen[int32(code)]; dup {
+			continue
+		}
+		seen[int32(code)] = struct{}{}
+		codes = append(codes, int32(code))
+	}
+	slices.Sort(codes)
+	return codes, nil
+}
+
+// FormatExitCodes renders exit codes in the comma-separated form accepted by
+// ParseExitCodes.
+func FormatExitCodes(codes []int32) string {
+	fields := make([]string, len(codes))
+	for i, code := range codes {
+		fields[i] = strconv.FormatInt(int64(code), 10)
+	}
+	return strings.Join(fields, ",")
 }
 
 func validatePodFailurePolicy(policy *batchv1.PodFailurePolicy) error {

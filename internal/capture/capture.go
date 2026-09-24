@@ -77,7 +77,7 @@ func run(agentType string, input io.Reader, stdout, stderr io.Writer, commandRun
 			usage = make(map[string]string)
 		}
 		usage["response"] = base64.StdEncoding.EncodeToString([]byte(detector.report()))
-		exitCode = 1
+		exitCode = ExitThrashStopped
 	}
 	outputs := captureOutputs(commandRunner, usage)
 	if len(outputs) == 0 {

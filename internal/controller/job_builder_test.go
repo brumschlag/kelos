@@ -5189,9 +5189,8 @@ func TestBuildJob_NoTaskSpawnerLabelNoEnv(t *testing.T) {
 	}
 }
 
-func TestBuildJob_PodFailurePolicyUnsetByDefault(t *testing.T) {
-	builder := NewJobBuilder()
-	task := &kelos.Task{
+func newPodFailurePolicyTestTask() *kelos.Task {
+	return &kelos.Task{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-pod-failure-policy",
 			Namespace: "default",
@@ -5205,6 +5204,47 @@ func TestBuildJob_PodFailurePolicyUnsetByDefault(t *testing.T) {
 			},
 		},
 	}
+}
+
+// podFailurePolicyAction mirrors the Kubernetes Job controller's evaluation of
+// a podFailurePolicy for a pod whose single named container exited with
+// exitCode and which carries the given pod conditions: rules are evaluated in
+// order and the first match wins. It returns "" when no rule matches, meaning
+// the failure counts against backoffLimit.
+func podFailurePolicyAction(policy *batchv1.PodFailurePolicy, containerName string, exitCode int32, conditions ...corev1.PodConditionType) batchv1.PodFailurePolicyAction {
+	if policy == nil {
+		return ""
+	}
+	for _, rule := range policy.Rules {
+		if req := rule.OnExitCodes; req != nil {
+			if req.ContainerName != nil && *req.ContainerName != containerName {
+				continue
+			}
+			in := false
+			for _, v := range req.Values {
+				if v == exitCode {
+					in = true
+				}
+			}
+			if (req.Operator == batchv1.PodFailurePolicyOnExitCodesOpIn) == in {
+				return rule.Action
+			}
+			continue
+		}
+		for _, pattern := range rule.OnPodConditions {
+			for _, c := range conditions {
+				if pattern.Type == c && pattern.Status == corev1.ConditionTrue {
+					return rule.Action
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func TestBuildJob_DefaultPodFailurePolicyFailsJobOnAgentOOMAndStop(t *testing.T) {
+	builder := NewJobBuilder()
+	task := newPodFailurePolicyTestTask()
 
 	job, err := builder.Build(task, nil, nil, task.Spec.Prompt)
 	if err != nil {
@@ -5214,9 +5254,178 @@ func TestBuildJob_PodFailurePolicyUnsetByDefault(t *testing.T) {
 	if *job.Spec.BackoffLimit != 1 {
 		t.Errorf("Expected BackoffLimit 1, got %d", *job.Spec.BackoffLimit)
 	}
+	// podFailurePolicy is only valid with restartPolicy Never.
+	if got := job.Spec.Template.Spec.RestartPolicy; got != corev1.RestartPolicyNever {
+		t.Fatalf("Expected pod RestartPolicy Never, got %q", got)
+	}
+	if job.Spec.Template.Spec.Containers[0].Name != kelos.AgentContainerName {
+		t.Fatalf("Expected first container %q, got %q", kelos.AgentContainerName, job.Spec.Template.Spec.Containers[0].Name)
+	}
 
+	want := &batchv1.PodFailurePolicy{
+		Rules: []batchv1.PodFailurePolicyRule{
+			{
+				Action: batchv1.PodFailurePolicyActionIgnore,
+				OnPodConditions: []batchv1.PodFailurePolicyOnPodConditionsPattern{
+					{Type: corev1.DisruptionTarget, Status: corev1.ConditionTrue},
+				},
+			},
+			{
+				Action: batchv1.PodFailurePolicyActionFailJob,
+				OnExitCodes: &batchv1.PodFailurePolicyOnExitCodesRequirement{
+					ContainerName: ptr.To(kelos.AgentContainerName),
+					Operator:      batchv1.PodFailurePolicyOnExitCodesOpIn,
+					Values:        []int32{137, 143},
+				},
+			},
+		},
+	}
+	gotJSON, _ := json.Marshal(job.Spec.PodFailurePolicy)
+	wantJSON, _ := json.Marshal(want)
+	if string(gotJSON) != string(wantJSON) {
+		t.Fatalf("PodFailurePolicy =\n  %s\nwant\n  %s", gotJSON, wantJSON)
+	}
+}
+
+func TestBuildJob_DefaultPodFailurePolicyPreservesOtherRetries(t *testing.T) {
+	builder := NewJobBuilder()
+	task := newPodFailurePolicyTestTask()
+
+	job, err := builder.Build(task, nil, nil, task.Spec.Prompt)
+	if err != nil {
+		t.Fatalf("Build() returned error: %v", err)
+	}
+	policy := job.Spec.PodFailurePolicy
+
+	tests := []struct {
+		name       string
+		container  string
+		exitCode   int32
+		conditions []corev1.PodConditionType
+		want       batchv1.PodFailurePolicyAction
+	}{
+		{name: "agent OOMKilled", container: kelos.AgentContainerName, exitCode: 137, want: batchv1.PodFailurePolicyActionFailJob},
+		{name: "agent stopped for thrash", container: kelos.AgentContainerName, exitCode: 143, want: batchv1.PodFailurePolicyActionFailJob},
+		{name: "ordinary agent failure follows backoffLimit", container: kelos.AgentContainerName, exitCode: 1, want: ""},
+		{name: "other agent exit code follows backoffLimit", container: kelos.AgentContainerName, exitCode: 2, want: ""},
+		{name: "init container killed follows backoffLimit", container: "git-clone", exitCode: 137, want: ""},
+		{name: "sidecar terminated follows backoffLimit", container: "sidecar", exitCode: 143, want: ""},
+		{name: "preempted agent is ignored", container: kelos.AgentContainerName, exitCode: 143, conditions: []corev1.PodConditionType{corev1.DisruptionTarget}, want: batchv1.PodFailurePolicyActionIgnore},
+		{name: "evicted agent is ignored", container: kelos.AgentContainerName, exitCode: 137, conditions: []corev1.PodConditionType{corev1.DisruptionTarget}, want: batchv1.PodFailurePolicyActionIgnore},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := podFailurePolicyAction(policy, tt.container, tt.exitCode, tt.conditions...); got != tt.want {
+				t.Fatalf("Action for %s exit %d = %q, want %q", tt.container, tt.exitCode, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildJob_AgentFailFastExitCodesOverride(t *testing.T) {
+	builder := NewJobBuilder()
+	builder.AgentFailFastExitCodes = []int32{137}
+	task := newPodFailurePolicyTestTask()
+
+	job, err := builder.Build(task, nil, nil, task.Spec.Prompt)
+	if err != nil {
+		t.Fatalf("Build() returned error: %v", err)
+	}
+	if job.Spec.PodFailurePolicy == nil || len(job.Spec.PodFailurePolicy.Rules) != 2 {
+		t.Fatalf("Expected 2 PodFailurePolicy rules, got %#v", job.Spec.PodFailurePolicy)
+	}
+	onExitCodes := job.Spec.PodFailurePolicy.Rules[1].OnExitCodes
+	if onExitCodes == nil || len(onExitCodes.Values) != 1 || onExitCodes.Values[0] != 137 {
+		t.Fatalf("Expected FailJob exit codes [137], got %#v", onExitCodes)
+	}
+	if got := podFailurePolicyAction(job.Spec.PodFailurePolicy, kelos.AgentContainerName, 143); got != "" {
+		t.Fatalf("Expected exit 143 to follow backoffLimit with override [137], got %q", got)
+	}
+}
+
+func TestBuildJob_AgentFailFastExitCodesDisabled(t *testing.T) {
+	builder := NewJobBuilder()
+	builder.AgentFailFastExitCodes = nil
+	task := newPodFailurePolicyTestTask()
+
+	job, err := builder.Build(task, nil, nil, task.Spec.Prompt)
+	if err != nil {
+		t.Fatalf("Build() returned error: %v", err)
+	}
 	if job.Spec.PodFailurePolicy != nil {
-		t.Fatalf("Expected PodFailurePolicy to be unset, got %#v", job.Spec.PodFailurePolicy)
+		t.Fatalf("Expected PodFailurePolicy to be unset when fail-fast exit codes are disabled, got %#v", job.Spec.PodFailurePolicy)
+	}
+	if *job.Spec.BackoffLimit != 1 {
+		t.Errorf("Expected BackoffLimit 1, got %d", *job.Spec.BackoffLimit)
+	}
+}
+
+func TestBuildJob_DefaultPodFailurePolicyNotSharedBetweenJobs(t *testing.T) {
+	builder := NewJobBuilder()
+	first, err := builder.Build(newPodFailurePolicyTestTask(), nil, nil, "Hello")
+	if err != nil {
+		t.Fatalf("Build() returned error: %v", err)
+	}
+	first.Spec.PodFailurePolicy.Rules[1].OnExitCodes.Values[0] = 1
+
+	second, err := builder.Build(newPodFailurePolicyTestTask(), nil, nil, "Hello")
+	if err != nil {
+		t.Fatalf("Build() returned error: %v", err)
+	}
+	if got := second.Spec.PodFailurePolicy.Rules[1].OnExitCodes.Values; got[0] != 137 {
+		t.Fatalf("Expected a fresh policy per Job, got exit codes %v", got)
+	}
+	if builder.AgentFailFastExitCodes[0] != 137 {
+		t.Fatalf("Expected builder exit codes to be unchanged, got %v", builder.AgentFailFastExitCodes)
+	}
+}
+
+func TestFormatExitCodesRoundTripsDefault(t *testing.T) {
+	formatted := FormatExitCodes(DefaultAgentFailFastExitCodes)
+	if formatted != "137,143" {
+		t.Fatalf("FormatExitCodes(default) = %q, want %q", formatted, "137,143")
+	}
+	parsed, err := ParseExitCodes(formatted)
+	if err != nil {
+		t.Fatalf("ParseExitCodes(%q) returned error: %v", formatted, err)
+	}
+	if fmt.Sprint(parsed) != fmt.Sprint(DefaultAgentFailFastExitCodes) {
+		t.Fatalf("Round trip = %v, want %v", parsed, DefaultAgentFailFastExitCodes)
+	}
+}
+
+func TestParseExitCodes(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      string
+		want    []int32
+		wantErr bool
+	}{
+		{name: "default", in: "137,143", want: []int32{137, 143}},
+		{name: "spaces unsorted duplicates", in: " 143, 137 ,143", want: []int32{137, 143}},
+		{name: "empty disables", in: "", want: nil},
+		{name: "blank disables", in: "  ", want: nil},
+		{name: "zero rejected", in: "0,137", wantErr: true},
+		{name: "negative rejected", in: "-1", wantErr: true},
+		{name: "non-numeric rejected", in: "oom", wantErr: true},
+		{name: "empty element rejected", in: "137,,143", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseExitCodes(tt.in)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("ParseExitCodes(%q) = %v, want error", tt.in, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseExitCodes(%q) returned error: %v", tt.in, err)
+			}
+			if fmt.Sprint(got) != fmt.Sprint(tt.want) || (got == nil) != (tt.want == nil) {
+				t.Fatalf("ParseExitCodes(%q) = %v, want %v", tt.in, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -5298,6 +5507,10 @@ func TestBuildJob_PodFailurePolicyOverride(t *testing.T) {
 	}
 	if len(rules[1].OnExitCodes.Values) != 1 || rules[1].OnExitCodes.Values[0] != 0 {
 		t.Errorf("Expected exit codes values [0], got %v", rules[1].OnExitCodes.Values)
+	}
+	// A Task-level policy replaces the controller default; it is not merged.
+	if rules[1].OnExitCodes.ContainerName != nil {
+		t.Errorf("Expected the Task policy verbatim, got containerName %q", *rules[1].OnExitCodes.ContainerName)
 	}
 }
 

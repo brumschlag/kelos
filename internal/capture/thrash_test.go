@@ -340,8 +340,11 @@ func TestRunStopsAgentOnAutocompactThrash(t *testing.T) {
 	stopper := &fakeStopper{}
 	code := run("claude-code", bytes.NewReader(input), &stdout, &stderr, mockRunner{}, thrashConfig{MaxRepeats: 1, WindowTurns: 3}, stopper)
 
-	if code == 0 {
-		t.Fatal("Exit code = 0, want non-zero so the Task fails")
+	// Exactly ExitThrashStopped, not merely non-zero: the controller's default
+	// podFailurePolicy FailJob codes include it, so a thrash stop fails the Job
+	// instead of being retried however Claude Code itself exited.
+	if code != ExitThrashStopped {
+		t.Fatalf("Exit code = %d, want %d (ExitThrashStopped) so the Job fails without a retry", code, ExitThrashStopped)
 	}
 	if stopper.calls != 1 {
 		t.Fatalf("Stopper called %d times, want 1", stopper.calls)
@@ -375,8 +378,8 @@ func TestRunOverridesResponseWhenAgentWritesResultAfterStop(t *testing.T) {
 	}
 	var stdout, stderr bytes.Buffer
 	code := run("claude-code", bytes.NewReader(data), &stdout, &stderr, mockRunner{}, thrashConfig{MaxRepeats: 1, WindowTurns: 3}, &fakeStopper{})
-	if code == 0 {
-		t.Fatal("Exit code = 0, want non-zero")
+	if code != ExitThrashStopped {
+		t.Fatalf("Exit code = %d, want %d (ExitThrashStopped)", code, ExitThrashStopped)
 	}
 	decoded, _ := base64.StdEncoding.DecodeString(outputValue(t, stdout.String(), "response"))
 	if !strings.Contains(string(decoded), "Stopped early by kelos-capture") {

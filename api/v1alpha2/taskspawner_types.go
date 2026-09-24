@@ -1128,8 +1128,8 @@ type TaskTemplate struct {
 	PodOverrides *PodOverrides `json:"podOverrides,omitempty"`
 
 	// PodFailurePolicy specifies how failed pods affect spawned Tasks' backing
-	// Job retry accounting. If unset, spawned Tasks leave
-	// Job.spec.podFailurePolicy unset and Kubernetes default Job handling applies.
+	// Job retry accounting. If unset, spawned Tasks get the controller default
+	// described on Task.spec.podFailurePolicy.
 	// +optional
 	// +kubebuilder:validation:XValidation:rule="self.rules.all(r, r.action != 'FailIndex')",message="podFailurePolicy.rules[].action FailIndex is not supported for Task Jobs"
 	PodFailurePolicy *batchv1.PodFailurePolicy `json:"podFailurePolicy,omitempty"`
